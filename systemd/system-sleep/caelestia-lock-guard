@@ -8,6 +8,7 @@ BUS="unix:path=${RUNTIME_DIR}/bus"
 IPC="/home/yash/.local/bin/caelestia-qs-ipc"
 LOG="${RUNTIME_DIR}/caelestia-sleep-guard.log"
 IPC_TIMEOUT=4
+LOCK_RETRIES=2
 
 log() {
     printf '%s %s\n' "$(date --iso-8601=seconds)" "$*" >> "$LOG" 2>/dev/null || true
@@ -28,16 +29,47 @@ restart_qs() {
     run_user /usr/bin/systemctl --user restart caelestia-quickshell.service
 }
 
+lock_session() {
+    local attempt
+    for attempt in $(seq 1 "$LOCK_RETRIES"); do
+        if qs_call lock safeLock >> "$LOG" 2>&1; then
+            log "lock: Caelestia session lock accepted on attempt ${attempt}"
+            return 0
+        fi
+        log "lock: Caelestia session lock failed on attempt ${attempt}"
+        if [ "$attempt" -lt "$LOCK_RETRIES" ]; then
+            restart_qs >> "$LOG" 2>&1 || true
+            /usr/bin/sleep 1
+        fi
+    done
+    return 1
+}
+
+ensure_ipc() {
+    if qs_call drawers list >> "$LOG" 2>&1; then
+        return 0
+    fi
+    log "ipc: unhealthy or timed out, restarting Quickshell"
+    restart_qs >> "$LOG" 2>&1 || true
+    /usr/bin/sleep 1
+    qs_call drawers list >> "$LOG" 2>&1
+}
+
 case "${1:-}/${2:-}" in
     pre/*)
-        log "pre-sleep: skipping Caelestia lock because session-lock IPC is currently unsafe"
+        log "pre-sleep: locking with Caelestia before suspend"
+        ensure_ipc >> "$LOG" 2>&1 || true
+        if ! lock_session; then
+            log "pre-sleep: Caelestia lock did not confirm before suspend"
+        fi
         ;;
     post/*)
-        log "post-resume: checking Caelestia Quickshell IPC without touching session lock"
+        log "post-resume: checking Caelestia Quickshell IPC and lock state"
         /usr/bin/sleep 1
-        if ! qs_call drawers list >> "$LOG" 2>&1; then
-            log "post-resume: IPC unhealthy or timed out, restarting Quickshell"
-            restart_qs >> "$LOG" 2>&1 || true
+        ensure_ipc >> "$LOG" 2>&1 || true
+        if ! qs_call lock isLocked >> "$LOG" 2>&1; then
+            log "post-resume: lock state IPC failed, trying Caelestia lock again"
+            lock_session >> "$LOG" 2>&1 || true
         fi
         ;;
 esac

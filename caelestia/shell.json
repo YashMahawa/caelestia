@@ -81,6 +81,8 @@
     "services": {
         "gpuType": "",
         "lyricsBackend": "Paxsenix",
+        "preferHindiRomanization": true,
+        "romanizeLyrics": true,
         "maxVolume": 2,
         "useFahrenheit": false,
         "weatherLocation": "26.2389,73.0243"

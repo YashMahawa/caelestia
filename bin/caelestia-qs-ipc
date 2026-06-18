@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+pid="$(systemctl --user show -P MainPID caelestia-quickshell.service 2>/dev/null || true)"
+
+if [[ "$pid" =~ ^[0-9]+$ ]] && [[ "$pid" != "0" ]]; then
+    exec /usr/sbin/qs ipc --pid "$pid" call "$@"
+fi
+
+exec /usr/sbin/qs -c caelestia ipc --any-display call "$@"

@@ -169,6 +169,12 @@ if confirm-overwrite $config/hypr
     hyprctl reload
 end
 
+# Caelestia user configs
+if confirm-overwrite $config/caelestia
+    log 'Installing caelestia user configs...'
+    ln -s (realpath caelestia) $config/caelestia
+end
+
 # Starship
 if confirm-overwrite $config/starship.toml
     log 'Installing starship config...'

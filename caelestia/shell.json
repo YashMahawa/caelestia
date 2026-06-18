@@ -1,0 +1,94 @@
+{
+    "background": {
+        "desktopClock": {
+            "background": {
+                "blur": true,
+                "enabled": true,
+                "opacity": 0.2868308607851986
+            },
+            "enabled": true,
+            "invertColors": false,
+            "position": "middle-left",
+            "shadow": {
+                "blur": 0.6052149142599278,
+                "enabled": false,
+                "opacity": 0.40403951376353786
+            }
+        },
+        "enabled": true,
+        "visualiser": {
+            "enabled": false,
+            "rounding": 1,
+            "spacing": 1.3369091715358934
+        },
+        "wallpaperEnabled": true
+    },
+    "bar": {
+        "status": {
+            "showAudio": true,
+            "showLockStatus": false,
+            "showMicrophone": true
+        },
+        "workspaces": {
+            "activeTrail": false,
+            "showWindows": true,
+            "showWindowsOnSpecialWorkspaces": true
+        }
+    },
+    "general": {
+        "idle": {
+            "inhibitWhenAudio": true,
+            "lockBeforeSleep": true,
+            "timeouts": [
+                {
+                    "idleAction": "lock",
+                    "respectInhibitors": true,
+                    "returnAction": null,
+                    "timeout": 180
+                },
+                {
+                    "idleAction": "dpms off",
+                    "respectInhibitors": true,
+                    "returnAction": "dpms on",
+                    "timeout": 300
+                },
+                {
+                    "idleAction": [
+                        "systemctl",
+                        "suspend"
+                    ],
+                    "respectInhibitors": true,
+                    "returnAction": null,
+                    "timeout": 1800
+                }
+            ]
+        }
+    },
+    "launcher": {
+        "showOnHover": true,
+        "useFuzzy": {
+            "actions": true,
+            "apps": true,
+            "schemes": true,
+            "variants": true,
+            "wallpapers": true
+        }
+    },
+    "notifs": {
+        "defaultExpireTimeout": 10000,
+        "openExpanded": false
+    },
+    "services": {
+        "gpuType": "",
+        "lyricsBackend": "Paxsenix",
+        "maxVolume": 2,
+        "useFahrenheit": false,
+        "weatherLocation": "26.2389,73.0243"
+    },
+    "utilities": {
+        "toasts": {
+            "fullscreen": "all",
+            "nowPlaying": true
+        }
+    }
+}

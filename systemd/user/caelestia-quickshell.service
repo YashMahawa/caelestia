@@ -1,0 +1,17 @@
+[Unit]
+Description=Caelestia Quickshell
+After=graphical-session.target hyprland-session-anchor.service xdg-desktop-portal.service
+Wants=hyprland-session-anchor.service xdg-desktop-portal.service
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStartPre=/usr/bin/sleep 3
+ExecStartPre=%h/.local/bin/caelestia-qs-clean-runtime
+ExecStart=/usr/sbin/qs -c caelestia -n
+ExecStop=/usr/sbin/qs kill -c caelestia
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

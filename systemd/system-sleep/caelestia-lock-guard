@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+set -u
+
+USER_NAME="yash"
+USER_ID="1000"
+RUNTIME_DIR="/run/user/${USER_ID}"
+BUS="unix:path=${RUNTIME_DIR}/bus"
+IPC="/home/yash/.local/bin/caelestia-qs-ipc"
+LOG="${RUNTIME_DIR}/caelestia-sleep-guard.log"
+IPC_TIMEOUT=4
+
+log() {
+    printf '%s %s\n' "$(date --iso-8601=seconds)" "$*" >> "$LOG" 2>/dev/null || true
+}
+
+run_user() {
+    /usr/bin/runuser -u "$USER_NAME" -- env \
+        XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+        DBUS_SESSION_BUS_ADDRESS="$BUS" \
+        "$@"
+}
+
+qs_call() {
+    run_user /usr/bin/timeout "$IPC_TIMEOUT" "$IPC" "$@"
+}
+
+restart_qs() {
+    run_user /usr/bin/systemctl --user restart caelestia-quickshell.service
+}
+
+case "${1:-}/${2:-}" in
+    pre/*)
+        log "pre-sleep: skipping Caelestia lock because session-lock IPC is currently unsafe"
+        ;;
+    post/*)
+        log "post-resume: checking Caelestia Quickshell IPC without touching session lock"
+        /usr/bin/sleep 1
+        if ! qs_call drawers list >> "$LOG" 2>&1; then
+            log "post-resume: IPC unhealthy or timed out, restarting Quickshell"
+            restart_qs >> "$LOG" 2>&1 || true
+        fi
+        ;;
+esac

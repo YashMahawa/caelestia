@@ -65,6 +65,7 @@
         }
     },
     "launcher": {
+        "maxShown": 4,
         "showOnHover": true,
         "useFuzzy": {
             "actions": true,

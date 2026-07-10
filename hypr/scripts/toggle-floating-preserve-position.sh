@@ -7,8 +7,17 @@ address=$(jq -r '.address // empty' <<<"$window")
 was_floating=$(jq -r '.floating // false' <<<"$window")
 monitor_id=$(jq -r '.monitor // 0' <<<"$window")
 read -r x y < <(jq -r '.at | @tsv' <<<"$window")
+read -r old_width old_height < <(jq -r '.size | @tsv' <<<"$window")
+mode=${1:-toggle}
 
-[[ -n "$address" && "$x" != "null" && "$y" != "null" ]] || exit 0
+[[ -n "$address" && "$x" != "null" && "$y" != "null" && "$old_width" != "null" && "$old_height" != "null" ]] || exit 0
+
+if [[ "$mode" == "--ensure-floating" && "$was_floating" == "true" ]]; then
+    exit 0
+fi
+
+center_x=$((x + old_width / 2))
+center_y=$((y + old_height / 2))
 
 hyprctl dispatch togglefloating "address:$address" >/dev/null || exit 1
 
@@ -20,7 +29,7 @@ if [[ "$was_floating" == "false" ]]; then
         monitor=$(hyprctl monitors -j | jq -c --argjson id "$monitor_id" '.[] | select(.id == $id)')
         if [[ -n "$monitor" ]]; then
             read -r mon_x mon_y mon_width mon_height reserved_left reserved_top reserved_right reserved_bottom < <(
-                jq -r '[.x, .y, .width, .height, .reserved[0], .reserved[1], .reserved[2], .reserved[3]] | @tsv' <<<"$monitor"
+                jq -r '[.x, .y, ((.width / .scale) | floor), ((.height / .scale) | floor), .reserved[0], .reserved[1], .reserved[2], .reserved[3]] | @tsv' <<<"$monitor"
             )
             margin=12
             min_x=$((mon_x + reserved_left + margin))
@@ -32,6 +41,8 @@ if [[ "$was_floating" == "false" ]]; then
                 ((height > usable_height)) && height=$usable_height
                 hyprctl dispatch resizewindowpixel "exact $width $height,address:$address" >/dev/null
             fi
+            x=$((center_x - width / 2))
+            y=$((center_y - height / 2))
             max_x=$((mon_x + mon_width - reserved_right - margin - width))
             max_y=$((mon_y + mon_height - reserved_bottom - margin - height))
             ((max_x < min_x)) && max_x=$min_x

@@ -11,7 +11,7 @@ url='https://github.com/caelestia-dots/caelestia'
 license=('GPL-3.0-only')
 depends=('caelestia-cli' 'caelestia-shell'
          'hyprland' 'xdg-desktop-portal-hyprland' 'xdg-desktop-portal-gtk' 'hyprpicker'
-         'wl-clipboard' 'cliphist' 'inotify-tools' 'app2unit' 'wireplumber' 'trash-cli'
+         'wl-clipboard' 'cliphist' 'grim' 'slurp' 'swappy' 'inotify-tools' 'app2unit' 'wireplumber' 'trash-cli'
          'foot' 'fish' 'eza' 'fastfetch' 'starship' 'btop' 'jq' 'adw-gtk-theme'
          'papirus-icon-theme' 'qtengine' 'ttf-jetbrains-mono-nerd')
 optdepends=('thunar: file manager'

@@ -1,0 +1,199 @@
+#!/usr/bin/env python3
+"""Stable power and thermal policy for this Caelestia laptop.
+
+Power Profiles Daemon remains the source of truth. This process adds conservative
+Intel P-state caps and a slow, hysteretic thermal state machine. It deliberately
+avoids rapid turbo toggling.
+"""
+
+import json
+import os
+import signal
+import sys
+import time
+
+import dbus
+from dbus.mainloop.glib import DBusGMainLoop
+from gi.repository import GLib
+
+NO_TURBO = "/sys/devices/system/cpu/intel_pstate/no_turbo"
+MAX_PERF = "/sys/devices/system/cpu/intel_pstate/max_perf_pct"
+STATE_DIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "caelestia")
+STATE_FILE = os.path.join(STATE_DIR, "power-state.json")
+
+PROFILE_POLICY = {
+    "power-saver": {"max_perf": 62, "no_turbo": 1},
+    "balanced": {"max_perf": 88, "no_turbo": 0},
+    "performance": {"max_perf": 100, "no_turbo": 0},
+}
+
+# Raptor Lake is designed to manage short high-temperature bursts. These limits
+# intervene only when heat is sustained, with wide hysteresis to avoid oscillation.
+SOFT_LIMIT = 85.0
+SOFT_RECOVER = 76.0
+HARD_LIMIT = 93.0
+HARD_RECOVER = 80.0
+RECOVERY_SECONDS = 30.0
+SAMPLE_SECONDS = 3
+
+profile = "balanced"
+thermal_state = "normal"
+below_recovery_since = None
+last_temp = None
+
+
+def log(message):
+    print(f"[caelestia-power] {message}", flush=True)
+
+
+def read_text(path):
+    with open(path, encoding="utf-8") as handle:
+        return handle.read().strip()
+
+
+def write_value(path, value):
+    value = str(value)
+    try:
+        if read_text(path) == value:
+            return
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(value)
+        log(f"{os.path.basename(path)}={value}")
+    except OSError as exc:
+        log(f"cannot write {path}: {exc}")
+
+
+def cpu_temperature():
+    readings = []
+    thermal_root = "/sys/class/thermal"
+    try:
+        entries = os.listdir(thermal_root)
+    except OSError:
+        return None
+    for entry in entries:
+        if not entry.startswith("thermal_zone"):
+            continue
+        base = os.path.join(thermal_root, entry)
+        try:
+            kind = read_text(os.path.join(base, "type"))
+            if kind not in {"x86_pkg_temp", "cpu_thermal", "acpitz"}:
+                continue
+            value = float(read_text(os.path.join(base, "temp"))) / 1000.0
+            if 0 < value < 130:
+                readings.append(value)
+        except (OSError, ValueError):
+            continue
+    return max(readings) if readings else None
+
+
+def active_policy():
+    base = PROFILE_POLICY.get(profile, PROFILE_POLICY["balanced"]).copy()
+    if thermal_state == "soft":
+        base["max_perf"] = min(base["max_perf"], 65)
+    elif thermal_state == "hard":
+        base["max_perf"] = min(base["max_perf"], 45)
+        base["no_turbo"] = 1
+    return base
+
+
+def apply_policy():
+    policy = active_policy()
+    write_value(MAX_PERF, policy["max_perf"])
+    write_value(NO_TURBO, policy["no_turbo"])
+
+
+def save_state():
+    os.makedirs(STATE_DIR, exist_ok=True)
+    payload = {
+        "profile": profile,
+        "thermal_state": thermal_state,
+        "temperature_c": last_temp,
+        "policy": active_policy(),
+        "updated_at": time.time(),
+    }
+    temporary = f"{STATE_FILE}.tmp"
+    with open(temporary, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, separators=(",", ":"))
+    os.replace(temporary, STATE_FILE)
+
+
+def update_thermal_state():
+    global thermal_state, below_recovery_since, last_temp
+    temperature = cpu_temperature()
+    last_temp = temperature
+    if temperature is None:
+        save_state()
+        return True
+
+    now = time.monotonic()
+    previous = thermal_state
+    if temperature >= HARD_LIMIT:
+        thermal_state = "hard"
+        below_recovery_since = None
+    elif thermal_state == "normal" and temperature >= SOFT_LIMIT:
+        thermal_state = "soft"
+        below_recovery_since = None
+    else:
+        recovery = HARD_RECOVER if thermal_state == "hard" else SOFT_RECOVER
+        if thermal_state != "normal" and temperature <= recovery:
+            if below_recovery_since is None:
+                below_recovery_since = now
+            elif now - below_recovery_since >= RECOVERY_SECONDS:
+                thermal_state = "soft" if thermal_state == "hard" else "normal"
+                below_recovery_since = None
+        else:
+            below_recovery_since = None
+
+    if previous != thermal_state:
+        log(f"thermal state {previous} -> {thermal_state} at {temperature:.1f} C")
+        apply_policy()
+    save_state()
+    return True
+
+
+def set_profile(new_profile):
+    global profile, thermal_state, below_recovery_since
+    new_profile = str(new_profile)
+    if new_profile not in PROFILE_POLICY:
+        log(f"ignoring unknown profile {new_profile!r}")
+        return
+    profile = new_profile
+    thermal_state = "normal"
+    below_recovery_since = None
+    log(f"profile={profile}")
+    apply_policy()
+    save_state()
+
+
+def properties_changed(_interface, changed, _invalidated):
+    if "ActiveProfile" in changed:
+        set_profile(changed["ActiveProfile"])
+
+
+def main():
+    DBusGMainLoop(set_as_default=True)
+    bus = dbus.SystemBus()
+    bus.add_signal_receiver(
+        properties_changed,
+        signal_name="PropertiesChanged",
+        dbus_interface="org.freedesktop.DBus.Properties",
+        bus_name="net.hadess.PowerProfiles",
+        path="/net/hadess/PowerProfiles",
+    )
+    obj = bus.get_object("net.hadess.PowerProfiles", "/net/hadess/PowerProfiles")
+    props = dbus.Interface(obj, "org.freedesktop.DBus.Properties")
+    set_profile(props.Get("net.hadess.PowerProfiles", "ActiveProfile"))
+
+    loop = GLib.MainLoop()
+    GLib.timeout_add_seconds(SAMPLE_SECONDS, update_thermal_state)
+    signal.signal(signal.SIGTERM, lambda *_: loop.quit())
+    signal.signal(signal.SIGINT, lambda *_: loop.quit())
+    loop.run()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as error:
+        print(f"caelestia-power-daemon: {error}", file=sys.stderr)
+        sys.exit(1)

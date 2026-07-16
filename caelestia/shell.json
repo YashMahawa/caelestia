@@ -1,4 +1,9 @@
 {
+    "appearance": {
+        "transparency": {
+            "enabled": false
+        }
+    },
     "background": {
         "desktopClock": {
             "background": {
@@ -24,6 +29,11 @@
         "wallpaperEnabled": true
     },
     "bar": {
+        "clock": {
+            "background": false,
+            "showDate": false
+        },
+        "persistent": true,
         "status": {
             "showAudio": true,
             "showLockStatus": false,
@@ -35,10 +45,15 @@
             "showWindowsOnSpecialWorkspaces": true
         }
     },
+    "dashboard": {
+        "mediaUpdateInterval": 750,
+        "resourceUpdateInterval": 3000
+    },
     "general": {
         "idle": {
             "inhibitWhenAudio": true,
-            "lockBeforeSleep": true,
+            "lockAfterSleep": false,
+            "lockBeforeSleep": false,
             "timeouts": [
                 {
                     "idleAction": "lock",
@@ -75,16 +90,20 @@
             "wallpapers": true
         }
     },
+    "nexus": {
+        "networkRescanInterval": 30000
+    },
     "notifs": {
         "defaultExpireTimeout": 10000,
         "openExpanded": false
     },
     "services": {
-        "gpuType": "",
+        "defaultPlayer": "Chrome",
+        "gpuType": "GENERIC",
         "lyricsBackend": "Paxsenix",
+        "maxVolume": 2,
         "preferHindiRomanization": true,
         "romanizeLyrics": true,
-        "maxVolume": 2,
         "useFahrenheit": false,
         "weatherLocation": "26.2389,73.0243"
     },

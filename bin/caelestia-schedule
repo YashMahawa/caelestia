@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+    cat >&2 <<'EOF'
+Usage:
+  caelestia-schedule list
+  caelestia-schedule in DURATION PROFILE command [args...]
+  caelestia-schedule at 'CALENDAR' PROFILE command [args...]
+  caelestia-schedule cancel TIMER_UNIT
+
+Profiles: background, daily, interactive, ml
+Examples:
+  caelestia-schedule in 30m background recollindex -c ~/.recoll
+  caelestia-schedule at 'tomorrow 08:00' interactive google-chrome-stable
+EOF
+}
+
+action="${1:-}"
+case "$action" in
+    list)
+        systemctl --user list-timers 'caelestia-scheduled-*' --all
+        ;;
+    cancel)
+        unit="${2:-}"
+        test -n "$unit" || { usage; exit 2; }
+        unit="${unit%.timer}"
+        systemctl --user stop "$unit.timer" "$unit.service" 2>/dev/null || true
+        systemctl --user reset-failed "$unit.timer" "$unit.service" 2>/dev/null || true
+        ;;
+    in|at)
+        when="${2:-}"
+        profile="${3:-}"
+        shift 3 || { usage; exit 2; }
+        test -n "$when" && test -n "$profile" && test "$#" -gt 0 || {
+            usage
+            exit 2
+        }
+        unit="caelestia-scheduled-$(date +%s)-$$"
+        timing=()
+        if [[ "$action" == "in" ]]; then
+            timing=(--on-active="$when")
+        else
+            timing=(--on-calendar="$when")
+        fi
+        systemd-run --user --unit="$unit" --collect "${timing[@]}" \
+            /home/yash/.local/bin/caelestia-run "$profile" "$@"
+        ;;
+    *)
+        usage
+        exit 2
+        ;;
+esac

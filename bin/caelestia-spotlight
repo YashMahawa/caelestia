@@ -1,0 +1,185 @@
+#!/usr/bin/env python3
+"""Fast unified launcher for apps, indexed files, documents and actions."""
+
+import configparser
+import os
+import re
+import shlex
+import subprocess
+import sys
+import urllib.parse
+from pathlib import Path
+
+HOME = Path.home()
+
+
+def run(command, *, text=None, timeout=8):
+    try:
+        return subprocess.run(
+            command,
+            input=text,
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def menu(prompt, entries=None):
+    payload = "\n".join(entries or [])
+    result = run(
+        ["rofi", "-dmenu", "-i", "-p", prompt, "-matching", "fuzzy"],
+        text=payload,
+        timeout=120,
+    )
+    if not result or result.returncode != 0:
+        return ""
+    return result.stdout.strip()
+
+
+def desktop_apps(query):
+    roots = [
+        HOME / ".local/share/applications",
+        Path("/usr/local/share/applications"),
+        Path("/usr/share/applications"),
+    ]
+    found = []
+    seen = set()
+    words = query.casefold().split()
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for path in root.rglob("*.desktop"):
+            parser = configparser.ConfigParser(interpolation=None, strict=False)
+            try:
+                parser.read(path, encoding="utf-8")
+                entry = parser["Desktop Entry"]
+                if entry.get("Type", "Application") != "Application":
+                    continue
+                if entry.getboolean("NoDisplay", fallback=False):
+                    continue
+                name = entry.get("Name", path.stem)
+                keywords = " ".join(
+                    [name, entry.get("GenericName", ""), entry.get("Keywords", "")]
+                ).casefold()
+                if words and not all(word in keywords for word in words):
+                    continue
+                desktop_id = path.name.removesuffix(".desktop")
+                key = name.casefold()
+                if key in seen:
+                    continue
+                seen.add(key)
+                found.append((f"󰀻  {name}", ("app", desktop_id)))
+            except (OSError, configparser.Error, KeyError, ValueError):
+                continue
+    return sorted(found, key=lambda item: item[0].casefold())[:30]
+
+
+def filename_results(query):
+    if not query:
+        return []
+    result = run(["plocate", "-i", "-l", "50", "--", query], timeout=4)
+    if not result or result.returncode not in (0, 1):
+        return []
+    items = []
+    for raw_path in result.stdout.splitlines():
+        path = Path(raw_path)
+        if "/.cache/" in raw_path or "/node_modules/" in raw_path:
+            continue
+        items.append((f"󰈔  {path.name}    {path.parent}", ("file", raw_path)))
+    return items[:30]
+
+
+def content_results(query):
+    if not query:
+        return []
+    result = run(
+        ["recollq", "-c", str(HOME / ".recoll"), "-b", "-n", "0-30", query],
+        timeout=8,
+    )
+    if not result or result.returncode not in (0, 1):
+        return []
+    items = []
+    seen = set()
+    for line in result.stdout.splitlines():
+        match = re.search(r"file://[^\s]+", line)
+        if not match:
+            continue
+        path = urllib.parse.unquote(urllib.parse.urlparse(match.group(0)).path)
+        if path in seen:
+            continue
+        seen.add(path)
+        parsed = Path(path)
+        items.append((f"󰱼  {parsed.name}    {parsed.parent}", ("file", path)))
+    return items
+
+
+def dispatch(kind, value):
+    if kind == "app":
+        subprocess.Popen(
+            ["gtk-launch", value],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    elif kind == "file":
+        subprocess.Popen(
+            ["xdg-open", value],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+
+
+def main():
+    query = menu("Spotlight")
+    if not query:
+        return
+
+    if query.startswith("="):
+        expression = query[1:].strip()
+        result = run(["qalc", "-t", expression])
+        answer = result.stdout.strip() if result else "Calculation failed"
+        menu("Result", [answer])
+        return
+    if query.startswith(">"):
+        command = query[1:].strip()
+        if command:
+            subprocess.Popen(["foot", "bash", "-lc", f"{command}; exec bash"])
+        return
+    if query.startswith("?"):
+        url = "https://www.google.com/search?q=" + urllib.parse.quote_plus(query[1:])
+        subprocess.Popen(["xdg-open", url])
+        return
+    if query in {"battery", "balanced", "performance", "ml mode"}:
+        selected = "ml" if query == "ml mode" else query
+        subprocess.Popen(["caelestia-mode", selected])
+        return
+
+    providers = []
+    providers.extend(desktop_apps(query))
+    providers.extend(filename_results(query))
+    providers.extend(content_results(query))
+    if not providers:
+        choice = menu("No local result", [f"󰖟  Search web for “{query}”"])
+        if choice:
+            subprocess.Popen(
+                ["xdg-open", "https://www.google.com/search?q=" + urllib.parse.quote_plus(query)]
+            )
+        return
+
+    labels = [label for label, _action in providers]
+    choice = menu("Open", labels)
+    if not choice:
+        return
+    try:
+        index = labels.index(choice)
+    except ValueError:
+        return
+    dispatch(*providers[index][1])
+
+
+if __name__ == "__main__":
+    main()

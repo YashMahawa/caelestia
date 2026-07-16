@@ -165,14 +165,8 @@ fish -c 'rm -f caelestia-meta-*.pkg.tar.zst' 2> /dev/null
 if confirm-overwrite $config/hypr
     log 'Installing hypr* configs...'
     ln -s (realpath hypr) $config/hypr
-    chmod u+x $config/hypr/scripts/wsaction.fish
+    chmod u+x $config/hypr/scripts/wsaction.fish $config/hypr/scripts/screenshot.fish
     hyprctl reload
-end
-
-# Caelestia user configs
-if confirm-overwrite $config/caelestia
-    log 'Installing caelestia user configs...'
-    ln -s (realpath caelestia) $config/caelestia
 end
 
 # Starship

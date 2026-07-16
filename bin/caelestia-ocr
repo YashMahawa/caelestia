@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+image="$(mktemp --suffix=.png)"
+text="$(mktemp)"
+trap 'rm -f "$image" "$text" "$text.txt"' EXIT
+
+geometry="$(slurp)" || exit 0
+grim -g "$geometry" "$image"
+tesseract "$image" "$text" -l eng >/dev/null 2>&1
+wl-copy < "$text.txt"
+notify-send "Text copied" "OCR result is now on the clipboard"

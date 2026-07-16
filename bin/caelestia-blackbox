@@ -1,0 +1,190 @@
+#!/usr/bin/env python3
+import os
+import sys
+import time
+import signal
+import sqlite3
+import subprocess
+import psutil
+import json
+
+DB_MEM_PATH = "/dev/shm/caelestia-blackbox.db"
+DB_PERSIST_DIR = "/home/yash/.local/share/caelestia"
+DB_PERSIST_PATH = os.path.join(DB_PERSIST_DIR, "blackbox_archive.db")
+POLL_INTERVAL = 2.0  # seconds
+KEEP_WINDOW = 900.0  # 15 minutes in seconds
+
+running = True
+
+def handle_signal(signum, frame):
+    global running
+    print(f"Received signal {signum}, stopping...", flush=True)
+    running = False
+
+signal.signal(signal.SIGTERM, handle_signal)
+signal.signal(signal.SIGINT, handle_signal)
+
+def get_active_window():
+    try:
+        out = subprocess.check_output(["hyprctl", "activewindow", "-j"], stderr=subprocess.DEVNULL)
+        data = json.loads(out)
+        title = data.get("title", "Desktop")
+        if any(word in title.lower() for word in ["interview", "prepare", "cognios", "to help you"]):
+            title = "Workspace"
+        if len(title) > 60:
+            title = title[:57] + "..."
+        return title
+    except Exception:
+        return "Unknown"
+
+def get_cpu_temp():
+    try:
+        temps = psutil.sensors_temperatures()
+        if 'coretemp' in temps:
+            for entry in temps['coretemp']:
+                if entry.label == 'Package id 0':
+                    return entry.current
+            return temps['coretemp'][0].current
+
+        # Fallback to sysfs
+        for i in range(10):
+            path = f"/sys/class/thermal/thermal_zone{i}/type"
+            if os.path.exists(path):
+                with open(path) as f:
+                    t = f.read().strip()
+                if t in ["x86_pkg_temp", "acpitz", "cpu_thermal"]:
+                    with open(f"/sys/class/thermal/thermal_zone{i}/temp") as f:
+                        return float(f.read().strip()) / 1000.0
+    except Exception:
+        pass
+    return 0.0
+
+def get_power_profile():
+    try:
+        out = subprocess.check_output([
+            "gdbus", "call", "--system",
+            "--dest", "net.hadess.PowerProfiles",
+            "--object-path", "/net/hadess/PowerProfiles",
+            "--method", "org.freedesktop.DBus.Properties.Get",
+            "net.hadess.PowerProfiles", "ActiveProfile"
+        ], stderr=subprocess.DEVNULL).decode().strip()
+
+        if "performance" in out:
+            return "performance"
+        elif "power-saver" in out:
+            return "power-saver"
+        elif "balanced" in out:
+            return "balanced"
+    except Exception:
+        pass
+    return "unknown"
+
+def sync_to_persistent_storage():
+    """Backup the shared memory DB to persistent SSD storage safely."""
+    try:
+        if not os.path.exists(DB_MEM_PATH):
+            return
+        os.makedirs(DB_PERSIST_DIR, exist_ok=True)
+
+        src_conn = sqlite3.connect(DB_MEM_PATH)
+        dst_conn = sqlite3.connect(DB_PERSIST_PATH)
+
+        # Use SQLite backup API for a clean online hot-backup
+        with dst_conn:
+            src_conn.backup(dst_conn)
+
+        src_conn.close()
+        dst_conn.close()
+        print("BlackBox database synced to persistent storage successfully.", flush=True)
+    except Exception as e:
+        print(f"Error syncing BlackBox database: {e}", file=sys.stderr, flush=True)
+
+def main():
+    print("Starting Caelestia BlackBox Telemetry Recorder...", flush=True)
+
+    # 1. Setup shared memory DB
+    conn = sqlite3.connect(DB_MEM_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS telemetry (
+            timestamp REAL PRIMARY KEY,
+            cpu_usage REAL,
+            ram_used_gb REAL,
+            swap_used_gb REAL,
+            cpu_temp REAL,
+            power_profile TEXT,
+            active_window TEXT,
+            disk_read_mbs REAL,
+            disk_write_mbs REAL
+        )
+    """)
+    conn.commit()
+
+    last_sync_time = time.time()
+    last_io = psutil.disk_io_counters()
+    last_io_time = time.time()
+
+    while running:
+        loop_start = time.time()
+
+        # 2. Gather metrics
+        try:
+            cpu_usage = psutil.cpu_percent()
+            mem = psutil.virtual_memory()
+            ram_used = (mem.total - mem.available) / (1024**3)
+
+            swap = psutil.swap_memory()
+            swap_used = swap.used / (1024**3)
+
+            cpu_temp = get_cpu_temp()
+            power_profile = get_power_profile()
+            active_win = get_active_window()
+
+            # Disk IO calculations
+            current_io = psutil.disk_io_counters()
+            current_time = time.time()
+            dt = current_time - last_io_time
+
+            if dt > 0 and current_io and last_io:
+                disk_read_mbs = ((current_io.read_bytes - last_io.read_bytes) / (1024**2)) / dt
+                disk_write_mbs = ((current_io.write_bytes - last_io.write_bytes) / (1024**2)) / dt
+            else:
+                disk_read_mbs = 0.0
+                disk_write_mbs = 0.0
+
+            last_io = current_io
+            last_io_time = current_time
+
+            # 3. Insert into RAM-backed DB
+            cursor.execute("""
+                INSERT OR REPLACE INTO telemetry
+                (timestamp, cpu_usage, ram_used_gb, swap_used_gb, cpu_temp, power_profile, active_window, disk_read_mbs, disk_write_mbs)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (current_time, cpu_usage, ram_used, swap_used, cpu_temp, power_profile, active_win, disk_read_mbs, disk_write_mbs))
+
+            # 4. Enforce sliding window (DELETE old logs)
+            cutoff = current_time - KEEP_WINDOW
+            cursor.execute("DELETE FROM telemetry WHERE timestamp < ?", (cutoff,))
+            conn.commit()
+
+        except Exception as e:
+            print(f"Error collecting telemetry: {e}", file=sys.stderr, flush=True)
+
+        # 5. Periodic Sync (Every 5 minutes)
+        if time.time() - last_sync_time > 300.0:
+            sync_to_persistent_storage()
+            last_sync_time = time.time()
+
+        # Sleep adjusting for work time
+        elapsed = time.time() - loop_start
+        sleep_time = max(0.1, POLL_INTERVAL - elapsed)
+        time.sleep(sleep_time)
+
+    # 6. Graceful shutdown sync
+    conn.close()
+    print("Syncing data to persistent archive on shutdown...", flush=True)
+    sync_to_persistent_storage()
+    print("Caelestia BlackBox stopped cleanly.", flush=True)
+
+if __name__ == "__main__":
+    main()

@@ -1,13 +1,13 @@
 if status is-interactive
     # Starship custom prompt
-    command -v starship &> /dev/null && starship init fish | source
+    starship init fish | source
 
     # Direnv + Zoxide
     command -v direnv &> /dev/null && direnv hook fish | source
     command -v zoxide &> /dev/null && zoxide init fish --cmd cd | source
 
     # Better ls
-    command -v eza &> /dev/null && alias ls='eza --icons --group-directories-first -1'
+    alias ls='eza --icons --group-directories-first -1'
 
     # Abbrs
     abbr lg 'lazygit'
@@ -42,4 +42,14 @@ if status is-interactive
 
     # Custom fish config
     source ~/.config/caelestia/user-config.fish 2> /dev/null
+
+    # Add NVM binaries to path for gemini/codex
+    if test -d "$HOME/.nvm/versions/node/"
+        set -l latest_node (ls -vr "$HOME/.nvm/versions/node/" | head -n 1)
+        fish_add_path "$HOME/.nvm/versions/node/$latest_node/bin"
+    end
 end
+
+
+# Added by Antigravity CLI installer
+set -gx PATH "/home/yash/.local/bin" $PATH

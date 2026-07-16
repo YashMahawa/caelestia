@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+exec 9>"${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/caelestia-cache-maintenance.lock"
+flock -n 9 || exit 0
+
+size_mib() {
+    du -sm "$1" 2>/dev/null | awk '{print $1 + 0}'
+}
+
+clean_if_oversize() {
+    local path="$1"
+    local limit_mib="$2"
+    shift 2
+
+    [[ -d "$path" ]] || return 0
+    if (( $(size_mib "$path") > limit_mib )); then
+        "$@"
+    fi
+}
+
+# Native cache maintenance keeps reusable objects whenever possible.
+command -v uv >/dev/null && uv cache prune --quiet || true
+command -v npm >/dev/null && npm cache verify >/dev/null 2>&1 || true
+command -v trash-empty >/dev/null && trash-empty -f 30 || true
+
+# Age out lightweight visual and temporary caches. Browser profiles, cookies,
+# sessions, GPU shader caches, OpenVINO models, and IDE state are excluded.
+find "$HOME/.cache/thumbnails" -type f -atime +30 -delete 2>/dev/null || true
+find "$HOME/.cache/thumbnails" -depth -type d -empty -delete 2>/dev/null || true
+find "$HOME/.cache/quickshell" -type f -atime +30 -delete 2>/dev/null || true
+find "$HOME/.cache/quickshell" -depth -type d -empty -delete 2>/dev/null || true
+find "$HOME/.cache/pip/http-v2" -type f -atime +60 -delete 2>/dev/null || true
+find "$HOME/.cache/pip/http-v2" -depth -type d -empty -delete 2>/dev/null || true
+
+# Avoid unlimited package/build cache growth while retaining normal hot caches.
+clean_if_oversize "$HOME/.cache/pip" 5120 \
+    /home/yash/ML/.venv/bin/python -m pip cache purge
+clean_if_oversize "$HOME/.npm" 8192 npm cache clean --force
+clean_if_oversize "$HOME/.cache/yarn" 3072 yarn cache clean
+clean_if_oversize "$HOME/.cache/go-build" 4096 go clean -cache -testcache
+
+# Future Caelestia safety snapshots expire after two weeks. Active config
+# directories never match these names.
+find "$HOME/.config/quickshell" -maxdepth 1 -mindepth 1 -type d \
+    \( -name 'caelestia.backup-*' -o -name 'caelestia.broken-*' \
+       -o -name 'caelestia.highcpu-*' -o -name 'caelestia.invisible-*' \) \
+    -mtime +14 -exec rm -rf -- {} + 2>/dev/null || true
+find "$HOME/.config/caelestia" -maxdepth 1 -type f \
+    \( -name '*.bak*' -o -name '*.backup-*' \) -mtime +14 -delete \
+    2>/dev/null || true

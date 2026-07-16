@@ -1,0 +1,11 @@
+[Unit]
+Description=Run low-impact cache maintenance weekly
+
+[Timer]
+OnBootSec=30min
+OnUnitActiveSec=7d
+RandomizedDelaySec=2h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

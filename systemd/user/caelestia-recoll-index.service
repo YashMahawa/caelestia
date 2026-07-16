@@ -1,0 +1,19 @@
+[Unit]
+Description=Caelestia low-priority document content index
+ConditionACPower=true
+
+[Service]
+Type=oneshot
+Environment=RECOLL_CONFDIR=%h/.recoll
+ExecStart=/usr/bin/recollindex -c %h/.recoll -d
+Nice=15
+CPUWeight=10
+IOWeight=10
+IOSchedulingClass=idle
+MemoryHigh=1G
+MemoryMax=2G
+TasksMax=20
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.recoll %t
+PrivateTmp=true

@@ -17,3 +17,8 @@ systemctl --user reset-failed \
     xdg-desktop-portal.service \
     xdg-desktop-portal-hyprland.service \
     xdg-desktop-portal-gtk.service || true
+
+# Start after Hyprland has exported WAYLAND_DISPLAY and DISPLAY. Starting the
+# portal from an early default.target unit caused the GTK implementation to
+# launch without a display and enter start-limit-hit.
+systemctl --user start xdg-desktop-portal.service || true

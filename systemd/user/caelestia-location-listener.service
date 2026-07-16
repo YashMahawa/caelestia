@@ -1,0 +1,11 @@
+[Unit]
+Description=Caelestia Weather Location Listener for Phone Coordinates
+After=network.target
+
+[Service]
+ExecStart=/home/yash/.local/bin/caelestia-location-listener
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

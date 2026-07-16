@@ -1,0 +1,132 @@
+#!/usr/bin/env python3
+import socket
+import subprocess
+import sys
+import json
+
+SPECIAL_KEYS = {
+    1: "BackSpace",
+    2: "Tab",
+    4: "Left",
+    5: "Up",
+    6: "Right",
+    7: "Down",
+    8: "PageUp",
+    9: "PageDown",
+    10: "Home",
+    11: "End",
+    12: "Return",
+    13: "Delete",
+    14: "Escape",
+}
+# Map F1-F12 keys
+for f in range(1, 13):
+    SPECIAL_KEYS[20 + f] = f"F{f}"
+
+def handle_input(payload):
+    try:
+        action = payload.get("action")
+        if not action:
+            return
+
+        if action == "move":
+            dx = payload.get("dx", 0.0)
+            dy = payload.get("dy", 0.0)
+            # Trackpad sensitivity scale
+            scale = 2.5
+            sdx = int(dx * scale)
+            sdy = int(dy * scale)
+            if sdx != 0 or sdy != 0:
+                subprocess.run(["ydotool", "mousemove", "--", str(sdx), str(sdy)], check=False)
+        elif action == "absmove":
+            x = payload.get("x", 0.0)
+            y = payload.get("y", 0.0)
+            px = int(x * 1920)
+            py = int(y * 1080)
+            subprocess.run(["ydotool", "mousemove", "--absolute", "--", str(px), str(py)], check=False)
+
+        elif action == "scroll":
+            dx = payload.get("dx", 0.0)
+            dy = payload.get("dy", 0.0)
+            # ydotool vertical wheel scroll direction, standard is positive/negative
+            sdx = int(dx)
+            sdy = int(dy)
+            if sdx != 0 or sdy != 0:
+                subprocess.run(["ydotool", "mousemove", "--wheel", str(sdx), str(sdy)], check=False)
+
+        elif action == "click":
+            btn = payload.get("btn")
+            if btn == "left":
+                subprocess.run(["ydotool", "click", "0xC0"], check=False)
+            elif btn == "right":
+                subprocess.run(["ydotool", "click", "0xC1"], check=False)
+            elif btn == "middle":
+                subprocess.run(["ydotool", "click", "0xC2"], check=False)
+            elif btn == "double":
+                subprocess.run(["ydotool", "click", "0xC0"], check=False)
+                subprocess.run(["ydotool", "click", "0xC0"], check=False)
+
+        elif action == "hold":
+            # 272 is BTN_LEFT in uinput / evdev
+            subprocess.run(["ydotool", "key", "272:1"], check=False)
+
+        elif action == "release":
+            subprocess.run(["ydotool", "key", "272:0"], check=False)
+
+        elif action == "key":
+            content = payload.get("content", "")
+            if content:
+                subprocess.run(["ydotool", "type", content], check=False)
+
+        elif action == "specialKey":
+            code = payload.get("code")
+            key_name = SPECIAL_KEYS.get(code)
+            if key_name:
+                subprocess.run(["ydotool", "key", key_name], check=False)
+
+    except Exception as e:
+        print(f"Error executing input action: {e}", file=sys.stderr)
+
+def main():
+    UDP_IP = "0.0.0.0"
+    UDP_PORT = 43210
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+    try:
+        sock.bind((UDP_IP, UDP_PORT))
+        print(f"Listening for location and input packages on UDP port {UDP_PORT}...")
+    except Exception as e:
+        print(f"Error binding to port: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    while True:
+        try:
+            data, addr = sock.recvfrom(4096)
+            message = data.decode("utf-8").strip()
+
+            # Route based on packet prefix
+            if message.startswith("INPUT:"):
+                # Parse JSON payload
+                json_str = message[6:]
+                payload = json.loads(json_str)
+                handle_input(payload)
+            elif "," in message:
+                parts = message.split(",")
+                if len(parts) == 2:
+                    try:
+                        lat = float(parts[0])
+                        lon = float(parts[1])
+                        coords = f"{lat},{lon}"
+                        print(f"Coordinates received from {addr}: {coords}. Updating Caelestia...")
+                        subprocess.run(["/home/yash/.local/bin/caelestia-update-location", coords], check=True)
+                    except ValueError:
+                        print("Invalid numeric coordinates received.")
+        except KeyboardInterrupt:
+            break
+        except Exception as e:
+            print(f"Error in listener loop: {e}", file=sys.stderr)
+
+if __name__ == "__main__":
+    main()

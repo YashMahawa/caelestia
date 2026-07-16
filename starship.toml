@@ -1,5 +1,9 @@
 # version: 1.0.0
 
+# Home has many top-level dirs; defaults (30ms scan / 500ms commands) time out.
+command_timeout = 2000
+scan_timeout = 1000
+
 add_newline = false
 continuation_prompt = "[▸▹ ](dimmed white)"
 

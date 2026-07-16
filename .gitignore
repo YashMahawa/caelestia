@@ -9,4 +9,13 @@
 /fish/fish_variables
 /fish/conf.d/
 
+*.bak
+*.bak-*
+*.backup-*
+*.disabled-test
+*broken-post-fork*
+*pre-package-sync*
+__pycache__/
+*.py[cod]
+
 .SRCINFO

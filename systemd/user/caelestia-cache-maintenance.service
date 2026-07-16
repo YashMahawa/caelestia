@@ -1,0 +1,19 @@
+[Unit]
+Description=Low-impact Caelestia cache and backup maintenance
+ConditionACPower=true
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/caelestia-cache-maintenance
+Nice=15
+CPUWeight=10
+IOWeight=10
+IOSchedulingClass=idle
+MemoryHigh=512M
+MemoryMax=1G
+TasksMax=32
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.cache %h/.npm %h/.local/share/Trash %h/.config/quickshell %h/.config/caelestia

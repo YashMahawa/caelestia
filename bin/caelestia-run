@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+profile="${1:-}"
+test -n "$profile" || {
+    echo "Usage: caelestia-run {background|daily|interactive|ml} command [args...]" >&2
+    exit 2
+}
+shift
+test "$#" -gt 0 || {
+    echo "caelestia-run: command required" >&2
+    exit 2
+}
+
+case "$profile" in
+    background)
+        cpu=20; io=20; nice=10
+        ;;
+    daily)
+        cpu=100; io=100; nice=0
+        ;;
+    interactive)
+        cpu=500; io=300; nice=0
+        ;;
+    ml)
+        cpu=800; io=500; nice=0
+        ;;
+    *)
+        echo "Unknown profile: $profile" >&2
+        exit 2
+        ;;
+esac
+
+unit="caelestia-${profile}-$(date +%s)-$$"
+exec systemd-run --user --unit="$unit" --collect --quiet \
+    --property="CPUWeight=$cpu" \
+    --property="IOWeight=$io" \
+    --property="Nice=$nice" \
+    --setenv="CAELESTIA_APP_PROFILE=$profile" \
+    -- "$@"

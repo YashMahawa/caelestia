@@ -3,6 +3,12 @@
 This is the main repo of the caelestia dots and contains the user configs for
 apps. This repo also includes an install script to install the entire dots.
 
+The `bin/` and `systemd/user/` directories in this fork also contain the
+resource-bounded launchers, low-impact cache maintenance, document indexing,
+power/thermal guard, shell recovery, local Spotlight search, and diagnostic
+services used by the maintained laptop setup. They contain no credentials;
+machine-local secrets and application sessions stay outside this repository.
+
 ## Installation
 
 Simply clone this repo and run the install script (you need
@@ -47,6 +53,9 @@ Dependencies:
 -   xdg-desktop-portal-gtk
 -   hyprpicker
 -   wl-clipboard
+-   grim
+-   slurp
+-   swappy
 -   cliphist
 -   inotify-tools
 -   app2unit

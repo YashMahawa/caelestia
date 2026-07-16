@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+mode="${1:-status}"
+case "$mode" in
+    status)
+        powerprofilesctl
+        state="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/caelestia/power-state.json"
+        test -r "$state" && jq . "$state"
+        ;;
+    battery|power-saver)
+        powerprofilesctl set power-saver
+        ;;
+    balanced|daily)
+        powerprofilesctl set balanced
+        ;;
+    performance|turbo)
+        powerprofilesctl set performance
+        ;;
+    *)
+        echo "Usage: caelestia-mode {status|battery|balanced|performance}" >&2
+        exit 2
+        ;;
+esac

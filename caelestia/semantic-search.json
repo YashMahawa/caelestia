@@ -1,0 +1,44 @@
+{
+  "roots": [
+    "/home/yash/Desktop",
+    "/home/yash/Documents",
+    "/home/yash/Downloads",
+    "/home/yash/Pictures",
+    "/home/yash/Videos",
+    "/home/yash/Music",
+    "/home/yash/Ob",
+    "/home/yash/Obsidian",
+    "/home/yash/Acads",
+    "/home/yash/ML"
+  ],
+  "exclude_directories": [
+    ".cache", "cache", ".git", ".hg", ".svn", ".idea", ".vscode", ".obsidian",
+    "__pycache__", "node_modules", ".venv", ".venv-openvino-convert",
+    "venv", "venv_new",
+    "build", "dist", "target", "coverage", ".next", ".nuxt",
+    "models", "checkpoints", "site-packages", "engines", ".Trash-1000", ".stfolder",
+    "System Volume Information", "Codex", "j2", "jre-8u461-linux-x64",
+    "postman-linux-x64", "ACCC_Installer", "chrome"
+  ],
+  "exclude_globs": [
+    "*.env", "*.key", "*.pem", "*.p12", "*.pfx", "*credentials*",
+    "*secret*", "*token*", "*password*", "*passwd*", "*cookie*", "*auth*",
+    "*_files", "*.iso", "*.img", "*.safetensors",
+    "*.gguf", "*.onnx", "*.pt", "*.pth", "*.apk", "*.AppImage",
+    "*.zip", "*.7z", "*.rar", "*.tar", "*.gz", "*.xz", "*.zst",
+    "*.o", "*.so", "*.a", "*.class", "*.pyc", "*.map", "*.min.js",
+    "*.cl_cache", "*.blob", "kaggle_run*", "kaggle_*_output", "*_output",
+    "vqa-rad-gemini-eval"
+  ],
+  "max_file_mb": 64,
+  "max_text_characters": 100000,
+  "embedding_characters": 7000,
+  "embedding_dimensions": 512,
+  "ocr": {
+    "enabled": true,
+    "languages": "eng",
+    "max_image_mb": 20,
+    "pdf_fallback": true,
+    "max_pdf_pages": 16
+  }
+}

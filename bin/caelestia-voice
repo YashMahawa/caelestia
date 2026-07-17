@@ -1,0 +1,180 @@
+#!/usr/bin/env python3
+"""On-demand Gemini dictation controller for Caelestia.
+
+The recording path has no ML imports and consumes no idle RAM.  Gemini is only
+loaded in the short-lived transcription worker after recording stops.
+"""
+
+from __future__ import annotations
+
+import fcntl
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HOME = Path.home()
+STATE_DIR = HOME / ".local/state/caelestia"
+STATE = STATE_DIR / "voice-state.json"
+PID_FILE = STATE_DIR / "voice-recorder.pid"
+LOCK = STATE_DIR / "voice.lock"
+AUDIO = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / "caelestia-voice.wav"
+VENV_PYTHON = HOME / "gemini_voice_assistant/venv_new/bin/python3"
+MODEL = "gemini-3.1-flash-lite"
+PROMPT = """Transcribe the user's speech accurately. Remove accidental filler words and apply spoken mid-sentence corrections, keeping only the corrected wording. Add natural punctuation. Do not censor profanity. Do not answer the user or invent facts: output only what was spoken. If there is only silence, background noise, or unintelligible speech, output exactly <NO TEXT>."""
+
+
+def write_state(status: str, message: str, *, detail: str = "") -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    payload = {"status": status, "message": message, "detail": detail, "updated": time.time()}
+    temporary = STATE.with_suffix(".tmp")
+    temporary.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    os.replace(temporary, STATE)
+
+
+def recorder_pid() -> int | None:
+    try:
+        pid = int(PID_FILE.read_text().strip())
+        os.kill(pid, 0)
+        return pid
+    except (OSError, ValueError):
+        PID_FILE.unlink(missing_ok=True)
+        return None
+
+
+def start() -> None:
+    if recorder_pid():
+        return
+    AUDIO.unlink(missing_ok=True)
+    process = subprocess.Popen(
+        ["ffmpeg", "-nostdin", "-loglevel", "error", "-y", "-f", "pulse", "-i", "default", "-ac", "1", "-ar", "16000", str(AUDIO)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    PID_FILE.write_text(str(process.pid), encoding="utf-8")
+    write_state("listening", "Listening…", detail="Press F9 again to transcribe")
+    subprocess.run(
+        ["systemd-run", "--user", "--quiet", "--collect", "--unit=caelestia-voice-timeout",
+         "--on-active=60s", str(Path(__file__).resolve()), "stop"],
+        check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+
+
+def stop() -> None:
+    subprocess.run(
+        ["systemctl", "--user", "stop", "caelestia-voice-timeout.timer"],
+        check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    pid = recorder_pid()
+    if not pid:
+        write_state("idle", "")
+        return
+    try:
+        os.kill(pid, signal.SIGINT)
+        for _ in range(30):
+            try:
+                os.kill(pid, 0)
+            except OSError:
+                break
+            time.sleep(0.05)
+        else:
+            os.kill(pid, signal.SIGTERM)
+    except OSError:
+        pass
+    PID_FILE.unlink(missing_ok=True)
+    write_state("processing", "Transcribing…", detail="Gemini is cleaning up your words")
+    python = str(VENV_PYTHON if VENV_PYTHON.exists() else Path(sys.executable))
+    subprocess.Popen(
+        [python, str(Path(__file__).resolve()), "_transcribe"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+def api_key() -> str | None:
+    for path in (HOME / "gemini_voice_assistant/paid_key", HOME / ".gemini_api_key"):
+        try:
+            value = path.read_text(encoding="utf-8").strip()
+            if value:
+                return value
+        except OSError:
+            pass
+    return os.environ.get("GEMINI_API_KEY")
+
+
+def paste(text: str) -> None:
+    subprocess.run(["wl-copy", "--", text], check=False)
+    terminal = False
+    try:
+        active = json.loads(subprocess.check_output(["hyprctl", "activewindow", "-j"], text=True))
+        window_class = active.get("class", "").casefold()
+        terminal = any(name in window_class for name in ("foot", "kitty", "ghostty", "alacritty", "terminal"))
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+        pass
+    keys = ["29:1", "42:1", "47:1", "47:0", "42:0", "29:0"] if terminal else ["29:1", "47:1", "47:0", "29:0"]
+    subprocess.run(["ydotool", "key", *keys], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def transcribe() -> None:
+    key = api_key()
+    if not key:
+        write_state("error", "Gemini key unavailable", detail="Add it to a private key file")
+        time.sleep(4)
+        write_state("idle", "")
+        return
+    try:
+        if not AUDIO.exists() or AUDIO.stat().st_size < 1500:
+            raise ValueError("No speech was recorded")
+        from google import genai
+        from google.genai import types
+
+        client = genai.Client(api_key=key)
+        response = client.models.generate_content(
+            model=MODEL,
+            contents=[PROMPT, types.Part.from_bytes(data=AUDIO.read_bytes(), mime_type="audio/wav")],
+            config=types.GenerateContentConfig(temperature=0),
+        )
+        text = (response.text or "").strip()
+        if not text or text in {"<NO TEXT>", "(<NO TEXT>)"}:
+            write_state("empty", "No clear speech detected")
+        else:
+            paste(text)
+            preview = text if len(text) <= 120 else text[:117] + "…"
+            write_state("done", "Pasted", detail=preview)
+    except Exception as error:
+        message = str(error).replace("\n", " ")[:160]
+        write_state("error", "Voice typing failed", detail=message)
+    finally:
+        AUDIO.unlink(missing_ok=True)
+    time.sleep(3 if json.loads(STATE.read_text()).get("status") != "error" else 5)
+    write_state("idle", "")
+
+
+def main() -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with LOCK.open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        command = sys.argv[1] if len(sys.argv) > 1 else "toggle"
+        if command == "start":
+            start()
+        elif command == "stop":
+            stop()
+        elif command == "toggle":
+            stop() if recorder_pid() else start()
+        elif command == "status":
+            print(STATE.read_text() if STATE.exists() else '{"status":"idle"}')
+        elif command == "_transcribe":
+            transcribe()
+        else:
+            raise SystemExit("usage: caelestia-voice [toggle|start|stop|status]")
+
+
+if __name__ == "__main__":
+    main()

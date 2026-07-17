@@ -1,0 +1,12 @@
+[Unit]
+Description=Continue visual search indexing in safe AC-powered batches
+
+[Timer]
+OnBootSec=30min
+OnUnitActiveSec=20min
+RandomizedDelaySec=3min
+Persistent=true
+Unit=caelestia-visual-index.service
+
+[Install]
+WantedBy=timers.target

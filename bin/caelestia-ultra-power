@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+state_dir="${HOME}/.local/state/caelestia"
+state_file="${state_dir}/ultra-power.json"
+lock_file="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/caelestia-ultra-power.lock"
+mkdir -p "$state_dir" "$(dirname "$lock_file")"
+exec 9>"$lock_file"
+flock -n 9 || exit 0
+
+service_active() {
+    systemctl --user is-active --quiet "$1" && printf true || printf false
+}
+
+shell_toast() {
+    /home/yash/.local/bin/caelestia-qs-ipc toaster info "$1" "$2" "$3" >/dev/null 2>&1 || true
+}
+
+signal_power_daemon() {
+    local pid
+    pid="$(systemctl --user show -P MainPID caelestia-power-daemon.service 2>/dev/null || true)"
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] && kill -USR1 "$pid" 2>/dev/null || true
+}
+
+active=false
+if [[ -r "$state_file" ]]; then
+    active="$(jq -r '.active // false' "$state_file" 2>/dev/null || printf false)"
+fi
+
+command="${1:-toggle}"
+if [[ "$command" == status ]]; then
+    [[ -r "$state_file" ]] && cat "$state_file" || printf '{"active":false}\n'
+    exit 0
+fi
+
+if [[ "$command" == off || ( "$command" == toggle && "$active" == true ) ]]; then
+    previous_profile="$(jq -r '.previous_profile // "balanced"' "$state_file")"
+    target_profile="${2:-$previous_profile}"
+    previous_brightness="$(jq -r '.previous_brightness // empty' "$state_file")"
+
+    jq '.active=false | .status="restoring" | .updated=now' "$state_file" >"${state_file}.tmp"
+    mv "${state_file}.tmp" "$state_file"
+    signal_power_daemon
+
+    powerprofilesctl set "$target_profile" 2>/dev/null || powerprofilesctl set balanced
+    if [[ "$previous_brightness" =~ ^[0-9]+$ ]]; then
+        brightnessctl set "$previous_brightness" >/dev/null 2>&1 || true
+    fi
+    hyprctl reload >/dev/null 2>&1 || true
+
+    for unit in caelestia-semantic-watch.service caelestia-semantic-backfill.timer caelestia-visual-index.timer caelestia-cache-maintenance.timer caelestia-location-listener.service; do
+        if [[ "$(jq -r --arg unit "$unit" '.services[$unit] // false' "$state_file")" == true ]]; then
+            systemctl --user start "$unit" >/dev/null 2>&1 || true
+        fi
+    done
+
+    jq '.active=false | .status="off" | .updated=now' "$state_file" >"${state_file}.tmp"
+    mv "${state_file}.tmp" "$state_file"
+    shell_toast "Ultra Power Saver off" "Your previous profile, brightness and background services were restored." "battery_charging_full"
+    exit 0
+fi
+
+if [[ "$command" != on && "$command" != toggle ]]; then
+    echo "usage: caelestia-ultra-power [toggle|on|off|status]" >&2
+    exit 2
+fi
+
+previous_profile="$(powerprofilesctl get 2>/dev/null || printf balanced)"
+previous_brightness="$(brightnessctl get 2>/dev/null || true)"
+
+jq -n \
+    --arg profile "$previous_profile" \
+    --argjson brightness "${previous_brightness:-null}" \
+    --argjson semantic_watch "$(service_active caelestia-semantic-watch.service)" \
+    --argjson semantic_timer "$(service_active caelestia-semantic-backfill.timer)" \
+    --argjson visual_timer "$(service_active caelestia-visual-index.timer)" \
+    --argjson cache_timer "$(service_active caelestia-cache-maintenance.timer)" \
+    --argjson location "$(service_active caelestia-location-listener.service)" \
+    '{active:true,status:"entering",previous_profile:$profile,previous_brightness:$brightness,updated:now,
+      services:{"caelestia-semantic-watch.service":$semantic_watch,"caelestia-semantic-backfill.timer":$semantic_timer,"caelestia-visual-index.timer":$visual_timer,
+      "caelestia-cache-maintenance.timer":$cache_timer,"caelestia-location-listener.service":$location}}' >"${state_file}.tmp"
+mv "${state_file}.tmp" "$state_file"
+
+systemctl --user stop caelestia-semantic-index.service >/dev/null 2>&1 || true
+systemctl --user stop caelestia-semantic-query.service >/dev/null 2>&1 || true
+systemctl --user stop caelestia-visual-index.service >/dev/null 2>&1 || true
+systemctl --user stop caelestia-semantic-watch.service caelestia-semantic-backfill.timer caelestia-visual-index.timer caelestia-cache-maintenance.timer caelestia-location-listener.service >/dev/null 2>&1 || true
+powerprofilesctl set power-saver
+signal_power_daemon
+
+if [[ "$previous_brightness" =~ ^[0-9]+$ ]]; then
+    max_brightness="$(brightnessctl max 2>/dev/null || true)"
+    if [[ "$max_brightness" =~ ^[0-9]+$ ]]; then
+        cap=$((max_brightness * 35 / 100))
+        (( previous_brightness > cap )) && brightnessctl set "$cap" >/dev/null 2>&1 || true
+    fi
+fi
+
+hyprctl keyword animations:enabled false >/dev/null 2>&1 || true
+hyprctl keyword decoration:blur:enabled false >/dev/null 2>&1 || true
+jq '.status="on" | .updated=now' "$state_file" >"${state_file}.tmp"
+mv "${state_file}.tmp" "$state_file"
+shell_toast "Ultra Power Saver on" "ML indexing and nonessential listeners are paused. Video, Chrome, PDFs and Bluetooth audio remain fully available." "battery_saver"

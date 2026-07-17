@@ -1,0 +1,54 @@
+#!/usr/bin/python3
+"""Small client for the short-lived semantic query service."""
+
+import argparse
+import json
+import os
+import socket
+import subprocess
+import time
+from pathlib import Path
+
+parser = argparse.ArgumentParser()
+parser.add_argument("query")
+parser.add_argument("-n", "--count", type=int, default=10)
+args = parser.parse_args()
+path = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / "caelestia-semantic-search.sock"
+request = (json.dumps({"query": args.query, "count": args.count}) + "\n").encode()
+
+ultra_state = Path.home() / ".local/state/caelestia/ultra-power.json"
+try:
+    ultra_active = json.loads(ultra_state.read_text()).get("active", False)
+except (OSError, ValueError):
+    ultra_active = False
+if ultra_active:
+    environment = os.environ.copy()
+    environment["CAELESTIA_LEXICAL_ONLY"] = "1"
+    subprocess.run(
+        [str(Path.home() / ".local/bin/caelestia-semantic-search"), "search", args.query, "-n", str(args.count), "--json"],
+        env=environment,
+    )
+    raise SystemExit
+
+for attempt in range(30):
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        client.settimeout(30)
+        client.connect(str(path))
+        client.sendall(request)
+        response = b""
+        while not response.endswith(b"\n"):
+            chunk = client.recv(65536)
+            if not chunk:
+                break
+            response += chunk
+        print(response.decode().strip() or "[]")
+        break
+    except (FileNotFoundError, ConnectionRefusedError):
+        if attempt == 0:
+            subprocess.run(["systemctl", "--user", "start", "caelestia-semantic-query.service"], check=False)
+        time.sleep(0.1)
+    finally:
+        client.close()
+else:
+    print(json.dumps({"error": "semantic search service did not start"}))

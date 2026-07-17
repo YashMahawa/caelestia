@@ -1,0 +1,17 @@
+[Unit]
+Description=Caelestia event-driven semantic file watcher
+After=graphical-session.target
+
+[Service]
+ExecStart=/usr/bin/python3 %h/.local/share/caelestia-search/watch.py
+Restart=on-failure
+RestartSec=3
+Nice=10
+MemoryMax=160M
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/share/caelestia-search
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

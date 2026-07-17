@@ -1,0 +1,16 @@
+[Unit]
+Description=Short-lived Caelestia semantic query engine
+
+[Service]
+Type=simple
+ExecStart=%h/.local/share/caelestia-search/semantic_search.py serve
+Nice=5
+CPUWeight=50
+MemoryHigh=1100M
+MemoryMax=1400M
+TasksMax=48
+TimeoutStopSec=3
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/share/caelestia-search %h/.cache/caelestia-search %t
+PrivateTmp=true

@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -euo pipefail
+ultra_state="$HOME/.local/state/caelestia/ultra-power.json"
+if [[ ! -r "$ultra_state" ]] || [[ "$(jq -r '.active // false' "$ultra_state" 2>/dev/null)" != true ]]; then
+    systemctl --user start --no-block caelestia-semantic-query.service >/dev/null 2>&1 || true
+fi
+exec /home/yash/.local/bin/caelestia-qs-ipc drawers toggle launcher

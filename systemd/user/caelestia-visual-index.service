@@ -1,0 +1,19 @@
+[Unit]
+Description=Bounded iGPU visual labelling for Caelestia search
+ConditionACPower=true
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/share/caelestia-search/visual_index.py 16
+Nice=18
+CPUWeight=5
+IOWeight=5
+IOSchedulingClass=idle
+MemoryHigh=1500M
+MemoryMax=1850M
+TasksMax=48
+TimeoutStartSec=10min
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/share/caelestia-search %h/.cache/caelestia-search
+PrivateTmp=true

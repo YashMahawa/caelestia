@@ -20,6 +20,7 @@ NO_TURBO = "/sys/devices/system/cpu/intel_pstate/no_turbo"
 MAX_PERF = "/sys/devices/system/cpu/intel_pstate/max_perf_pct"
 STATE_DIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "caelestia")
 STATE_FILE = os.path.join(STATE_DIR, "power-state.json")
+ULTRA_STATE_FILE = os.path.expanduser("~/.local/state/caelestia/ultra-power.json")
 
 PROFILE_POLICY = {
     "power-saver": {"max_perf": 62, "no_turbo": 1},
@@ -88,6 +89,13 @@ def cpu_temperature():
 
 def active_policy():
     base = PROFILE_POLICY.get(profile, PROFILE_POLICY["balanced"]).copy()
+    try:
+        with open(ULTRA_STATE_FILE, encoding="utf-8") as handle:
+            if json.load(handle).get("active"):
+                base["max_perf"] = min(base["max_perf"], 45)
+                base["no_turbo"] = 1
+    except (OSError, ValueError):
+        pass
     if thermal_state == "soft":
         base["max_perf"] = min(base["max_perf"], 65)
     elif thermal_state == "hard":
@@ -188,6 +196,7 @@ def main():
     GLib.timeout_add_seconds(SAMPLE_SECONDS, update_thermal_state)
     signal.signal(signal.SIGTERM, lambda *_: loop.quit())
     signal.signal(signal.SIGINT, lambda *_: loop.quit())
+    signal.signal(signal.SIGUSR1, lambda *_: GLib.idle_add(apply_policy))
     loop.run()
 
 

@@ -17,8 +17,11 @@ case "$mode" in
     performance|turbo)
         powerprofilesctl set performance
         ;;
+    ultra)
+        exec /home/yash/.local/bin/caelestia-ultra-power toggle
+        ;;
     *)
-        echo "Usage: caelestia-mode {status|battery|balanced|performance}" >&2
+        echo "Usage: caelestia-mode {status|battery|balanced|performance|ultra}" >&2
         exit 2
         ;;
 esac

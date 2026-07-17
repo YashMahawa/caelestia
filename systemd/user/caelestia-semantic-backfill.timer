@@ -1,0 +1,12 @@
+[Unit]
+Description=Finish the initial semantic index in small AC-powered batches
+
+[Timer]
+OnBootSec=20min
+OnUnitActiveSec=10min
+RandomizedDelaySec=2min
+Persistent=true
+Unit=caelestia-semantic-index.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,644 @@
+#!/home/yash/ML/.venv/bin/python
+"""Selective, local, event-driven semantic file search for Caelestia."""
+
+from __future__ import annotations
+
+import argparse
+import difflib
+import fnmatch
+import json
+import mimetypes
+import os
+import sqlite3
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+import zipfile
+from pathlib import Path
+from xml.etree import ElementTree
+
+import numpy as np
+
+HOME = Path.home()
+APP = HOME / ".local/share/caelestia-search"
+CONFIG_PATH = HOME / ".config/caelestia/semantic-search.json"
+DB_PATH = APP / "index.sqlite3"
+MODEL_PATH = HOME / "ML/models/embeddinggemma-300m-int4-ov"
+CACHE_PATH = HOME / ".cache/caelestia-search/embeddinggemma-ov"
+MODEL_ID = "embeddinggemma-300m-int4-sym-g32-ov-v1"
+QUERY_EMBEDDER = None
+GPU_SCORER = None
+
+PLAIN_EXTENSIONS = {
+    ".txt", ".md", ".markdown", ".rst", ".org", ".tex", ".csv", ".tsv",
+    ".json", ".jsonl", ".yaml", ".yml", ".toml", ".ini", ".conf", ".log",
+    ".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".java", ".kt",
+    ".kts", ".c", ".h", ".cc", ".cpp", ".hpp", ".rs", ".go", ".sh",
+    ".bash", ".zsh", ".fish", ".sql", ".html", ".htm", ".css", ".scss",
+    ".qml", ".xml", ".svg", ".ipynb", ".properties", ".desktop", ".service",
+    ".timer", ".graphql", ".f", ".f90",
+}
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff", ".bmp"}
+OFFICE_EXTENSIONS = {".docx", ".pptx", ".xlsx", ".odt", ".odp", ".ods"}
+
+
+def config() -> dict:
+    return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+
+
+def connect() -> sqlite3.Connection:
+    APP.mkdir(parents=True, exist_ok=True)
+    db = sqlite3.connect(DB_PATH, timeout=30)
+    db.execute("PRAGMA journal_mode=WAL")
+    db.execute("PRAGMA synchronous=NORMAL")
+    db.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS files (
+            path TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            parent TEXT NOT NULL,
+            mime TEXT,
+            size INTEGER NOT NULL,
+            mtime_ns INTEGER NOT NULL,
+            text TEXT NOT NULL DEFAULT '',
+            vector BLOB,
+            vector_dim INTEGER,
+            indexed_at INTEGER NOT NULL
+        );
+        CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(
+            path UNINDEXED, name, parent, text,
+            tokenize='unicode61 remove_diacritics 2'
+        );
+        CREATE TABLE IF NOT EXISTS pending (
+            path TEXT PRIMARY KEY,
+            queued_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS visual_tags (
+            path TEXT PRIMARY KEY,
+            mtime_ns INTEGER NOT NULL,
+            tags TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS files_mtime ON files(mtime_ns);
+        """
+    )
+    columns = {row[1] for row in db.execute("PRAGMA table_info(files)")}
+    if "kind" not in columns:
+        db.execute("ALTER TABLE files ADD COLUMN kind TEXT NOT NULL DEFAULT 'file'")
+    return db
+
+
+def excluded(path: Path, cfg: dict) -> bool:
+    try:
+        relative_parts = set(path.relative_to(HOME).parts)
+    except ValueError:
+        relative_parts = set(path.parts)
+    if relative_parts.intersection(cfg["exclude_directories"]):
+        return True
+    name = path.name.casefold()
+    return any(fnmatch.fnmatch(name, pattern.casefold()) for pattern in cfg["exclude_globs"])
+
+
+def supported(path: Path, cfg: dict) -> bool:
+    try:
+        stat = path.stat()
+    except (FileNotFoundError, PermissionError, OSError):
+        return False
+    return (
+        (path.is_file() or path.is_dir())
+        and not path.is_symlink()
+        and (path.is_dir() or stat.st_size <= cfg["max_file_mb"] * 1024 * 1024)
+        and not excluded(path, cfg)
+    )
+
+
+def roots(cfg: dict) -> list[Path]:
+    return [Path(p) for p in cfg["roots"] if Path(p).is_dir()]
+
+
+def iter_files(cfg: dict):
+    excluded_dirs = set(cfg["exclude_directories"])
+    for root in roots(cfg):
+        for current, dirs, names in os.walk(root, followlinks=False):
+            dirs[:] = [
+                d for d in dirs
+                if d not in excluded_dirs and not excluded(Path(current) / d, cfg)
+            ]
+            for name in dirs:
+                path = Path(current) / name
+                if supported(path, cfg):
+                    yield path
+            for name in names:
+                path = Path(current) / name
+                if supported(path, cfg):
+                    yield path
+
+
+def command_text(command: list[str], timeout: int = 30) -> str:
+    try:
+        result = subprocess.run(
+            command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=timeout, check=False,
+        )
+        if result.returncode == 0:
+            return result.stdout.decode("utf-8", errors="replace")
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return ""
+
+
+def office_text(path: Path) -> str:
+    chunks: list[str] = []
+    try:
+        with zipfile.ZipFile(path) as archive:
+            for name in archive.namelist():
+                if not name.endswith(".xml"):
+                    continue
+                if not any(part in name for part in ("document", "slide", "sheet", "content")):
+                    continue
+                try:
+                    root = ElementTree.fromstring(archive.read(name))
+                    chunks.extend(node.text for node in root.iter() if node.text)
+                except (ElementTree.ParseError, KeyError):
+                    continue
+    except (OSError, zipfile.BadZipFile):
+        return ""
+    return " ".join(chunks)
+
+
+def extract_text(path: Path, cfg: dict) -> str:
+    if path.is_dir():
+        return ""
+    suffix = path.suffix.casefold()
+    limit = cfg["max_text_characters"]
+    if suffix in PLAIN_EXTENSIONS or not suffix:
+        try:
+            return path.read_text(encoding="utf-8", errors="replace")[:limit]
+        except OSError:
+            return ""
+    if suffix == ".pdf":
+        text = command_text(["pdftotext", "-q", "-f", "1", "-l", "80", str(path), "-"], 45)
+        if len("".join(text.split())) >= 40 or not cfg["ocr"].get("pdf_fallback", True):
+            return text[:limit]
+        chunks: list[str] = []
+        max_pages = int(cfg["ocr"].get("max_pdf_pages", 16))
+        with tempfile.TemporaryDirectory(prefix="caelestia-ocr-") as temporary:
+            prefix = str(Path(temporary) / "page")
+            command_text(
+                ["pdftoppm", "-q", "-f", "1", "-l", str(max_pages), "-jpeg", "-scale-to", "1800", str(path), prefix],
+                180,
+            )
+            for image in sorted(Path(temporary).glob("page-*.jpg")):
+                chunks.append(command_text(
+                    ["tesseract", str(image), "stdout", "-l", cfg["ocr"]["languages"], "--psm", "6"], 45
+                ))
+                if sum(map(len, chunks)) >= limit:
+                    break
+        return "\n".join(chunks)[:limit]
+    if suffix in OFFICE_EXTENSIONS:
+        return office_text(path)[:limit]
+    if suffix in IMAGE_EXTENSIONS and cfg["ocr"]["enabled"]:
+        try:
+            if path.stat().st_size > cfg["ocr"]["max_image_mb"] * 1024 * 1024:
+                return ""
+        except OSError:
+            return ""
+        return command_text(
+            ["tesseract", str(path), "stdout", "-l", cfg["ocr"]["languages"], "--psm", "11"],
+            45,
+        )[:limit]
+    return ""
+
+
+class Embedder:
+    def __init__(self, dimensions: int, *, query: bool = False):
+        import openvino as ov
+        from transformers import AutoTokenizer
+
+        CACHE_PATH.mkdir(parents=True, exist_ok=True)
+        self.dimensions = dimensions
+        self.query = query
+        self.batch_size = 1 if query else 4
+        self.sequence_length = 128
+        waydroid_running = False
+        if not query:
+            try:
+                status = subprocess.run(
+                    ["waydroid", "status"],
+                    capture_output=True, text=True, timeout=3, check=False,
+                ).stdout
+                waydroid_running = "Container:\tRUNNING" in status
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        self.device = "CPU" if query or waydroid_running else "GPU"
+        device_cache = CACHE_PATH / self.device.casefold()
+        device_cache.mkdir(parents=True, exist_ok=True)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            MODEL_PATH, padding_side="right", local_files_only=True
+        )
+        core = ov.Core()
+        model = core.read_model(MODEL_PATH / "openvino_model_pruned.xml")
+        shape = [self.batch_size, self.sequence_length]
+        model.reshape({
+            "input_ids": shape,
+            "attention_mask": shape,
+            "position_ids": shape,
+        })
+        self.model = core.compile_model(
+            model,
+            self.device,
+            {
+                "CACHE_DIR": str(device_cache),
+                "PERFORMANCE_HINT": "LATENCY" if query else "THROUGHPUT",
+            },
+        )
+        self.output = self.model.output(0)
+        dense1 = core.read_model(MODEL_PATH / "dense1.xml")
+        dense1.reshape({"input": [self.batch_size, 768]})
+        self.dense1 = core.compile_model(
+            dense1, self.device, {"CACHE_DIR": str(device_cache)}
+        )
+        dense2 = core.read_model(MODEL_PATH / "dense2.xml")
+        dense2.reshape({"input": [self.batch_size, 3072]})
+        self.dense2 = core.compile_model(
+            dense2, self.device, {"CACHE_DIR": str(device_cache)}
+        )
+
+    def encode(self, texts: list[str]) -> np.ndarray:
+        count = len(texts)
+        prefix = "task: search result | query: " if self.query else "title: none | text: "
+        texts = [prefix + text for text in texts]
+        if count < self.batch_size:
+            texts.extend([texts[-1]] * (self.batch_size - count))
+        batch = self.tokenizer(
+            texts,
+            padding="max_length",
+            truncation=True,
+            max_length=self.sequence_length,
+            return_tensors="np",
+        )
+        batch["position_ids"] = np.broadcast_to(
+            np.arange(self.sequence_length, dtype=np.int64),
+            (self.batch_size, self.sequence_length),
+        ).copy()
+        hidden = self.model(
+            {
+                "input_ids": batch["input_ids"],
+                "attention_mask": batch["attention_mask"],
+                "position_ids": batch["position_ids"],
+            }
+        )[self.output]
+        mask = batch["attention_mask"][..., None]
+        pooled = (hidden * mask).sum(axis=1) / np.maximum(mask.sum(axis=1), 1)
+        projected = self.dense1(pooled)[self.dense1.output(0)]
+        vectors = self.dense2(projected)[self.dense2.output(0)]
+        vectors = vectors[:, : self.dimensions].astype(np.float32)
+        vectors /= np.maximum(np.linalg.norm(vectors, axis=1, keepdims=True), 1e-9)
+        return vectors[:count]
+
+
+class GpuVectorScorer:
+    """Reusable OpenCL cosine scorer; compilation happens once per query service."""
+
+    def __init__(self):
+        import pyopencl as cl
+        self.cl = cl
+        device = next(
+            device for platform in cl.get_platforms()
+            for device in platform.get_devices(device_type=cl.device_type.GPU)
+            if "Intel" in device.vendor or "Intel" in device.name
+        )
+        self.context = cl.Context([device])
+        self.queue = cl.CommandQueue(self.context)
+        self.program = cl.Program(self.context, """
+        __kernel void score(__global const float *matrix, __global const float *query,
+                            __global float *scores, const int dimensions) {
+            int row = get_global_id(0);
+            int base = row * dimensions;
+            float total = 0.0f;
+            for (int column = 0; column < dimensions; ++column)
+                total += matrix[base + column] * query[column];
+            scores[row] = total;
+        }
+        """).build(options=["-cl-fast-relaxed-math"])
+
+    def score(self, vectors: np.ndarray, query: np.ndarray) -> np.ndarray:
+        cl = self.cl
+        matrix = np.ascontiguousarray(vectors, dtype=np.float32)
+        query = np.ascontiguousarray(query, dtype=np.float32)
+        output = np.empty(len(matrix), dtype=np.float32)
+        flags = cl.mem_flags
+        matrix_buffer = cl.Buffer(self.context, flags.READ_ONLY | flags.COPY_HOST_PTR, hostbuf=matrix)
+        query_buffer = cl.Buffer(self.context, flags.READ_ONLY | flags.COPY_HOST_PTR, hostbuf=query)
+        output_buffer = cl.Buffer(self.context, flags.WRITE_ONLY, output.nbytes)
+        self.program.score(
+            self.queue, (len(matrix),), None, matrix_buffer, query_buffer,
+            output_buffer, np.int32(matrix.shape[1]),
+        )
+        cl.enqueue_copy(self.queue, output, output_buffer).wait()
+        return output
+
+
+def queue_path(db: sqlite3.Connection, path: Path):
+    db.execute(
+        "INSERT INTO pending(path, queued_at) VALUES(?, ?) "
+        "ON CONFLICT(path) DO UPDATE SET queued_at=excluded.queued_at",
+        (str(path), time.time_ns()),
+    )
+
+
+def discover(full: bool = False):
+    cfg = config()
+    db = connect()
+    if full:
+        db.execute("CREATE TEMP TABLE seen_paths(path TEXT PRIMARY KEY)")
+    seen: set[str] = set()
+    queued = 0
+    for path in iter_files(cfg):
+        raw = str(path)
+        seen.add(raw)
+        if full:
+            db.execute("INSERT OR IGNORE INTO seen_paths(path) VALUES(?)", (raw,))
+        stat = path.stat()
+        row = db.execute("SELECT size, mtime_ns FROM files WHERE path=?", (raw,)).fetchone()
+        kind = "folder" if path.is_dir() else "file"
+        parent = str(path.parent.relative_to(HOME)) if path.is_relative_to(HOME) else str(path.parent)
+        mime = "inode/directory" if kind == "folder" else (mimetypes.guess_type(path.name)[0] or "")
+        if row is None:
+            db.execute(
+                "INSERT INTO files(path,name,parent,mime,size,mtime_ns,indexed_at,kind) VALUES(?,?,?,?,?,?,0,?)",
+                (raw, path.name, parent, mime, 0 if kind == "folder" else stat.st_size, stat.st_mtime_ns, kind),
+            )
+            db.execute(
+                "INSERT INTO files_fts(path,name,parent,text) VALUES(?,?,?,?)",
+                (raw, path.name, parent, ""),
+            )
+        expected_size = 0 if kind == "folder" else stat.st_size
+        if full or row != (expected_size, stat.st_mtime_ns):
+            queue_path(db, path)
+            queued += 1
+    if full:
+        db.execute("DELETE FROM files WHERE path NOT IN (SELECT path FROM seen_paths)")
+        db.execute("DELETE FROM pending WHERE path NOT IN (SELECT path FROM seen_paths)")
+        # FTS5 has no normal index on its unindexed path column. Rebuilding once
+        # is dramatically cheaper than thousands of per-path virtual-table scans.
+        db.execute("DELETE FROM files_fts")
+        db.execute("INSERT INTO files_fts(path,name,parent,text) SELECT path,name,parent,text FROM files")
+    db.commit()
+    print(json.dumps({"discovered": len(seen), "queued": queued}))
+
+
+def remove_path(db: sqlite3.Connection, raw: str):
+    db.execute("DELETE FROM files WHERE path=?", (raw,))
+    db.execute("DELETE FROM files_fts WHERE path=?", (raw,))
+    db.execute("DELETE FROM pending WHERE path=?", (raw,))
+
+
+def work(limit: int = 0):
+    cfg = config()
+    db = connect()
+    embedder: Embedder | None = None
+    processed = failed = 0
+    while True:
+        batch_rows = db.execute(
+            "SELECT path FROM pending ORDER BY queued_at DESC LIMIT 4"
+        ).fetchall()
+        if not batch_rows or (limit and processed >= limit):
+            break
+        documents: list[tuple[Path, os.stat_result, str, str]] = []
+        for (raw,) in batch_rows:
+            path = Path(raw)
+            if not supported(path, cfg):
+                remove_path(db, raw)
+                continue
+            try:
+                stat = path.stat()
+                text = extract_text(path, cfg)
+                visual = db.execute("SELECT tags FROM visual_tags WHERE path=?", (raw,)).fetchone()
+                if visual:
+                    text = f"{text}\nVisual content: {visual[0]}".strip()
+                relative = str(path.parent.relative_to(HOME)) if path.is_relative_to(HOME) else str(path.parent)
+                kind = "folder" if path.is_dir() else "file"
+                semantic = (
+                    f"{kind.title()}: {path.name}\nParent: {relative}\n"
+                    f"Type: {mimetypes.guess_type(path.name)[0] or path.suffix or kind}\n"
+                    f"Content:\n{text[:cfg['embedding_characters']]}"
+                )
+                documents.append((path, stat, text, semantic))
+            except (OSError, ValueError):
+                failed += 1
+                db.execute("DELETE FROM pending WHERE path=?", (raw,))
+        if not documents:
+            db.commit()
+            continue
+        if embedder is None:
+            embedder = Embedder(cfg["embedding_dimensions"])
+        vectors = embedder.encode([item[3] for item in documents])
+        for (path, stat, text, _semantic), vector in zip(documents, vectors):
+            raw = str(path)
+            kind = "folder" if path.is_dir() else "file"
+            mime = "inode/directory" if kind == "folder" else (mimetypes.guess_type(path.name)[0] or "")
+            parent = str(path.parent.relative_to(HOME)) if path.is_relative_to(HOME) else str(path.parent)
+            db.execute(
+                """
+                INSERT INTO files(path,name,parent,mime,size,mtime_ns,text,vector,vector_dim,indexed_at,kind)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(path) DO UPDATE SET
+                  name=excluded.name,parent=excluded.parent,mime=excluded.mime,size=excluded.size,
+                  mtime_ns=excluded.mtime_ns,text=excluded.text,vector=excluded.vector,
+                  vector_dim=excluded.vector_dim,indexed_at=excluded.indexed_at,kind=excluded.kind
+                """,
+                (
+                    raw, path.name, parent, mime, stat.st_size, stat.st_mtime_ns, text,
+                    vector.astype(np.float16).tobytes(), len(vector), int(time.time()), kind,
+                ),
+            )
+            db.execute("DELETE FROM files_fts WHERE path=?", (raw,))
+            db.execute(
+                "INSERT INTO files_fts(path,name,parent,text) VALUES(?,?,?,?)",
+                (raw, path.name, parent, text),
+            )
+            db.execute("DELETE FROM pending WHERE path=?", (raw,))
+            processed += 1
+        db.commit()
+    print(json.dumps({"processed": processed, "failed": failed}))
+
+
+def search(query: str, count: int = 20, json_output: bool = False):
+    global QUERY_EMBEDDER, GPU_SCORER
+    cfg = config()
+    db = connect()
+    rows = db.execute(
+        "SELECT path,name,parent,mime,size,mtime_ns,vector,vector_dim,kind FROM files WHERE vector IS NOT NULL"
+    ).fetchall()
+    if os.environ.get("CAELESTIA_LEXICAL_ONLY") == "1":
+        rows = []
+    scores = np.array([], dtype=np.float32)
+    if rows:
+        if QUERY_EMBEDDER is None:
+            QUERY_EMBEDDER = Embedder(cfg["embedding_dimensions"], query=True)
+        query_vector = QUERY_EMBEDDER.encode([query])[0]
+        vectors = np.vstack([
+            np.frombuffer(row[6], dtype=np.float16, count=row[7]).astype(np.float32)
+            for row in rows
+        ])
+    else:
+        vectors = np.empty((0, cfg["embedding_dimensions"]), dtype=np.float32)
+    vector_scores = None
+    ultra = HOME / ".local/state/caelestia/ultra-power.json"
+    ultra_active = False
+    try:
+        ultra_active = json.loads(ultra.read_text()).get("active", False)
+    except (OSError, ValueError):
+        pass
+    if len(rows) >= 256 and not ultra_active:
+        try:
+            if GPU_SCORER is None:
+                GPU_SCORER = GpuVectorScorer()
+            vector_scores = GPU_SCORER.score(vectors, query_vector)
+        except Exception:
+            vector_scores = None
+    if rows and vector_scores is None:
+        vector_scores = vectors @ query_vector
+    if vector_scores is not None:
+        scores = vector_scores
+    lexical: dict[str, float] = {}
+    try:
+        terms = " OR ".join(f'"{word.replace(chr(34), "")}"' for word in query.split() if word)
+        if terms:
+            for raw, rank in db.execute(
+                "SELECT path,bm25(files_fts,1.0,3.0,1.5,0.5) FROM files_fts "
+                "WHERE files_fts MATCH ? ORDER BY rank LIMIT 100", (terms,)
+            ):
+                lexical[raw] = 1.0 / (1.0 + abs(float(rank)))
+    except sqlite3.OperationalError:
+        pass
+    fuzzy: dict[str, float] = {}
+    query_folded = query.casefold()
+    if len(query_folded) >= 3:
+        for raw, name in db.execute("SELECT path,name FROM files"):
+            stem = Path(name).stem.casefold()
+            tokens = [name.casefold(), stem, *stem.replace("_", " ").replace("-", " ").split()]
+            similarity = max(difflib.SequenceMatcher(None, query_folded, token).ratio() for token in tokens)
+            if similarity >= 0.74:
+                fuzzy[raw] = similarity
+
+    candidates: dict[str, tuple[float, tuple]] = {}
+    sorted_semantic = sorted((float(value) for value in scores), reverse=True)
+    semantic_confident = False
+    if sorted_semantic:
+        comparison = sorted_semantic[min(4, len(sorted_semantic) - 1)]
+        semantic_confident = sorted_semantic[0] >= 0.78 and sorted_semantic[0] - comparison >= 0.035
+    for index, row in enumerate(rows):
+        name_bonus = 0.8 if query_folded in row[1].casefold() else 0.0
+        lexical_score = lexical.get(row[0], 0.0)
+        fuzzy_score = fuzzy.get(row[0], 0.0)
+        semantic_score = float(scores[index])
+        # Weak semantic similarities are worse than an honest empty result.
+        if not lexical_score and not fuzzy_score and not name_bonus and (not semantic_confident or semantic_score < 0.58):
+            continue
+        combined = semantic_score + 0.7 * lexical_score + 0.65 * fuzzy_score + name_bonus
+        candidates[row[0]] = (combined, row)
+    named_paths = set(lexical) | set(fuzzy)
+    if named_paths:
+        placeholders = ",".join("?" for _ in named_paths)
+        for row in db.execute(
+            f"SELECT path,name,parent,mime,size,mtime_ns,vector,vector_dim,kind FROM files WHERE path IN ({placeholders})",
+            tuple(named_paths),
+        ):
+            if row[0] in candidates:
+                continue
+            name_bonus = 0.8 if query_folded in row[1].casefold() else 0.0
+            combined = 0.7 * lexical.get(row[0], 0.0) + 0.65 * fuzzy.get(row[0], 0.0) + name_bonus
+            candidates[row[0]] = (combined, row)
+    ranked = sorted(candidates.values(), key=lambda item: item[0], reverse=True)[:count]
+    results = [{
+        "path": row[0], "name": row[1], "parent": row[2], "mime": row[3],
+        "size": row[4], "mtime_ns": row[5], "kind": row[8], "score": round(score, 5),
+    } for score, row in ranked]
+    if json_output:
+        print(json.dumps(results, ensure_ascii=False))
+    else:
+        for result in results:
+            print(f"{result['score']:.4f}\t{result['path']}")
+
+
+def serve():
+    global QUERY_EMBEDDER
+    runtime = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
+    socket_path = runtime / "caelestia-semantic-search.sock"
+    socket_path.unlink(missing_ok=True)
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(str(socket_path))
+    os.chmod(socket_path, 0o600)
+    server.listen(4)
+    server.settimeout(45)
+    # Launcher startup pre-warms the compact query model while apps are already
+    # visible, so semantic results are fast by the time the user finishes typing.
+    QUERY_EMBEDDER = Embedder(config()["embedding_dimensions"], query=True)
+    try:
+        while True:
+            try:
+                connection, _ = server.accept()
+            except TimeoutError:
+                break
+            with connection:
+                request = b""
+                while not request.endswith(b"\n") and len(request) < 65536:
+                    part = connection.recv(65536)
+                    if not part:
+                        break
+                    request += part
+                try:
+                    payload = json.loads(request)
+                    import io
+                    from contextlib import redirect_stdout
+                    output = io.StringIO()
+                    with redirect_stdout(output):
+                        search(str(payload["query"]), min(int(payload.get("count", 10)), 20), True)
+                    response = output.getvalue().strip() or "[]"
+                except Exception as error:
+                    response = json.dumps({"error": str(error)[:200]})
+                connection.sendall(response.encode("utf-8") + b"\n")
+    finally:
+        server.close()
+        socket_path.unlink(missing_ok=True)
+
+
+def status():
+    db = connect()
+    files = db.execute("SELECT count(*) FROM files").fetchone()[0]
+    pending = db.execute("SELECT count(*) FROM pending").fetchone()[0]
+    size = DB_PATH.stat().st_size if DB_PATH.exists() else 0
+    print(json.dumps({"files": files, "pending": pending, "database_bytes": size}))
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    commands = parser.add_subparsers(dest="command", required=True)
+    scan = commands.add_parser("scan")
+    scan.add_argument("--full", action="store_true")
+    worker = commands.add_parser("work")
+    worker.add_argument("--limit", type=int, default=0)
+    finder = commands.add_parser("search")
+    finder.add_argument("query")
+    finder.add_argument("-n", "--count", type=int, default=20)
+    finder.add_argument("--json", action="store_true")
+    commands.add_parser("status")
+    commands.add_parser("serve")
+    args = parser.parse_args()
+    if args.command == "scan":
+        discover(args.full)
+    elif args.command == "work":
+        work(args.limit)
+    elif args.command == "search":
+        search(args.query, args.count, args.json)
+    elif args.command == "status":
+        status()
+    elif args.command == "serve":
+        serve()
+
+
+if __name__ == "__main__":
+    main()

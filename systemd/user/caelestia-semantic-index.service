@@ -1,0 +1,19 @@
+[Unit]
+Description=Caelestia bounded local semantic indexing worker
+ConditionACPower=true
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/share/caelestia-search/semantic_search.py work --limit 48
+Nice=15
+CPUWeight=10
+IOWeight=10
+IOSchedulingClass=idle
+MemoryHigh=1300M
+MemoryMax=1600M
+TasksMax=40
+TimeoutStartSec=10min
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/share/caelestia-search %h/.cache/caelestia-search %h/.cache/huggingface
+PrivateTmp=true

@@ -1,0 +1,89 @@
+#!/usr/bin/env python3
+"""Fast CLI for Caelestia's local lexical and semantic file index."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+HOME = Path.home()
+QUERY = HOME / ".local/bin/caelestia-semantic-query"
+ENGINE = HOME / ".local/bin/caelestia-semantic-search"
+
+
+def run(command: list[str], *, environment: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(command, text=True, capture_output=True, env=environment, check=False)
+
+
+def find(args: argparse.Namespace) -> int:
+    query = " ".join(args.query).strip()
+    if not query:
+        raise SystemExit("caelestia-search: a query is required")
+    if args.lexical:
+        environment = os.environ.copy()
+        environment["CAELESTIA_LEXICAL_ONLY"] = "1"
+        result = run([str(ENGINE), "search", query, "-n", str(args.limit), "--json"], environment=environment)
+    else:
+        result = run([str(QUERY), query, "-n", str(args.limit)])
+    if result.returncode:
+        sys.stderr.write(result.stderr or "Caelestia search failed\n")
+        return result.returncode
+    try:
+        rows = json.loads(result.stdout or "[]")
+    except json.JSONDecodeError:
+        sys.stderr.write("Caelestia search returned invalid JSON\n")
+        return 1
+    if not isinstance(rows, list):
+        sys.stderr.write(str(rows.get("error", "Caelestia search failed")) + "\n")
+        return 1
+    if args.kind != "any":
+        rows = [row for row in rows if row.get("kind") == args.kind]
+    if args.json:
+        print(json.dumps(rows, ensure_ascii=False, indent=2))
+    elif args.null:
+        sys.stdout.buffer.write(b"\0".join(os.fsencode(row["path"]) for row in rows))
+        if rows:
+            sys.stdout.buffer.write(b"\0")
+    else:
+        for row in rows:
+            print(f"{row.get('score', 0):.5f}\t{row.get('kind', 'file')}\t{row['path']}")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        prog="caelestia-search",
+        description="Search Caelestia's local filename, content, OCR and semantic index.",
+    )
+    subparsers = parser.add_subparsers(dest="command")
+    finder = subparsers.add_parser("find", help="search the index")
+    finder.add_argument("query", nargs="+")
+    finder.add_argument("-n", "--limit", type=int, default=10)
+    finder.add_argument("--json", action="store_true", help="machine-readable result objects")
+    finder.add_argument("-0", "--null", action="store_true", help="NUL-separated result paths")
+    finder.add_argument("--lexical", action="store_true", help="skip ML and use names/indexed text only")
+    finder.add_argument("--kind", choices=("any", "file", "folder"), default="any")
+    subparsers.add_parser("status", help="show index/backfill status as JSON")
+    subparsers.add_parser("scan", help="refresh filename metadata without embedding content")
+
+    # Treat an unrecognised first word as a query for convenient agent/shell use.
+    raw = sys.argv[1:]
+    if raw and raw[0] not in {"find", "status", "scan", "-h", "--help"}:
+        raw.insert(0, "find")
+    args = parser.parse_args(raw)
+    if args.command == "find":
+        return find(args)
+    if args.command == "status":
+        return subprocess.call([str(ENGINE), "status"])
+    if args.command == "scan":
+        return subprocess.call([str(ENGINE), "scan"])
+    parser.print_help()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

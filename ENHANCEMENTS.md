@@ -19,6 +19,9 @@ not stored in Git.
 - In Ultra Power Saver, search remains available but automatically uses lexical
   filename/content search without loading either ML model.
 - Nautilus exposes `Search with Caelestia Spotlight` in its context menu.
+- `caelestia-search` exposes the same index to terminals and AI agents with
+  JSON, lexical-only, file/folder filtering and NUL-separated path output.
+  See `search/CLI.md` for examples.
 
 Local model locations:
 

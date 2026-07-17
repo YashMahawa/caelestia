@@ -20,9 +20,33 @@ DATA = HOME / ".local/share/caelestia-clipboard"
 FILES = DATA / "items"
 DB = DATA / "history.sqlite3"
 STATE = HOME / ".local/state/caelestia/clipboard-history.json"
+CONFIG = HOME / ".config/caelestia/clipboard.json"
 MAX_ITEMS = 100
 MAX_TEXT = 2 * 1024 * 1024
 MAX_IMAGE = 30 * 1024 * 1024
+
+
+def retention_days() -> int:
+    try:
+        value = int(json.loads(CONFIG.read_text(encoding="utf-8")).get("retentionDays", 7))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        value = 7
+    return value if value in {1, 2, 7} else 7
+
+
+def set_retention(days: int) -> int:
+    if days not in {1, 2, 7}:
+        return 2
+    CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    temporary = CONFIG.with_suffix(".tmp")
+    temporary.write_text(json.dumps({"retentionDays": days}, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(CONFIG)
+    connection = setup()
+    prune(connection)
+    connection.commit()
+    export_state(connection)
+    print(days)
+    return 0
 
 
 def setup() -> sqlite3.Connection:
@@ -35,8 +59,11 @@ def setup() -> sqlite3.Connection:
         """CREATE TABLE IF NOT EXISTS items (
         id INTEGER PRIMARY KEY, digest TEXT UNIQUE NOT NULL, kind TEXT NOT NULL,
         mime TEXT NOT NULL, text TEXT NOT NULL DEFAULT '', path TEXT NOT NULL DEFAULT '',
-        created REAL NOT NULL)"""
+        created REAL NOT NULL, pinned INTEGER NOT NULL DEFAULT 0)"""
     )
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(items)")}
+    if "pinned" not in columns:
+        connection.execute("ALTER TABLE items ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0")
     return connection
 
 
@@ -46,11 +73,11 @@ def run(*args: str, input_data: bytes | None = None) -> subprocess.CompletedProc
 
 def export_state(connection: sqlite3.Connection) -> None:
     rows = connection.execute(
-        "SELECT id,kind,mime,text,path,created FROM items ORDER BY created DESC LIMIT ?", (MAX_ITEMS,)
+        "SELECT id,kind,mime,text,path,created,pinned FROM items ORDER BY pinned DESC,created DESC LIMIT ?", (MAX_ITEMS,)
     ).fetchall()
     payload = [
         {"id": row[0], "kind": row[1], "mime": row[2], "text": row[3],
-         "path": row[4], "created": row[5]}
+         "path": row[4], "created": row[5], "pinned": bool(row[6])}
         for row in rows
     ]
     temporary = STATE.with_suffix(".tmp")
@@ -76,10 +103,14 @@ def preferred_type(types: list[str]) -> tuple[str, str] | None:
 
 
 def prune(connection: sqlite3.Connection) -> None:
+    cutoff = time.time() - retention_days() * 86400
     stale = connection.execute(
-        "SELECT id,path FROM items ORDER BY created DESC LIMIT -1 OFFSET ?", (MAX_ITEMS,)
+        "SELECT id,path FROM items WHERE pinned=0 AND created < ?", (cutoff,)
     ).fetchall()
-    for item_id, path in stale:
+    overflow = connection.execute(
+        "SELECT id,path FROM items WHERE pinned=0 ORDER BY created DESC LIMIT -1 OFFSET ?", (MAX_ITEMS,)
+    ).fetchall()
+    for item_id, path in {row[0]: row for row in [*stale, *overflow]}.values():
         if path:
             try:
                 Path(path).unlink(missing_ok=True)
@@ -152,7 +183,14 @@ def copy_item(item_id: int) -> int:
 def reachable_device() -> str | None:
     result = run("kdeconnect-cli", "--list-available", "--id-only")
     devices = result.stdout.decode().split()
-    return devices[0] if devices else None
+    preferred = ""
+    continuity_config = Path.home() / ".config/caelestia/continuity.json"
+    if continuity_config.exists():
+        try:
+            preferred = str(json.loads(continuity_config.read_text(encoding="utf-8")).get("deviceId", ""))
+        except (OSError, json.JSONDecodeError):
+            pass
+    return preferred if preferred in devices else (devices[0] if devices else None)
 
 
 def send_item(item_id: int) -> int:
@@ -170,6 +208,13 @@ def send_item(item_id: int) -> int:
     else:
         command = ["kdeconnect-cli", "-d", device, "--share-text", text]
     return subprocess.call(command)
+
+
+def send_latest() -> int:
+    """Explicitly send the newest clipboard entry without exposing history UI."""
+    connection = setup()
+    row = connection.execute("SELECT id FROM items ORDER BY created DESC LIMIT 1").fetchone()
+    return send_item(int(row[0])) if row else 1
 
 
 def send_paths(values: list[str]) -> int:
@@ -194,6 +239,69 @@ def delete_item(item_id: int) -> int:
     if row and row[4]:
         Path(row[4]).unlink(missing_ok=True)
     connection.execute("DELETE FROM items WHERE id=?", (item_id,))
+    connection.commit()
+    export_state(connection)
+    return 0
+
+
+def toggle_pin(item_id: int) -> int:
+    connection = setup()
+    connection.execute("UPDATE items SET pinned=CASE pinned WHEN 0 THEN 1 ELSE 0 END WHERE id=?", (item_id,))
+    connection.commit()
+    export_state(connection)
+    return 0
+
+
+def edit_item(item_id: int, value: str) -> int:
+    value = value.replace("\x00", "").strip()
+    if not value or len(value.encode()) > MAX_TEXT:
+        return 2
+    connection = setup()
+    row = item(connection, item_id)
+    if row is None or row[1] != "text":
+        return 1
+    digest = hashlib.sha256(value.encode()).hexdigest()
+    try:
+        connection.execute(
+            "UPDATE items SET digest=?,text=?,created=? WHERE id=?",
+            (digest, value, time.time(), item_id),
+        )
+        connection.commit()
+    except sqlite3.IntegrityError:
+        connection.rollback()
+        return 3
+    export_state(connection)
+    return 0
+
+
+def add_path(value: str) -> int:
+    decoded = urllib.parse.unquote(value.removeprefix("file://"))
+    source = Path(decoded).expanduser().resolve()
+    if not source.exists():
+        return 1
+    mime = mimetypes.guess_type(source.name)[0] or "application/octet-stream"
+    connection = setup()
+    now = time.time()
+    if source.is_file() and mime.startswith("image/") and source.stat().st_size <= MAX_IMAGE:
+        data = source.read_bytes()
+        digest = hashlib.sha256(data).hexdigest()
+        target = FILES / f"{digest}{source.suffix.lower()}"
+        if not target.exists():
+            target.write_bytes(data)
+        connection.execute(
+            """INSERT INTO items(digest,kind,mime,text,path,created) VALUES(?,?,?,?,?,?)
+            ON CONFLICT(digest) DO UPDATE SET created=excluded.created""",
+            (digest, "image", mime, source.name, str(target), now),
+        )
+    else:
+        uri = source.as_uri()
+        digest = hashlib.sha256(uri.encode()).hexdigest()
+        connection.execute(
+            """INSERT INTO items(digest,kind,mime,text,path,created) VALUES(?,?,?,?,?,?)
+            ON CONFLICT(digest) DO UPDATE SET created=excluded.created""",
+            (digest, "files", "text/uri-list", uri, "", now),
+        )
+    prune(connection)
     connection.commit()
     export_state(connection)
     return 0
@@ -227,19 +335,36 @@ def main() -> int:
     sub.add_parser("serve")
     sub.add_parser("capture")
     sub.add_parser("clear")
-    for name in ("copy", "send", "delete"):
+    sub.add_parser("send-latest")
+    sub.add_parser("retention-status")
+    retention = sub.add_parser("retention")
+    retention.add_argument("days", type=int, choices=(1, 2, 7))
+    for name in ("copy", "send", "delete", "pin"):
         command = sub.add_parser(name)
         command.add_argument("id", type=int)
+    edit = sub.add_parser("edit")
+    edit.add_argument("id", type=int)
+    edit.add_argument("text")
+    add = sub.add_parser("add-path")
+    add.add_argument("path")
     send_path = sub.add_parser("send-path")
     send_path.add_argument("paths", nargs="+")
     args = parser.parse_args()
     if args.command == "serve": return serve()
     if args.command == "capture": return capture()
     if args.command == "clear": return clear()
+    if args.command == "send-latest": return send_latest()
+    if args.command == "retention-status":
+        print(json.dumps({"retentionDays": retention_days()}))
+        return 0
+    if args.command == "retention": return set_retention(args.days)
     if args.command == "copy": return copy_item(args.id)
     if args.command == "send": return send_item(args.id)
     if args.command == "send-path": return send_paths(args.paths)
     if args.command == "delete": return delete_item(args.id)
+    if args.command == "pin": return toggle_pin(args.id)
+    if args.command == "edit": return edit_item(args.id, args.text)
+    if args.command == "add-path": return add_path(args.path)
     return 2
 
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""KDE Connect continuity helper: status, sharing, and opt-in path sync."""
+"""Caelestia Link helper: connectivity, sharing, and privacy controls."""
 
 from __future__ import annotations
 
@@ -10,6 +10,13 @@ import sys
 from pathlib import Path
 
 CONFIG = Path.home() / ".config/caelestia/continuity.json"
+DEFAULTS = {
+    "deviceId": "2d66b7a5cb214ae4be66b7b8f2ff46bb",
+    "deviceName": "V2240",
+    "autoClipboardSync": False,
+    "callsEnabled": True,
+    "notificationsEnabled": True,
+}
 
 
 def run(*args: str) -> subprocess.CompletedProcess[str]:
@@ -18,13 +25,17 @@ def run(*args: str) -> subprocess.CompletedProcess[str]:
 
 def device() -> str | None:
     result = run("kdeconnect-cli", "--list-available", "--id-only")
-    return result.stdout.split()[0] if result.returncode == 0 and result.stdout.split() else None
+    available = result.stdout.split() if result.returncode == 0 else []
+    preferred = str(config().get("deviceId", ""))
+    return preferred if preferred in available else (available[0] if available else None)
 
 
 def config() -> dict:
-    if not CONFIG.exists():
-        return {"deviceName": "T2 5G", "autoClipboardSync": False, "syncRules": []}
-    return json.loads(CONFIG.read_text(encoding="utf-8"))
+    value = dict(DEFAULTS)
+    if CONFIG.exists():
+        value.update(json.loads(CONFIG.read_text(encoding="utf-8")))
+    value.pop("syncRules", None)
+    return value
 
 
 def save_config(value: dict) -> None:
@@ -44,26 +55,13 @@ def share(paths: list[str]) -> int:
     return subprocess.call(["caelestia-clipboard", "send-path", *paths])
 
 
-def browse() -> int:
-    current = device()
-    if current is None:
-        print("T2 5G is not reachable", file=sys.stderr)
-        return 2
-    mounted = run("kdeconnect-cli", "-d", current, "--mount")
-    if mounted.returncode != 0:
-        print(mounted.stderr.strip(), file=sys.stderr)
-        return mounted.returncode
-    mount = run("kdeconnect-cli", "-d", current, "--get-mount-point").stdout.strip()
-    return subprocess.call(["gio", "open", mount]) if mount else 3
-
-
 def auto_clipboard(mode: str) -> int:
     settings = config()
     enabled = bool(settings.get("autoClipboardSync", False))
     enabled = not enabled if mode == "toggle" else mode == "on"
     current = device()
     if current is None:
-        print("T2 5G is not reachable", file=sys.stderr)
+        print("Caelestia Link phone is not reachable", file=sys.stderr)
         return 2
     result = run(
         "qdbus6", "org.kde.kdeconnect", f"/modules/kdeconnect/devices/{current}",
@@ -79,68 +77,56 @@ def auto_clipboard(mode: str) -> int:
     return 0
 
 
-def sync(rule_name: str | None) -> int:
+def privacy_toggle(setting: str, plugin: str, mode: str) -> int:
+    settings = config()
+    enabled = bool(settings.get(setting, True))
+    enabled = not enabled if mode == "toggle" else mode == "on"
     current = device()
     if current is None:
-        print("T2 5G is not reachable", file=sys.stderr)
+        print("Caelestia Link phone is not reachable", file=sys.stderr)
         return 2
-    rules = config().get("syncRules", [])
-    if rule_name:
-        rules = [rule for rule in rules if rule.get("name") == rule_name]
-    if not rules:
-        print("No matching sync rules; add explicit paths to ~/.config/caelestia/continuity.json")
-        return 0
-    mounted = run("kdeconnect-cli", "-d", current, "--mount")
-    if mounted.returncode != 0:
-        print(mounted.stderr.strip(), file=sys.stderr)
-        return mounted.returncode
-    mount = run("kdeconnect-cli", "-d", current, "--get-mount-point").stdout.strip()
-    mount_root = Path(mount).resolve()
-    if not mount_root.exists():
-        print("Phone storage mount is unavailable", file=sys.stderr)
-        return 3
-    result = 0
-    for rule in rules:
-        local = Path(rule["local"]).expanduser().resolve()
-        remote = (mount_root / rule["remote"].lstrip("/")).resolve()
-        if mount_root not in remote.parents and remote != mount_root:
-            print(f"Unsafe remote path rejected: {rule['remote']}", file=sys.stderr)
-            result = 4
-            continue
-        direction = rule.get("direction", "push")
-        source, target = (local, remote) if direction == "push" else (remote, local)
-        if direction not in {"push", "pull"} or not source.exists():
-            print(f"Skipped invalid rule: {rule.get('name', 'unnamed')}", file=sys.stderr)
-            result = 4
-            continue
-        target.mkdir(parents=True, exist_ok=True)
-        command = ["rsync", "-a", "--update", "--human-readable", str(source), str(target)]
-        code = subprocess.call(command)
-        result = code or result
-    return result
+    result = run(
+        "qdbus6", "org.kde.kdeconnect", f"/modules/kdeconnect/devices/{current}",
+        "org.kde.kdeconnect.device.setPluginEnabled", plugin,
+        "true" if enabled else "false",
+    )
+    if result.returncode != 0:
+        print(result.stderr.strip(), file=sys.stderr)
+        return result.returncode
+    settings[setting] = enabled
+    save_config(settings)
+    print("on" if enabled else "off")
+    return 0
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("status")
-    commands.add_parser("browse")
+    commands.add_parser("ring")
     auto = commands.add_parser("auto-clipboard")
     auto.add_argument("mode", choices=("on", "off", "toggle"))
+    calls = commands.add_parser("calls")
+    calls.add_argument("mode", choices=("on", "off", "toggle"))
+    notifications = commands.add_parser("notifications")
+    notifications.add_argument("mode", choices=("on", "off", "toggle"))
     send = commands.add_parser("send")
     send.add_argument("paths", nargs="+")
-    sync_parser = commands.add_parser("sync")
-    sync_parser.add_argument("rule", nargs="?")
     args = parser.parse_args()
     if args.command == "status":
         return status()
     if args.command == "send":
         return share(args.paths)
-    if args.command == "browse":
-        return browse()
+    if args.command == "ring":
+        current = device()
+        return subprocess.call(["kdeconnect-cli", "-d", current, "--ring"]) if current else 2
     if args.command == "auto-clipboard":
         return auto_clipboard(args.mode)
-    return sync(args.rule)
+    if args.command == "calls":
+        return privacy_toggle("callsEnabled", "kdeconnect_telephony", args.mode)
+    if args.command == "notifications":
+        return privacy_toggle("notificationsEnabled", "kdeconnect_notifications", args.mode)
+    return 2
 
 
 if __name__ == "__main__":

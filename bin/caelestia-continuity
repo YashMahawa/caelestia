@@ -23,8 +23,15 @@ def device() -> str | None:
 
 def config() -> dict:
     if not CONFIG.exists():
-        return {"deviceName": "T2 5G", "syncRules": []}
+        return {"deviceName": "T2 5G", "autoClipboardSync": False, "syncRules": []}
     return json.loads(CONFIG.read_text(encoding="utf-8"))
+
+
+def save_config(value: dict) -> None:
+    CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    temporary = CONFIG.with_suffix(".tmp")
+    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(CONFIG)
 
 
 def status() -> int:
@@ -48,6 +55,28 @@ def browse() -> int:
         return mounted.returncode
     mount = run("kdeconnect-cli", "-d", current, "--get-mount-point").stdout.strip()
     return subprocess.call(["gio", "open", mount]) if mount else 3
+
+
+def auto_clipboard(mode: str) -> int:
+    settings = config()
+    enabled = bool(settings.get("autoClipboardSync", False))
+    enabled = not enabled if mode == "toggle" else mode == "on"
+    current = device()
+    if current is None:
+        print("T2 5G is not reachable", file=sys.stderr)
+        return 2
+    result = run(
+        "qdbus6", "org.kde.kdeconnect", f"/modules/kdeconnect/devices/{current}",
+        "org.kde.kdeconnect.device.setPluginEnabled", "kdeconnect_clipboard",
+        "true" if enabled else "false",
+    )
+    if result.returncode != 0:
+        print(result.stderr.strip(), file=sys.stderr)
+        return result.returncode
+    settings["autoClipboardSync"] = enabled
+    save_config(settings)
+    print("on" if enabled else "off")
+    return 0
 
 
 def sync(rule_name: str | None) -> int:
@@ -96,6 +125,8 @@ def main() -> int:
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("status")
     commands.add_parser("browse")
+    auto = commands.add_parser("auto-clipboard")
+    auto.add_argument("mode", choices=("on", "off", "toggle"))
     send = commands.add_parser("send")
     send.add_argument("paths", nargs="+")
     sync_parser = commands.add_parser("sync")
@@ -107,6 +138,8 @@ def main() -> int:
         return share(args.paths)
     if args.command == "browse":
         return browse()
+    if args.command == "auto-clipboard":
+        return auto_clipboard(args.mode)
     return sync(args.rule)
 
 

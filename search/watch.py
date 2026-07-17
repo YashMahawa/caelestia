@@ -5,7 +5,6 @@ import json
 import fnmatch
 import mimetypes
 import os
-import re
 import sqlite3
 import subprocess
 import time
@@ -18,10 +17,7 @@ CONFIG = HOME / ".config/caelestia/semantic-search.json"
 DB = HOME / ".local/share/caelestia-search/index.sqlite3"
 CFG = json.loads(CONFIG.read_text())
 EXCLUDED_DIRECTORIES = set(CFG["exclude_directories"])
-PROJECT_MARKERS = {
-    ".git", "package.json", "pyproject.toml", "Cargo.toml", "go.mod",
-    "CMakeLists.txt", "pubspec.yaml", "build.gradle", "settings.gradle",
-}
+WATCH_ROOTS = {Path(raw) for raw in CFG["roots"]}
 CONTENT_EXTENSIONS = {
     ".txt", ".md", ".markdown", ".rst", ".org", ".tex", ".csv", ".tsv",
     ".json", ".jsonl", ".yaml", ".yml", ".toml", ".ini", ".conf", ".log",
@@ -65,6 +61,8 @@ class Handler(pyinotify.ProcessEvent):
             ):
                 db.close()
                 return
+            if candidate.is_dir() and candidate.parent in WATCH_ROOTS:
+                manager.add_watch(str(candidate), MASK, rec=False, auto_add=False)
             content_worthy = candidate.is_file() and (
                 candidate.suffix.casefold() in CONTENT_EXTENSIONS
                 or (not candidate.suffix and candidate.stat().st_size <= 2 * 1024 * 1024)
@@ -110,24 +108,13 @@ class Handler(pyinotify.ProcessEvent):
 manager = pyinotify.WatchManager()
 handler = Handler()
 notifier = pyinotify.Notifier(manager, handler)
-exclude = pyinotify.ExcludeFilter([
-    rf"(^|/){re.escape(name)}(/|$)" for name in CFG["exclude_directories"]
-])
-watch_roots = [Path(raw) for raw in CFG["roots"]]
-if CFG.get("discover_top_level_projects", True):
-    try:
-        for child in HOME.iterdir():
-            try:
-                is_project = any((child / marker).exists() for marker in PROJECT_MARKERS)
-            except OSError:
-                is_project = False
-            if child.is_dir() and not child.name.startswith(".") and child.name not in EXCLUDED_DIRECTORIES and is_project:
-                watch_roots.append(child)
-    except OSError:
-        pass
-for root in dict.fromkeys(watch_roots):
+for root in WATCH_ROOTS:
     if root.is_dir():
-        manager.add_watch(
-            str(root), MASK, rec=True, auto_add=True, exclude_filter=exclude
-        )
+        manager.add_watch(str(root), MASK, rec=False, auto_add=False)
+        try:
+            for child in root.iterdir():
+                if child.is_dir() and child.name not in EXCLUDED_DIRECTORIES:
+                    manager.add_watch(str(child), MASK, rec=False, auto_add=False)
+        except OSError:
+            pass
 notifier.loop()

@@ -12,7 +12,7 @@
     "/home/yash/Acads",
     "/home/yash/ML"
   ],
-  "discover_top_level_projects": true,
+  "discover_top_level_projects": false,
   "exclude_directories": [
     ".cache", "cache", ".git", ".hg", ".svn", ".idea", ".vscode", ".obsidian",
     "__pycache__", "node_modules", ".venv", ".venv-openvino-convert",

@@ -1,0 +1,4 @@
+[General]
+# Keep KDE Connect on LAN/Wi-Fi. Its Bluetooth provider continuously scans on
+# KDE Connect 26.04.3 and competes with 2.4 GHz Wi-Fi and Bluetooth audio.
+disabled_providers=AsyncLinkProvider

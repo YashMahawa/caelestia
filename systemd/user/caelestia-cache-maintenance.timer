@@ -2,8 +2,7 @@
 Description=Run low-impact cache maintenance weekly
 
 [Timer]
-OnBootSec=30min
-OnUnitActiveSec=7d
+OnCalendar=Sun *-*-* 04:00:00
 RandomizedDelaySec=2h
 Persistent=true
 

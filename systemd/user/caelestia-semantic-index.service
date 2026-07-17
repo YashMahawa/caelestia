@@ -3,16 +3,19 @@ Description=Caelestia bounded local semantic indexing worker
 ConditionACPower=true
 
 [Service]
+Environment=CAELESTIA_TORCH_AUTO_GPU=0
 Type=oneshot
-ExecStart=%h/.local/share/caelestia-search/semantic_search.py work --limit 48
+ExecCondition=%h/.local/bin/caelestia-index-guard
+ExecStart=/usr/bin/flock -n -E 0 %t/caelestia-index-writer.lock %h/.local/share/caelestia-search/semantic_search.py work --limit 16
 Nice=15
-CPUWeight=10
-IOWeight=10
+CPUWeight=5
+CPUQuota=75%
+IOWeight=5
 IOSchedulingClass=idle
-MemoryHigh=1300M
-MemoryMax=1600M
+MemoryHigh=1200M
+MemoryMax=1450M
 TasksMax=40
-TimeoutStartSec=10min
+TimeoutStartSec=15min
 ProtectSystem=strict
 ProtectHome=read-only
 ReadWritePaths=%h/.local/share/caelestia-search %h/.cache/caelestia-search %h/.cache/huggingface

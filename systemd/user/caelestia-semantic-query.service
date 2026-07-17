@@ -2,6 +2,7 @@
 Description=Short-lived Caelestia semantic query engine
 
 [Service]
+Environment=CAELESTIA_TORCH_AUTO_GPU=0
 Type=simple
 ExecStart=%h/.local/share/caelestia-search/semantic_search.py serve
 Nice=5

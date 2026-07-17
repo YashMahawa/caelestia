@@ -10,12 +10,14 @@
     "/home/yash/Ob",
     "/home/yash/Obsidian",
     "/home/yash/Acads",
-    "/home/yash/ML"
+    "/home/yash/ML",
+    "/home/yash/caelestia-repo-work"
   ],
   "discover_top_level_projects": false,
   "exclude_directories": [
     ".cache", "cache", ".git", ".hg", ".svn", ".idea", ".vscode", ".obsidian",
     "__pycache__", "node_modules", ".venv", ".venv-openvino-convert",
+    ".cxx", ".gradle", ".expo", ".dart_tool", ".pub-cache", ".terraform", "Pods", "DerivedData",
     "venv", "venv_new",
     "build", "dist", "target", "coverage", ".next", ".nuxt",
     "models", "checkpoints", "site-packages", "engines", ".Trash-1000", ".stfolder",
@@ -23,14 +25,15 @@
     "postman-linux-x64", "ACCC_Installer", "chrome"
   ],
   "exclude_globs": [
-    "*.env", "*.key", "*.pem", "*.p12", "*.pfx", "*credentials*",
+    "*.env", "*.env.*", "*.key", "*.pem", "*.p12", "*.pfx", "*credentials*",
+    "*api_key*", "*api-key*", "*production_keys*", "*keys_handoff*", "jules-cerebras.env",
     "*secret*", "*token*", "*password*", "*passwd*", "*cookie*", "*auth*",
     "*_files", "*.iso", "*.img", "*.safetensors",
     "*.gguf", "*.onnx", "*.pt", "*.pth", "*.apk", "*.AppImage",
     "*.zip", "*.7z", "*.rar", "*.tar", "*.gz", "*.xz", "*.zst",
     "*.o", "*.so", "*.a", "*.class", "*.pyc", "*.map", "*.min.js",
     "*.cl_cache", "*.blob", "kaggle_run*", "kaggle_*_output", "*_output",
-    "vqa-rad-gemini-eval"
+    "vqa-rad-gemini-eval", "caelestia-targeted-ui-snapshot-*"
   ],
   "max_file_mb": 64,
   "max_text_characters": 100000,

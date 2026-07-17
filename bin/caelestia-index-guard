@@ -1,0 +1,91 @@
+#!/usr/bin/env python3
+"""Allow background ML indexing only when it will stay unobtrusive."""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+HOME = Path.home()
+ULTRA_STATE = HOME / ".local/state/caelestia/ultra-power.json"
+MAX_START_TEMP_C = 70.0
+MAX_LOAD_1M = 2.0
+
+
+def deny(reason: str) -> int:
+    print(f"caelestia-index-guard: deferred: {reason}")
+    return 1
+
+
+def cpu_temperature() -> float | None:
+    readings: list[float] = []
+    for zone in Path("/sys/class/thermal").glob("thermal_zone*"):
+        try:
+            kind = (zone / "type").read_text().strip()
+            if kind not in {"x86_pkg_temp", "cpu_thermal", "acpitz"}:
+                continue
+            value = float((zone / "temp").read_text().strip()) / 1000
+            if 0 < value < 130:
+                readings.append(value)
+        except (OSError, ValueError):
+            continue
+    return max(readings) if readings else None
+
+
+def command_succeeds(command: list[str]) -> bool:
+    try:
+        return subprocess.run(
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=3,
+            check=False,
+        ).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def main() -> int:
+    try:
+        if json.loads(ULTRA_STATE.read_text()).get("active"):
+            return deny("ultra power saver is active")
+    except (OSError, ValueError):
+        pass
+
+    if command_succeeds(["systemctl", "is-active", "--quiet", "waydroid-container.service"]):
+        return deny("Waydroid is running")
+
+    if command_succeeds(["playerctl", "--all-players", "status"]):
+        result = subprocess.run(
+            ["playerctl", "--all-players", "status"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+        if any(line.strip() == "Playing" for line in result.stdout.splitlines()):
+            return deny("media playback is active")
+
+    try:
+        load_1m = os.getloadavg()[0]
+        if load_1m > MAX_LOAD_1M:
+            return deny(f"system load is {load_1m:.2f}")
+    except OSError:
+        pass
+
+    temperature = cpu_temperature()
+    if temperature is not None and temperature >= MAX_START_TEMP_C:
+        return deny(f"CPU is already {temperature:.1f} C")
+
+    print(
+        "caelestia-index-guard: allowed"
+        + (f" at {temperature:.1f} C" if temperature is not None else "")
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -3,10 +3,13 @@ Description=Bounded iGPU visual labelling for Caelestia search
 ConditionACPower=true
 
 [Service]
+Environment=CAELESTIA_TORCH_AUTO_GPU=0
 Type=oneshot
-ExecStart=%h/.local/share/caelestia-search/visual_index.py 16
+ExecCondition=%h/.local/bin/caelestia-index-guard
+ExecStart=/usr/bin/flock -n -E 0 %t/caelestia-index-writer.lock %h/.local/share/caelestia-search/visual_index.py 8
 Nice=18
 CPUWeight=5
+CPUQuota=75%
 IOWeight=5
 IOSchedulingClass=idle
 MemoryHigh=1500M

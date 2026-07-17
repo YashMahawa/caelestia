@@ -71,9 +71,11 @@ def label_vectors(core) -> np.ndarray:
         saved = np.load(LABEL_CACHE)
         if list(saved["labels"]) == LABELS:
             return saved["vectors"]
-    from transformers import AutoTokenizer
+    from tokenizers import Tokenizer
 
-    tokenizer = AutoTokenizer.from_pretrained(MODEL, local_files_only=True)
+    tokenizer = Tokenizer.from_file(str(MODEL / "tokenizer.json"))
+    tokenizer.enable_truncation(max_length=64)
+    tokenizer.enable_padding(length=64, pad_id=0, pad_token="<pad>", direction="right")
     model = core.read_model(MODEL / "onnx/text_model_int8.onnx")
     batch_size = 16
     model.reshape({"input_ids": [batch_size, 64]})
@@ -85,8 +87,9 @@ def label_vectors(core) -> np.ndarray:
         batch = prompts[offset:offset + batch_size]
         actual = len(batch)
         batch.extend([batch[-1]] * (batch_size - actual))
-        tokens = tokenizer(batch, padding="max_length", truncation=True, max_length=64, return_tensors="np")
-        vectors.append(compiled({"input_ids": tokens["input_ids"]})[output][:actual])
+        encoded = tokenizer.encode_batch(batch)
+        input_ids = np.asarray([item.ids for item in encoded], dtype=np.int64)
+        vectors.append(compiled({"input_ids": input_ids})[output][:actual])
     result = normalise(np.vstack(vectors))
     np.savez_compressed(LABEL_CACHE, labels=np.array(LABELS), vectors=result)
     return result
@@ -107,6 +110,8 @@ def main(limit: int = 16) -> None:
     CACHE.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(DB, timeout=30)
     db.execute("PRAGMA journal_mode=WAL")
+    db.execute("PRAGMA synchronous=NORMAL")
+    db.execute("PRAGMA busy_timeout=60000")
     db.execute("CREATE TABLE IF NOT EXISTS visual_tags(path TEXT PRIMARY KEY,mtime_ns INTEGER NOT NULL,tags TEXT NOT NULL)")
     rows = db.execute(
         """SELECT f.path,f.mtime_ns FROM files f LEFT JOIN visual_tags v ON v.path=f.path
@@ -150,6 +155,13 @@ def main(limit: int = 16) -> None:
             processed += 1
         except Exception as error:
             print(f"visual_index: {path}: {error}", file=sys.stderr)
+            # Do not retry the same corrupt/unsupported image every 30 minutes.
+            # A real replacement changes mtime and becomes eligible again.
+            db.execute(
+                "INSERT INTO visual_tags(path,mtime_ns,tags) VALUES(?,?,?) ON CONFLICT(path) DO UPDATE SET mtime_ns=excluded.mtime_ns,tags=excluded.tags",
+                (raw, mtime_ns, "unreadable image"),
+            )
+            db.commit()
     remaining = db.execute(
         """SELECT count(*) FROM files f LEFT JOIN visual_tags v ON v.path=f.path
            WHERE f.mime LIKE 'image/%' AND (v.path IS NULL OR v.mtime_ns != f.mtime_ns)"""

@@ -16,6 +16,10 @@ ENGINE = HOME / ".local/bin/caelestia-semantic-search"
 
 
 def run(command: list[str], *, environment: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+    environment = dict(environment or os.environ)
+    # The index uses native OpenVINO, not torch.compile.  Avoid the ML venv's
+    # eager PyTorch compatibility hook for cheap lexical/status operations.
+    environment["CAELESTIA_TORCH_AUTO_GPU"] = "0"
     return subprocess.run(command, text=True, capture_output=True, env=environment, check=False)
 
 
@@ -78,9 +82,9 @@ def main() -> int:
     if args.command == "find":
         return find(args)
     if args.command == "status":
-        return subprocess.call([str(ENGINE), "status"])
+        return subprocess.call([str(ENGINE), "status"], env={**os.environ, "CAELESTIA_TORCH_AUTO_GPU": "0"})
     if args.command == "scan":
-        return subprocess.call([str(ENGINE), "scan"])
+        return subprocess.call([str(ENGINE), "scan"], env={**os.environ, "CAELESTIA_TORCH_AUTO_GPU": "0"})
     parser.print_help()
     return 0
 

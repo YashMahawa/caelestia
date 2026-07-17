@@ -2,9 +2,9 @@
 Description=Continue visual search indexing in safe AC-powered batches
 
 [Timer]
-OnBootSec=30min
-OnUnitActiveSec=20min
-RandomizedDelaySec=3min
+OnBootSec=1h
+OnUnitActiveSec=30min
+RandomizedDelaySec=10min
 Persistent=true
 Unit=caelestia-visual-index.service
 

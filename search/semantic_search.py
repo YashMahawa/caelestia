@@ -9,6 +9,7 @@ import fnmatch
 import json
 import mimetypes
 import os
+import re
 import sqlite3
 import socket
 import subprocess
@@ -62,6 +63,7 @@ def connect() -> sqlite3.Connection:
     db = sqlite3.connect(DB_PATH, timeout=30)
     db.execute("PRAGMA journal_mode=WAL")
     db.execute("PRAGMA synchronous=NORMAL")
+    db.execute("PRAGMA busy_timeout=60000")
     db.executescript(
         """
         CREATE TABLE IF NOT EXISTS files (
@@ -132,7 +134,6 @@ def supported(path: Path, cfg: dict) -> bool:
     return (
         (path.is_file() or path.is_dir())
         and not path.is_symlink()
-        and (path.is_dir() or stat.st_size <= cfg["max_file_mb"] * 1024 * 1024)
         and not excluded(path, cfg)
     )
 
@@ -180,9 +181,14 @@ def iter_files(cfg: dict):
                     yield path
 
 
-def content_supported(path: Path) -> bool:
+def content_supported(path: Path, cfg: dict) -> bool:
     """Whether content extraction is useful; every path still gets name search."""
     if not path.is_file():
+        return False
+    try:
+        if path.stat().st_size > cfg["max_file_mb"] * 1024 * 1024:
+            return False
+    except OSError:
         return False
     suffix = path.suffix.casefold()
     if suffix in CONTENT_TEXT_EXTENSIONS | IMAGE_EXTENSIONS | OFFICE_EXTENSIONS | {".pdf"}:
@@ -272,7 +278,7 @@ def extract_text(path: Path, cfg: dict) -> str:
 class Embedder:
     def __init__(self, dimensions: int, *, query: bool = False, batch_size: int | None = None):
         import openvino as ov
-        from transformers import AutoTokenizer
+        from tokenizers import Tokenizer
 
         CACHE_PATH.mkdir(parents=True, exist_ok=True)
         self.dimensions = dimensions
@@ -284,8 +290,13 @@ class Embedder:
         self.device = "CPU"
         device_cache = CACHE_PATH / self.device.casefold()
         device_cache.mkdir(parents=True, exist_ok=True)
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            MODEL_PATH, padding_side="right", local_files_only=True
+        # The low-level Rust tokenizer produces byte-for-byte identical IDs for
+        # this tokenizer.json without importing Transformers and PyTorch.  That
+        # avoids roughly 300 MB of unrelated runtime memory per search process.
+        self.tokenizer = Tokenizer.from_file(str(MODEL_PATH / "tokenizer.json"))
+        self.tokenizer.enable_truncation(max_length=self.sequence_length)
+        self.tokenizer.enable_padding(
+            length=self.sequence_length, pad_id=0, pad_token="<pad>", direction="right"
         )
         core = ov.Core()
         model = core.read_model(MODEL_PATH / "openvino_model_pruned.xml")
@@ -321,13 +332,11 @@ class Embedder:
         texts = [prefix + text for text in texts]
         if count < self.batch_size:
             texts.extend([texts[-1]] * (self.batch_size - count))
-        batch = self.tokenizer(
-            texts,
-            padding="max_length",
-            truncation=True,
-            max_length=self.sequence_length,
-            return_tensors="np",
-        )
+        encoded = self.tokenizer.encode_batch(texts)
+        batch = {
+            "input_ids": np.asarray([item.ids for item in encoded], dtype=np.int64),
+            "attention_mask": np.asarray([item.attention_mask for item in encoded], dtype=np.int64),
+        }
         batch["position_ids"] = np.broadcast_to(
             np.arange(self.sequence_length, dtype=np.int64),
             (self.batch_size, self.sequence_length),
@@ -435,7 +444,7 @@ def discover(full: bool = False):
             queue_name(db, path)
         expected_size = 0 if kind == "folder" else stat.st_size
         if full or row != (expected_size, stat.st_mtime_ns):
-            if content_supported(path):
+            if content_supported(path, cfg):
                 queue_path(db, path)
                 queued += 1
             else:
@@ -444,6 +453,7 @@ def discover(full: bool = False):
         db.execute("DELETE FROM files WHERE path NOT IN (SELECT path FROM seen_paths)")
         db.execute("DELETE FROM pending WHERE path NOT IN (SELECT path FROM seen_paths)")
         db.execute("DELETE FROM name_pending WHERE path NOT IN (SELECT path FROM seen_paths)")
+        db.execute("DELETE FROM visual_tags WHERE path NOT IN (SELECT path FROM seen_paths)")
         # FTS5 has no normal index on its unindexed path column. Rebuilding once
         # is dramatically cheaper than thousands of per-path virtual-table scans.
         db.execute("DELETE FROM files_fts")
@@ -499,12 +509,33 @@ def work_names(db: sqlite3.Connection, cfg: dict, limit: int = 384) -> int:
 def work(limit: int = 0):
     cfg = config()
     db = connect()
-    names_processed = work_names(db, cfg, max(384, limit * 8) if limit else 384)
+    names_processed = work_names(db, cfg, max(128, limit * 4) if limit else 128)
     embedder: Embedder | None = None
     processed = failed = 0
     while True:
+        # User documents are the main semantic-search target.  Keep source trees
+        # name-searchable, but do not let a large repository rebuild hold PDFs,
+        # notes, downloads, and media metadata behind thousands of code files.
+        personal_prefixes = tuple(
+            str(HOME / name) + os.sep
+            for name in ("Desktop", "Documents", "Downloads", "Pictures", "Videos", "Music", "Ob", "Obsidian", "Acads")
+        )
+        priority_sql = " OR ".join("path LIKE ?" for _ in personal_prefixes)
         batch_rows = db.execute(
-            "SELECT path FROM pending ORDER BY queued_at DESC LIMIT 4"
+            f"""SELECT path FROM pending
+                ORDER BY CASE WHEN {priority_sql} THEN 0 ELSE 1 END,
+                  CASE
+                    WHEN lower(path) GLOB '*.md' OR lower(path) GLOB '*.markdown'
+                      OR lower(path) GLOB '*.txt' OR lower(path) GLOB '*.pdf' THEN 0
+                    WHEN lower(path) GLOB '*.docx' OR lower(path) GLOB '*.odt'
+                      OR lower(path) GLOB '*.png' OR lower(path) GLOB '*.jpg'
+                      OR lower(path) GLOB '*.jpeg' OR lower(path) GLOB '*.webp' THEN 1
+                    WHEN lower(path) GLOB '*.json' OR lower(path) GLOB '*.jsonl'
+                      OR lower(path) GLOB '*.log' THEN 3
+                    ELSE 2
+                  END,
+                  queued_at DESC LIMIT 4""",
+            tuple(prefix + "%" for prefix in personal_prefixes),
         ).fetchall()
         if not batch_rows or (limit and processed >= limit):
             break
@@ -610,14 +641,46 @@ def search(query: str, count: int = 20, json_output: bool = False):
     if vector_scores is not None:
         scores = vector_scores
     lexical: dict[str, float] = {}
+    filename_query = "." in query and not any(character.isspace() for character in query)
+    query_terms = list(dict.fromkeys(re.findall(r"[\w]+", query.casefold())))
     try:
-        terms = " OR ".join(f'"{word.replace(chr(34), "")}"' for word in query.split() if word)
+        terms = " OR ".join(f'"{word.replace(chr(34), "")}"' for word in query_terms)
         if terms:
-            for raw, rank in db.execute(
-                "SELECT path,bm25(files_fts,1.0,3.0,1.5,0.5) FROM files_fts "
+            document_count = max(1, int(db.execute("SELECT count(*) FROM files").fetchone()[0]))
+            term_weights: dict[str, float] = {}
+            for term in query_terms:
+                frequency = int(db.execute(
+                    "SELECT count(*) FROM files_fts WHERE files_fts MATCH ?", (f'"{term}"',)
+                ).fetchone()[0])
+                term_weights[term] = float(np.log((document_count + 1) / (frequency + 1)) + 1)
+            total_weight = sum(term_weights.values()) or 1.0
+            for position, (raw, name, parent, text, _rank) in enumerate(db.execute(
+                "SELECT path,name,parent,text,bm25(files_fts,1.0,3.0,1.5,0.5) FROM files_fts "
                 "WHERE files_fts MATCH ? ORDER BY rank LIMIT 100", (terms,)
-            ):
-                lexical[raw] = 1.0 / (1.0 + abs(float(rank)))
+            )):
+                name_folded = name.casefold()
+                haystack = f"{name}\n{parent}\n{text}".casefold()
+                if filename_query and query.casefold() not in name_folded:
+                    continue
+                matched_terms = [term for term in query_terms if term in haystack]
+                name_terms = [term for term in query_terms if term in name_folded]
+                phrase_match = query.casefold() in haystack
+                # FTS5 bm25 values are tiny negative ranks, not 0..1 scores.
+                # Measure token coverage explicitly so a single incidental word
+                # cannot outrank a filename or document matching the full intent.
+                coverage = sum(term_weights[term] for term in matched_terms) / total_weight
+                name_coverage = sum(term_weights[term] for term in name_terms) / total_weight
+                if not phrase_match and coverage < 0.6 and name_coverage < 0.3:
+                    continue
+                rank_tiebreak = 0.05 / (1 + position / 10)
+                lexical[raw] = min(
+                    1.0,
+                    0.55 * coverage
+                    + 0.35 * name_coverage
+                    + (0.45 if name_terms else 0.0)
+                    + (0.15 if phrase_match else 0.0)
+                    + rank_tiebreak,
+                )
     except sqlite3.OperationalError:
         pass
     fuzzy: dict[str, float] = {}
@@ -641,9 +704,9 @@ def search(query: str, count: int = 20, json_output: bool = False):
     candidates: dict[str, tuple[float, tuple]] = {}
     sorted_semantic = sorted((float(value) for value in scores), reverse=True)
     semantic_confident = False
-    if sorted_semantic:
+    if sorted_semantic and not filename_query:
         comparison = sorted_semantic[min(4, len(sorted_semantic) - 1)]
-        semantic_confident = sorted_semantic[0] >= 0.78 and sorted_semantic[0] - comparison >= 0.035
+        semantic_confident = sorted_semantic[0] >= 0.56 and sorted_semantic[0] - comparison >= 0.04
     for index, row in enumerate(rows):
         name_bonus = 0.8 if query_folded in row[1].casefold() else 0.0
         lexical_score = lexical.get(row[0], 0.0)
@@ -652,7 +715,9 @@ def search(query: str, count: int = 20, json_output: bool = False):
         # Weak semantic similarities are worse than an honest empty result.
         if not lexical_score and not fuzzy_score and not name_bonus and (not semantic_confident or semantic_score < 0.58):
             continue
-        combined = semantic_score + 0.7 * lexical_score + 0.65 * fuzzy_score + name_bonus
+        suffix = Path(row[1]).suffix.casefold()
+        content_quality = 1.12 if suffix in {".md", ".markdown", ".rst", ".org", ".txt", ".pdf"} else (0.82 if suffix in {".json", ".jsonl", ".log"} else 1.0)
+        combined = semantic_score + 0.9 * lexical_score * content_quality + 0.65 * fuzzy_score + name_bonus
         candidates[row[0]] = (combined, row)
     named_paths = set(lexical) | set(fuzzy)
     if named_paths:
@@ -664,7 +729,9 @@ def search(query: str, count: int = 20, json_output: bool = False):
             if row[0] in candidates:
                 continue
             name_bonus = 0.8 if query_folded in row[1].casefold() else 0.0
-            combined = 0.7 * lexical.get(row[0], 0.0) + 0.65 * fuzzy.get(row[0], 0.0) + name_bonus
+            suffix = Path(row[1]).suffix.casefold()
+            content_quality = 1.12 if suffix in {".md", ".markdown", ".rst", ".org", ".txt", ".pdf"} else (0.82 if suffix in {".json", ".jsonl", ".log"} else 1.0)
+            combined = 0.9 * lexical.get(row[0], 0.0) * content_quality + 0.65 * fuzzy.get(row[0], 0.0) + name_bonus
             candidates[row[0]] = (combined, row)
     ranked = sorted(candidates.values(), key=lambda item: item[0], reverse=True)[:count]
     results = [{

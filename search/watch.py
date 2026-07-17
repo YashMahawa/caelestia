@@ -36,7 +36,10 @@ class Handler(pyinotify.ProcessEvent):
 
     def process_default(self, event):
         DB.parent.mkdir(parents=True, exist_ok=True)
-        db = sqlite3.connect(DB, timeout=10)
+        db = sqlite3.connect(DB, timeout=60)
+        db.execute("PRAGMA journal_mode=WAL")
+        db.execute("PRAGMA synchronous=NORMAL")
+        db.execute("PRAGMA busy_timeout=60000")
         db.execute(
             "CREATE TABLE IF NOT EXISTS pending(path TEXT PRIMARY KEY, queued_at INTEGER NOT NULL)"
         )
@@ -66,7 +69,7 @@ class Handler(pyinotify.ProcessEvent):
             content_worthy = candidate.is_file() and (
                 candidate.suffix.casefold() in CONTENT_EXTENSIONS
                 or (not candidate.suffix and candidate.stat().st_size <= 2 * 1024 * 1024)
-            )
+            ) and candidate.stat().st_size <= CFG["max_file_mb"] * 1024 * 1024
             if content_worthy:
                 db.execute(
                     "INSERT INTO pending(path,queued_at) VALUES(?,?) "

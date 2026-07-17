@@ -16,9 +16,6 @@ if [[ "$mode" == "--ensure-floating" && "$was_floating" == "true" ]]; then
     exit 0
 fi
 
-center_x=$((x + old_width / 2))
-center_y=$((y + old_height / 2))
-
 hyprctl dispatch togglefloating "address:$address" >/dev/null || exit 1
 
 if [[ "$was_floating" == "false" ]]; then
@@ -41,8 +38,6 @@ if [[ "$was_floating" == "false" ]]; then
                 ((height > usable_height)) && height=$usable_height
                 hyprctl dispatch resizewindowpixel "exact $width $height,address:$address" >/dev/null
             fi
-            x=$((center_x - width / 2))
-            y=$((center_y - height / 2))
             max_x=$((mon_x + mon_width - reserved_right - margin - width))
             max_y=$((mon_y + mon_height - reserved_bottom - margin - height))
             ((max_x < min_x)) && max_x=$min_x

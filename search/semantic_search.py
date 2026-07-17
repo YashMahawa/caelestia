@@ -99,15 +99,17 @@ def connect() -> sqlite3.Connection:
     columns = {row[1] for row in db.execute("PRAGMA table_info(files)")}
     if "kind" not in columns:
         db.execute("ALTER TABLE files ADD COLUMN kind TEXT NOT NULL DEFAULT 'file'")
-    if "name_vector" not in columns:
+    needs_name_backfill = "name_vector" not in columns
+    if needs_name_backfill:
         db.execute("ALTER TABLE files ADD COLUMN name_vector BLOB")
     if "name_vector_dim" not in columns:
         db.execute("ALTER TABLE files ADD COLUMN name_vector_dim INTEGER")
-    db.execute(
-        "INSERT OR IGNORE INTO name_pending(path,queued_at) "
-        "SELECT path,? FROM files WHERE name_vector IS NULL",
-        (time.time_ns(),),
-    )
+    if needs_name_backfill:
+        db.execute(
+            "INSERT OR IGNORE INTO name_pending(path,queued_at) "
+            "SELECT path,? FROM files WHERE name_vector IS NULL",
+            (time.time_ns(),),
+        )
     return db
 
 
@@ -594,7 +596,9 @@ def search(query: str, count: int = 20, json_output: bool = False):
         ultra_active = json.loads(ultra.read_text()).get("active", False)
     except (OSError, ValueError):
         pass
-    if len(rows) >= 256 and not ultra_active:
+    # OpenCL setup costs more than a CPU dot product for a small/incomplete
+    # backfill. It becomes worthwhile once several thousand vectors exist.
+    if len(rows) >= 4096 and not ultra_active:
         try:
             if GPU_SCORER is None:
                 GPU_SCORER = GpuVectorScorer()
@@ -619,7 +623,15 @@ def search(query: str, count: int = 20, json_output: bool = False):
     fuzzy: dict[str, float] = {}
     query_folded = query.casefold()
     if len(query_folded) >= 3:
-        for raw, name in db.execute("SELECT path,name FROM files"):
+        # Never run SequenceMatcher across the full index. Exact token search is
+        # handled by FTS; this bounded pool exists only for genuine typos.
+        needle = query_folded[:2]
+        fuzzy_rows = db.execute(
+            "SELECT path,name FROM files WHERE instr(lower(name),?)>0 "
+            "ORDER BY abs(length(name)-?) LIMIT 2000",
+            (needle, len(query_folded)),
+        )
+        for raw, name in fuzzy_rows:
             stem = Path(name).stem.casefold()
             tokens = [name.casefold(), stem, *stem.replace("_", " ").replace("-", " ").split()]
             similarity = max(difflib.SequenceMatcher(None, query_folded, token).ratio() for token in tokens)
@@ -702,7 +714,11 @@ def serve():
                     response = output.getvalue().strip() or "[]"
                 except Exception as error:
                     response = json.dumps({"error": str(error)[:200]})
-                connection.sendall(response.encode("utf-8") + b"\n")
+                try:
+                    connection.sendall(response.encode("utf-8") + b"\n")
+                except (BrokenPipeError, ConnectionResetError):
+                    # Superseded launcher queries disconnect by design.
+                    pass
     finally:
         server.close()
         socket_path.unlink(missing_ok=True)

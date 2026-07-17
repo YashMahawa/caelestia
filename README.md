@@ -9,6 +9,37 @@ power/thermal guard, shell recovery, local Spotlight search, and diagnostic
 services used by the maintained laptop setup. They contain no credentials;
 machine-local secrets and application sessions stay outside this repository.
 
+## Caelestia Continuity
+
+This fork uses one event-driven clipboard service (`caelestia-clipboard`) and
+one native shell surface. `Super+V` opens the AMOLED clipboard history. Copied
+images, including screenshots, can be sent to the reachable KDE Connect device
+from each item. Files can also be dragged onto the compact top-centre
+Continuity island.
+
+The official KDE Connect daemon remains responsible for transport and pairing;
+the redundant tray indicator, CopyQ server, and cliphist watcher are not
+started. Remote control, file sharing, notifications, clipboard, media,
+battery, SMS, and SFTP remain enabled. Stylus/digitizer, modem, presenter,
+duplicate shared-input, and KDE's synchronous pausemusic plugin are disabled.
+Caelestia's `CallGuard.qml` pauses local MPRIS media for incoming-call
+notifications without sending phone-control commands.
+
+Useful commands:
+
+```sh
+caelestia-continuity status
+caelestia-continuity send ~/Downloads/example.pdf
+caelestia-continuity sync [optional-rule-name]
+```
+
+Path sync is deliberately opt-in. Add explicit `push` or `pull` rules to
+`~/.config/caelestia/continuity.json`; there are no default paths and sync never
+uses deletion. On Android, keep KDE Connect unrestricted in battery settings.
+The existing signed Android APK is preserved: replacing it with a custom build
+would require uninstalling or signing with the same key and is not part of this
+desktop configuration.
+
 ## Installation
 
 Simply clone this repo and run the install script (you need

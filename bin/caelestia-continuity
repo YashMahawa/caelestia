@@ -1,0 +1,114 @@
+#!/usr/bin/env python3
+"""KDE Connect continuity helper: status, sharing, and opt-in path sync."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+CONFIG = Path.home() / ".config/caelestia/continuity.json"
+
+
+def run(*args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(args, text=True, capture_output=True, timeout=30, check=False)
+
+
+def device() -> str | None:
+    result = run("kdeconnect-cli", "--list-available", "--id-only")
+    return result.stdout.split()[0] if result.returncode == 0 and result.stdout.split() else None
+
+
+def config() -> dict:
+    if not CONFIG.exists():
+        return {"deviceName": "T2 5G", "syncRules": []}
+    return json.loads(CONFIG.read_text(encoding="utf-8"))
+
+
+def status() -> int:
+    current = device()
+    print(json.dumps({"reachable": current is not None, "deviceId": current, **config()}, ensure_ascii=False))
+    return 0 if current else 2
+
+
+def share(paths: list[str]) -> int:
+    return subprocess.call(["caelestia-clipboard", "send-path", *paths])
+
+
+def browse() -> int:
+    current = device()
+    if current is None:
+        print("T2 5G is not reachable", file=sys.stderr)
+        return 2
+    mounted = run("kdeconnect-cli", "-d", current, "--mount")
+    if mounted.returncode != 0:
+        print(mounted.stderr.strip(), file=sys.stderr)
+        return mounted.returncode
+    mount = run("kdeconnect-cli", "-d", current, "--get-mount-point").stdout.strip()
+    return subprocess.call(["gio", "open", mount]) if mount else 3
+
+
+def sync(rule_name: str | None) -> int:
+    current = device()
+    if current is None:
+        print("T2 5G is not reachable", file=sys.stderr)
+        return 2
+    rules = config().get("syncRules", [])
+    if rule_name:
+        rules = [rule for rule in rules if rule.get("name") == rule_name]
+    if not rules:
+        print("No matching sync rules; add explicit paths to ~/.config/caelestia/continuity.json")
+        return 0
+    mounted = run("kdeconnect-cli", "-d", current, "--mount")
+    if mounted.returncode != 0:
+        print(mounted.stderr.strip(), file=sys.stderr)
+        return mounted.returncode
+    mount = run("kdeconnect-cli", "-d", current, "--get-mount-point").stdout.strip()
+    mount_root = Path(mount).resolve()
+    if not mount_root.exists():
+        print("Phone storage mount is unavailable", file=sys.stderr)
+        return 3
+    result = 0
+    for rule in rules:
+        local = Path(rule["local"]).expanduser().resolve()
+        remote = (mount_root / rule["remote"].lstrip("/")).resolve()
+        if mount_root not in remote.parents and remote != mount_root:
+            print(f"Unsafe remote path rejected: {rule['remote']}", file=sys.stderr)
+            result = 4
+            continue
+        direction = rule.get("direction", "push")
+        source, target = (local, remote) if direction == "push" else (remote, local)
+        if direction not in {"push", "pull"} or not source.exists():
+            print(f"Skipped invalid rule: {rule.get('name', 'unnamed')}", file=sys.stderr)
+            result = 4
+            continue
+        target.mkdir(parents=True, exist_ok=True)
+        command = ["rsync", "-a", "--update", "--human-readable", str(source), str(target)]
+        code = subprocess.call(command)
+        result = code or result
+    return result
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("status")
+    commands.add_parser("browse")
+    send = commands.add_parser("send")
+    send.add_argument("paths", nargs="+")
+    sync_parser = commands.add_parser("sync")
+    sync_parser.add_argument("rule", nargs="?")
+    args = parser.parse_args()
+    if args.command == "status":
+        return status()
+    if args.command == "send":
+        return share(args.paths)
+    if args.command == "browse":
+        return browse()
+    return sync(args.rule)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

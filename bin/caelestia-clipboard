@@ -1,0 +1,247 @@
+#!/usr/bin/env python3
+"""Single event-driven clipboard/history bridge for Caelestia and KDE Connect."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import mimetypes
+import os
+import sqlite3
+import subprocess
+import sys
+import time
+import urllib.parse
+from pathlib import Path
+
+HOME = Path.home()
+DATA = HOME / ".local/share/caelestia-clipboard"
+FILES = DATA / "items"
+DB = DATA / "history.sqlite3"
+STATE = HOME / ".local/state/caelestia/clipboard-history.json"
+MAX_ITEMS = 100
+MAX_TEXT = 2 * 1024 * 1024
+MAX_IMAGE = 30 * 1024 * 1024
+
+
+def setup() -> sqlite3.Connection:
+    FILES.mkdir(parents=True, exist_ok=True)
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(DB, timeout=10)
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute("PRAGMA synchronous=NORMAL")
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS items (
+        id INTEGER PRIMARY KEY, digest TEXT UNIQUE NOT NULL, kind TEXT NOT NULL,
+        mime TEXT NOT NULL, text TEXT NOT NULL DEFAULT '', path TEXT NOT NULL DEFAULT '',
+        created REAL NOT NULL)"""
+    )
+    return connection
+
+
+def run(*args: str, input_data: bytes | None = None) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(args, input=input_data, capture_output=True, check=False, timeout=20)
+
+
+def export_state(connection: sqlite3.Connection) -> None:
+    rows = connection.execute(
+        "SELECT id,kind,mime,text,path,created FROM items ORDER BY created DESC LIMIT ?", (MAX_ITEMS,)
+    ).fetchall()
+    payload = [
+        {"id": row[0], "kind": row[1], "mime": row[2], "text": row[3],
+         "path": row[4], "created": row[5]}
+        for row in rows
+    ]
+    temporary = STATE.with_suffix(".tmp")
+    temporary.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    temporary.replace(STATE)
+
+
+def offered_types() -> list[str]:
+    result = run("wl-paste", "--list-types")
+    return result.stdout.decode("utf-8", "replace").splitlines() if result.returncode == 0 else []
+
+
+def preferred_type(types: list[str]) -> tuple[str, str] | None:
+    for mime in ("image/png", "image/jpeg", "image/webp", "image/bmp"):
+        if mime in types:
+            return "image", mime
+    if "text/uri-list" in types:
+        return "files", "text/uri-list"
+    for mime in ("text/plain;charset=utf-8", "text/plain", "UTF8_STRING", "STRING"):
+        if mime in types:
+            return "text", mime
+    return None
+
+
+def prune(connection: sqlite3.Connection) -> None:
+    stale = connection.execute(
+        "SELECT id,path FROM items ORDER BY created DESC LIMIT -1 OFFSET ?", (MAX_ITEMS,)
+    ).fetchall()
+    for item_id, path in stale:
+        if path:
+            try:
+                Path(path).unlink(missing_ok=True)
+            except OSError:
+                pass
+        connection.execute("DELETE FROM items WHERE id=?", (item_id,))
+
+
+def capture() -> int:
+    if os.environ.get("CLIPBOARD_STATE") in {"sensitive", "nil", "clear"}:
+        return 0
+    choice = preferred_type(offered_types())
+    if choice is None:
+        return 0
+    kind, mime = choice
+    result = run("wl-paste", "--no-newline", "--type", mime)
+    if result.returncode != 0:
+        return result.returncode
+    data = result.stdout
+    limit = MAX_IMAGE if kind == "image" else MAX_TEXT
+    if not data or len(data) > limit:
+        return 0
+    digest = hashlib.sha256(data).hexdigest()
+    text = ""
+    path = ""
+    if kind == "image":
+        extension = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp", "image/bmp": ".bmp"}.get(mime, ".img")
+        target = FILES / f"{digest}{extension}"
+        if not target.exists():
+            target.write_bytes(data)
+        path = str(target)
+        text = "Copied image"
+    else:
+        text = data.decode("utf-8", "replace").replace("\x00", "").strip()
+        if not text:
+            return 0
+        if kind == "files":
+            text = "\n".join(line for line in text.splitlines() if line and not line.startswith("#"))
+    connection = setup()
+    now = time.time()
+    connection.execute(
+        """INSERT INTO items(digest,kind,mime,text,path,created) VALUES(?,?,?,?,?,?)
+        ON CONFLICT(digest) DO UPDATE SET created=excluded.created""",
+        (digest, kind, mime, text, path, now),
+    )
+    prune(connection)
+    connection.commit()
+    export_state(connection)
+    return 0
+
+
+def item(connection: sqlite3.Connection, item_id: int) -> tuple | None:
+    return connection.execute(
+        "SELECT id,kind,mime,text,path FROM items WHERE id=?", (item_id,)
+    ).fetchone()
+
+
+def copy_item(item_id: int) -> int:
+    connection = setup()
+    row = item(connection, item_id)
+    if row is None:
+        return 1
+    _, kind, mime, text, path = row
+    data = Path(path).read_bytes() if kind == "image" else text.encode()
+    process = subprocess.Popen(["wl-copy", "--type", mime], stdin=subprocess.PIPE)
+    process.communicate(data)
+    return process.returncode or 0
+
+
+def reachable_device() -> str | None:
+    result = run("kdeconnect-cli", "--list-available", "--id-only")
+    devices = result.stdout.decode().split()
+    return devices[0] if devices else None
+
+
+def send_item(item_id: int) -> int:
+    connection = setup()
+    row = item(connection, item_id)
+    device = reachable_device()
+    if row is None or device is None:
+        return 2
+    _, kind, _, text, path = row
+    if kind == "image":
+        command = ["kdeconnect-cli", "-d", device, "--share", path]
+    elif kind == "files":
+        first = text.splitlines()[0].removeprefix("file://")
+        command = ["kdeconnect-cli", "-d", device, "--share", first]
+    else:
+        command = ["kdeconnect-cli", "-d", device, "--share-text", text]
+    return subprocess.call(command)
+
+
+def send_paths(values: list[str]) -> int:
+    """Share one or more local paths through the first reachable paired device."""
+    device = reachable_device()
+    if device is None:
+        return 2
+    result = 0
+    for value in values:
+        decoded = urllib.parse.unquote(value.removeprefix("file://"))
+        path = Path(decoded).expanduser().resolve()
+        if not path.exists():
+            result = 1
+            continue
+        result = subprocess.call(["kdeconnect-cli", "-d", device, "--share", str(path)]) or result
+    return result
+
+
+def delete_item(item_id: int) -> int:
+    connection = setup()
+    row = item(connection, item_id)
+    if row and row[4]:
+        Path(row[4]).unlink(missing_ok=True)
+    connection.execute("DELETE FROM items WHERE id=?", (item_id,))
+    connection.commit()
+    export_state(connection)
+    return 0
+
+
+def clear() -> int:
+    connection = setup()
+    for (path,) in connection.execute("SELECT path FROM items WHERE path != ''"):
+        Path(path).unlink(missing_ok=True)
+    connection.execute("DELETE FROM items")
+    connection.commit()
+    export_state(connection)
+    return 0
+
+
+def serve() -> int:
+    connection = setup()
+    export_state(connection)
+    command = ["wl-paste", "--watch", str(Path(__file__).resolve()), "capture"]
+    while True:
+        process = subprocess.Popen(command)
+        result = process.wait()
+        if result in (-15, -2):
+            return 0
+        time.sleep(1)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("serve")
+    sub.add_parser("capture")
+    sub.add_parser("clear")
+    for name in ("copy", "send", "delete"):
+        command = sub.add_parser(name)
+        command.add_argument("id", type=int)
+    send_path = sub.add_parser("send-path")
+    send_path.add_argument("paths", nargs="+")
+    args = parser.parse_args()
+    if args.command == "serve": return serve()
+    if args.command == "capture": return capture()
+    if args.command == "clear": return clear()
+    if args.command == "copy": return copy_item(args.id)
+    if args.command == "send": return send_item(args.id)
+    if args.command == "send-path": return send_paths(args.paths)
+    if args.command == "delete": return delete_item(args.id)
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

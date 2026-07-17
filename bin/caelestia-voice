@@ -11,6 +11,7 @@ import fcntl
 import json
 import os
 import signal
+import random
 import subprocess
 import sys
 import time
@@ -24,7 +25,8 @@ LOCK = STATE_DIR / "voice.lock"
 AUDIO = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / "caelestia-voice.wav"
 VENV_PYTHON = HOME / "gemini_voice_assistant/venv_new/bin/python3"
 MODEL = "gemini-3.1-flash-lite"
-PROMPT = """Transcribe the user's speech accurately. Remove accidental filler words and apply spoken mid-sentence corrections, keeping only the corrected wording. Add natural punctuation. Do not censor profanity. Do not answer the user or invent facts: output only what was spoken. If there is only silence, background noise, or unintelligible speech, output exactly <NO TEXT>."""
+CONFIG = HOME / ".config/caelestia/voice-typing.json"
+DEFAULT_PROMPT = """Transcribe the user's speech accurately. Remove accidental filler words and apply spoken mid-sentence corrections, keeping only the corrected wording. Add natural punctuation. Do not censor profanity. Do not answer the user or invent facts: output only what was spoken. If there is only silence, background noise, or unintelligible speech, output exactly <NO TEXT>."""
 
 
 def write_state(status: str, message: str, *, detail: str = "") -> None:
@@ -98,15 +100,39 @@ def stop() -> None:
     )
 
 
-def api_key() -> str | None:
+def api_keys() -> list[str]:
+    keys: list[str] = []
+    for slot in range(1, 4):
+        try:
+            result = subprocess.run(
+                ["secret-tool", "lookup", "application", "caelestia", "purpose", "gemini-voice", "slot", str(slot)],
+                capture_output=True, text=True, timeout=5, check=False,
+            )
+            value = result.stdout.strip()
+            if value and value not in keys:
+                keys.append(value)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
     for path in (HOME / "gemini_voice_assistant/paid_key", HOME / ".gemini_api_key"):
         try:
             value = path.read_text(encoding="utf-8").strip()
-            if value:
-                return value
+            if value and value not in keys:
+                keys.append(value)
         except OSError:
             pass
-    return os.environ.get("GEMINI_API_KEY")
+    value = os.environ.get("GEMINI_API_KEY", "").strip()
+    if value and value not in keys:
+        keys.append(value)
+    random.SystemRandom().shuffle(keys)
+    return keys
+
+
+def transcription_config() -> tuple[str, str]:
+    try:
+        config = json.loads(CONFIG.read_text(encoding="utf-8"))
+        return config.get("model", MODEL), config.get("prompt", DEFAULT_PROMPT)
+    except (OSError, ValueError):
+        return MODEL, DEFAULT_PROMPT
 
 
 def paste(text: str) -> None:
@@ -123,8 +149,8 @@ def paste(text: str) -> None:
 
 
 def transcribe() -> None:
-    key = api_key()
-    if not key:
+    keys = api_keys()
+    if not keys:
         write_state("error", "Gemini key unavailable", detail="Add it to a private key file")
         time.sleep(4)
         write_state("idle", "")
@@ -135,12 +161,23 @@ def transcribe() -> None:
         from google import genai
         from google.genai import types
 
-        client = genai.Client(api_key=key)
-        response = client.models.generate_content(
-            model=MODEL,
-            contents=[PROMPT, types.Part.from_bytes(data=AUDIO.read_bytes(), mime_type="audio/wav")],
-            config=types.GenerateContentConfig(temperature=0),
-        )
+        model, prompt = transcription_config()
+        audio = AUDIO.read_bytes()
+        response = None
+        last_error = None
+        for key in keys:
+            try:
+                client = genai.Client(api_key=key)
+                response = client.models.generate_content(
+                    model=model,
+                    contents=[prompt, types.Part.from_bytes(data=audio, mime_type="audio/wav")],
+                    config=types.GenerateContentConfig(temperature=0),
+                )
+                break
+            except Exception as error:
+                last_error = error
+        if response is None:
+            raise RuntimeError(f"All configured Gemini keys failed: {last_error}")
         text = (response.text or "").strip()
         if not text or text in {"<NO TEXT>", "(<NO TEXT>)"}:
             write_state("empty", "No clear speech detected")

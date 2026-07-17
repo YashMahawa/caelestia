@@ -1,0 +1,4 @@
+{
+  "model": "gemini-3.1-flash-lite",
+  "prompt": "Transcribe the user's speech accurately. Remove accidental filler words and apply spoken mid-sentence corrections, keeping only the corrected wording. Add natural punctuation. Do not censor profanity. Do not answer the user or invent facts: output only what was spoken. If there is only silence, background noise, or unintelligible speech, output exactly <NO TEXT>."
+}

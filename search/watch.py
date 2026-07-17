@@ -2,6 +2,8 @@
 """Tiny inotify front-end: queue real changes and wake the bounded worker."""
 
 import json
+import fnmatch
+import mimetypes
 import os
 import re
 import sqlite3
@@ -16,6 +18,17 @@ CONFIG = HOME / ".config/caelestia/semantic-search.json"
 DB = HOME / ".local/share/caelestia-search/index.sqlite3"
 CFG = json.loads(CONFIG.read_text())
 EXCLUDED_DIRECTORIES = set(CFG["exclude_directories"])
+PROJECT_MARKERS = {
+    ".git", "package.json", "pyproject.toml", "Cargo.toml", "go.mod",
+    "CMakeLists.txt", "pubspec.yaml", "build.gradle", "settings.gradle",
+}
+CONTENT_EXTENSIONS = {
+    ".txt", ".md", ".markdown", ".rst", ".org", ".tex", ".csv", ".tsv",
+    ".json", ".jsonl", ".yaml", ".yml", ".toml", ".ini", ".conf", ".log",
+    ".ipynb", ".pdf", ".docx", ".pptx", ".xlsx",
+    ".odt", ".odp", ".ods", ".png", ".jpg", ".jpeg", ".webp", ".tif",
+    ".tiff", ".bmp",
+}
 MASK = (
     pyinotify.IN_CLOSE_WRITE | pyinotify.IN_MOVED_TO | pyinotify.IN_CREATE
     | pyinotify.IN_DELETE | pyinotify.IN_MOVED_FROM
@@ -31,9 +44,13 @@ class Handler(pyinotify.ProcessEvent):
         db.execute(
             "CREATE TABLE IF NOT EXISTS pending(path TEXT PRIMARY KEY, queued_at INTEGER NOT NULL)"
         )
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS name_pending(path TEXT PRIMARY KEY, queued_at INTEGER NOT NULL)"
+        )
         path = event.pathname
         if event.mask & (pyinotify.IN_DELETE | pyinotify.IN_MOVED_FROM):
             db.execute("DELETE FROM pending WHERE path=?", (path,))
+            db.execute("DELETE FROM name_pending WHERE path=?", (path,))
             try:
                 db.execute("DELETE FROM files WHERE path=?", (path,))
                 db.execute("DELETE FROM files_fts WHERE path=?", (path,))
@@ -44,14 +61,41 @@ class Handler(pyinotify.ProcessEvent):
             if (
                 (not candidate.is_file() and not candidate.is_dir())
                 or set(candidate.parts).intersection(EXCLUDED_DIRECTORIES)
+                or any(fnmatch.fnmatch(candidate.name.casefold(), pattern.casefold()) for pattern in CFG["exclude_globs"])
             ):
                 db.close()
                 return
-            db.execute(
-                "INSERT INTO pending(path,queued_at) VALUES(?,?) "
-                "ON CONFLICT(path) DO UPDATE SET queued_at=excluded.queued_at",
-                (path, time.time_ns()),
+            content_worthy = candidate.is_file() and (
+                candidate.suffix.casefold() in CONTENT_EXTENSIONS
+                or (not candidate.suffix and candidate.stat().st_size <= 2 * 1024 * 1024)
             )
+            if content_worthy:
+                db.execute(
+                    "INSERT INTO pending(path,queued_at) VALUES(?,?) "
+                    "ON CONFLICT(path) DO UPDATE SET queued_at=excluded.queued_at",
+                    (path, time.time_ns()),
+                )
+            try:
+                stat = candidate.stat()
+                kind = "folder" if candidate.is_dir() else "file"
+                parent = str(candidate.parent.relative_to(HOME)) if candidate.is_relative_to(HOME) else str(candidate.parent)
+                mime = "inode/directory" if kind == "folder" else (mimetypes.guess_type(candidate.name)[0] or "")
+                existed = db.execute("SELECT 1 FROM files WHERE path=?", (path,)).fetchone()
+                if not existed:
+                    db.execute(
+                        "INSERT INTO files(path,name,parent,mime,size,mtime_ns,indexed_at,kind) VALUES(?,?,?,?,?,?,0,?)",
+                        (path, candidate.name, parent, mime, 0 if kind == "folder" else stat.st_size, stat.st_mtime_ns, kind),
+                    )
+                    db.execute(
+                        "INSERT INTO files_fts(path,name,parent,text) VALUES(?,?,?,?)",
+                        (path, candidate.name, parent, ""),
+                    )
+                    db.execute(
+                        "INSERT OR REPLACE INTO name_pending(path,queued_at) VALUES(?,?)",
+                        (path, time.time_ns()),
+                    )
+            except (OSError, sqlite3.OperationalError):
+                pass
         db.commit()
         db.close()
         now = time.monotonic()
@@ -69,8 +113,19 @@ notifier = pyinotify.Notifier(manager, handler)
 exclude = pyinotify.ExcludeFilter([
     rf"(^|/){re.escape(name)}(/|$)" for name in CFG["exclude_directories"]
 ])
-for raw in CFG["roots"]:
-    root = Path(raw)
+watch_roots = [Path(raw) for raw in CFG["roots"]]
+if CFG.get("discover_top_level_projects", True):
+    try:
+        for child in HOME.iterdir():
+            try:
+                is_project = any((child / marker).exists() for marker in PROJECT_MARKERS)
+            except OSError:
+                is_project = False
+            if child.is_dir() and not child.name.startswith(".") and child.name not in EXCLUDED_DIRECTORIES and is_project:
+                watch_roots.append(child)
+    except OSError:
+        pass
+for root in dict.fromkeys(watch_roots):
     if root.is_dir():
         manager.add_watch(
             str(root), MASK, rec=True, auto_add=True, exclude_filter=exclude

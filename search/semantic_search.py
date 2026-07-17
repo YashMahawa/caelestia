@@ -42,6 +42,15 @@ PLAIN_EXTENSIONS = {
 }
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff", ".bmp"}
 OFFICE_EXTENSIONS = {".docx", ".pptx", ".xlsx", ".odt", ".odp", ".ods"}
+CONTENT_TEXT_EXTENSIONS = {
+    ".txt", ".md", ".markdown", ".rst", ".org", ".tex", ".csv", ".tsv",
+    ".json", ".jsonl", ".yaml", ".yml", ".toml", ".ini", ".conf", ".log",
+    ".ipynb",
+}
+PROJECT_MARKERS = {
+    ".git", "package.json", "pyproject.toml", "Cargo.toml", "go.mod",
+    "CMakeLists.txt", "pubspec.yaml", "build.gradle", "settings.gradle",
+}
 
 
 def config() -> dict:
@@ -75,6 +84,10 @@ def connect() -> sqlite3.Connection:
             path TEXT PRIMARY KEY,
             queued_at INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS name_pending (
+            path TEXT PRIMARY KEY,
+            queued_at INTEGER NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS visual_tags (
             path TEXT PRIMARY KEY,
             mtime_ns INTEGER NOT NULL,
@@ -86,6 +99,15 @@ def connect() -> sqlite3.Connection:
     columns = {row[1] for row in db.execute("PRAGMA table_info(files)")}
     if "kind" not in columns:
         db.execute("ALTER TABLE files ADD COLUMN kind TEXT NOT NULL DEFAULT 'file'")
+    if "name_vector" not in columns:
+        db.execute("ALTER TABLE files ADD COLUMN name_vector BLOB")
+    if "name_vector_dim" not in columns:
+        db.execute("ALTER TABLE files ADD COLUMN name_vector_dim INTEGER")
+    db.execute(
+        "INSERT OR IGNORE INTO name_pending(path,queued_at) "
+        "SELECT path,? FROM files WHERE name_vector IS NULL",
+        (time.time_ns(),),
+    )
     return db
 
 
@@ -114,11 +136,32 @@ def supported(path: Path, cfg: dict) -> bool:
 
 
 def roots(cfg: dict) -> list[Path]:
-    return [Path(p) for p in cfg["roots"] if Path(p).is_dir()]
+    found = [Path(p) for p in cfg["roots"] if Path(p).is_dir()]
+    if cfg.get("discover_top_level_projects", True):
+        # Deliberately only an ls-like one-level probe of $HOME.
+        try:
+            children = list(HOME.iterdir())
+        except OSError:
+            children = []
+        for child in children:
+            try:
+                is_project = any((child / marker).exists() for marker in PROJECT_MARKERS)
+            except OSError:
+                is_project = False
+            if child.is_dir() and not child.name.startswith(".") and not excluded(child, cfg) and is_project:
+                found.append(child)
+    return list(dict.fromkeys(found))
 
 
 def iter_files(cfg: dict):
     excluded_dirs = set(cfg["exclude_directories"])
+    # Include ordinary files directly in $HOME without recursively crawling it.
+    try:
+        for path in HOME.iterdir():
+            if path.is_file() and not path.name.startswith(".") and supported(path, cfg):
+                yield path
+    except OSError:
+        pass
     for root in roots(cfg):
         for current, dirs, names in os.walk(root, followlinks=False):
             dirs[:] = [
@@ -133,6 +176,19 @@ def iter_files(cfg: dict):
                 path = Path(current) / name
                 if supported(path, cfg):
                     yield path
+
+
+def content_supported(path: Path) -> bool:
+    """Whether content extraction is useful; every path still gets name search."""
+    if not path.is_file():
+        return False
+    suffix = path.suffix.casefold()
+    if suffix in CONTENT_TEXT_EXTENSIONS | IMAGE_EXTENSIONS | OFFICE_EXTENSIONS | {".pdf"}:
+        return True
+    try:
+        return not suffix and path.stat().st_size <= 2 * 1024 * 1024
+    except OSError:
+        return False
 
 
 def command_text(command: list[str], timeout: int = 30) -> str:
@@ -212,26 +268,18 @@ def extract_text(path: Path, cfg: dict) -> str:
 
 
 class Embedder:
-    def __init__(self, dimensions: int, *, query: bool = False):
+    def __init__(self, dimensions: int, *, query: bool = False, batch_size: int | None = None):
         import openvino as ov
         from transformers import AutoTokenizer
 
         CACHE_PATH.mkdir(parents=True, exist_ok=True)
         self.dimensions = dimensions
         self.query = query
-        self.batch_size = 1 if query else 4
+        self.batch_size = batch_size or (1 if query else 4)
         self.sequence_length = 128
-        waydroid_running = False
-        if not query:
-            try:
-                status = subprocess.run(
-                    ["waydroid", "status"],
-                    capture_output=True, text=True, timeout=3, check=False,
-                ).stdout
-                waydroid_running = "Container:\tRUNNING" in status
-            except (OSError, subprocess.TimeoutExpired):
-                pass
-        self.device = "CPU" if query or waydroid_running else "GPU"
+        # Long iGPU model workloads have stalled the compositor on this laptop.
+        # Query-time vector scoring remains iGPU accelerated where worthwhile.
+        self.device = "CPU"
         device_cache = CACHE_PATH / self.device.casefold()
         device_cache.mkdir(parents=True, exist_ok=True)
         self.tokenizer = AutoTokenizer.from_pretrained(
@@ -348,6 +396,14 @@ def queue_path(db: sqlite3.Connection, path: Path):
     )
 
 
+def queue_name(db: sqlite3.Connection, path: Path):
+    db.execute(
+        "INSERT INTO name_pending(path, queued_at) VALUES(?, ?) "
+        "ON CONFLICT(path) DO UPDATE SET queued_at=excluded.queued_at",
+        (str(path), time.time_ns()),
+    )
+
+
 def discover(full: bool = False):
     cfg = config()
     db = connect()
@@ -374,13 +430,18 @@ def discover(full: bool = False):
                 "INSERT INTO files_fts(path,name,parent,text) VALUES(?,?,?,?)",
                 (raw, path.name, parent, ""),
             )
+            queue_name(db, path)
         expected_size = 0 if kind == "folder" else stat.st_size
         if full or row != (expected_size, stat.st_mtime_ns):
-            queue_path(db, path)
-            queued += 1
+            if content_supported(path):
+                queue_path(db, path)
+                queued += 1
+            else:
+                db.execute("DELETE FROM pending WHERE path=?", (raw,))
     if full:
         db.execute("DELETE FROM files WHERE path NOT IN (SELECT path FROM seen_paths)")
         db.execute("DELETE FROM pending WHERE path NOT IN (SELECT path FROM seen_paths)")
+        db.execute("DELETE FROM name_pending WHERE path NOT IN (SELECT path FROM seen_paths)")
         # FTS5 has no normal index on its unindexed path column. Rebuilding once
         # is dramatically cheaper than thousands of per-path virtual-table scans.
         db.execute("DELETE FROM files_fts")
@@ -393,11 +454,50 @@ def remove_path(db: sqlite3.Connection, raw: str):
     db.execute("DELETE FROM files WHERE path=?", (raw,))
     db.execute("DELETE FROM files_fts WHERE path=?", (raw,))
     db.execute("DELETE FROM pending WHERE path=?", (raw,))
+    db.execute("DELETE FROM name_pending WHERE path=?", (raw,))
+
+
+def work_names(db: sqlite3.Connection, cfg: dict, limit: int = 384) -> int:
+    """Give every path a semantic filename vector before costly content OCR."""
+    embedder: Embedder | None = None
+    processed = 0
+    while processed < limit:
+        batch_rows = db.execute(
+            "SELECT path FROM name_pending ORDER BY queued_at DESC LIMIT 16"
+        ).fetchall()
+        if not batch_rows:
+            break
+        documents: list[tuple[str, str]] = []
+        for (raw,) in batch_rows:
+            path = Path(raw)
+            if not supported(path, cfg):
+                remove_path(db, raw)
+                continue
+            kind = "Folder" if path.is_dir() else "File"
+            parent = str(path.parent.relative_to(HOME)) if path.is_relative_to(HOME) else str(path.parent)
+            readable = path.stem.replace("_", " ").replace("-", " ")
+            documents.append((raw, f"{kind}: {readable}\nFilename: {path.name}\nFolder: {parent}"))
+        if not documents:
+            db.commit()
+            continue
+        if embedder is None:
+            embedder = Embedder(cfg["embedding_dimensions"], batch_size=16)
+        vectors = embedder.encode([document for _raw, document in documents])
+        for (raw, _document), vector in zip(documents, vectors):
+            db.execute(
+                "UPDATE files SET name_vector=?,name_vector_dim=? WHERE path=?",
+                (vector.astype(np.float16).tobytes(), len(vector), raw),
+            )
+            db.execute("DELETE FROM name_pending WHERE path=?", (raw,))
+            processed += 1
+        db.commit()
+    return processed
 
 
 def work(limit: int = 0):
     cfg = config()
     db = connect()
+    names_processed = work_names(db, cfg, max(384, limit * 8) if limit else 384)
     embedder: Embedder | None = None
     processed = failed = 0
     while True:
@@ -462,7 +562,7 @@ def work(limit: int = 0):
             db.execute("DELETE FROM pending WHERE path=?", (raw,))
             processed += 1
         db.commit()
-    print(json.dumps({"processed": processed, "failed": failed}))
+    print(json.dumps({"names_processed": names_processed, "processed": processed, "failed": failed}))
 
 
 def search(query: str, count: int = 20, json_output: bool = False):
@@ -470,7 +570,9 @@ def search(query: str, count: int = 20, json_output: bool = False):
     cfg = config()
     db = connect()
     rows = db.execute(
-        "SELECT path,name,parent,mime,size,mtime_ns,vector,vector_dim,kind FROM files WHERE vector IS NOT NULL"
+        "SELECT path,name,parent,mime,size,mtime_ns,"
+        "COALESCE(vector,name_vector),COALESCE(vector_dim,name_vector_dim),kind "
+        "FROM files WHERE vector IS NOT NULL OR name_vector IS NOT NULL"
     ).fetchall()
     if os.environ.get("CAELESTIA_LEXICAL_ONLY") == "1":
         rows = []
@@ -610,8 +712,11 @@ def status():
     db = connect()
     files = db.execute("SELECT count(*) FROM files").fetchone()[0]
     pending = db.execute("SELECT count(*) FROM pending").fetchone()[0]
+    name_pending = db.execute("SELECT count(*) FROM name_pending").fetchone()[0]
+    name_vectors = db.execute("SELECT count(*) FROM files WHERE name_vector IS NOT NULL").fetchone()[0]
     size = DB_PATH.stat().st_size if DB_PATH.exists() else 0
-    print(json.dumps({"files": files, "pending": pending, "database_bytes": size}))
+    print(json.dumps({"files": files, "pending": pending, "name_pending": name_pending,
+                      "name_vectors": name_vectors, "database_bytes": size}))
 
 
 def main():

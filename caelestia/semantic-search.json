@@ -6,11 +6,13 @@
     "/home/yash/Pictures",
     "/home/yash/Videos",
     "/home/yash/Music",
+    "/home/yash/Projects",
     "/home/yash/Ob",
     "/home/yash/Obsidian",
     "/home/yash/Acads",
     "/home/yash/ML"
   ],
+  "discover_top_level_projects": true,
   "exclude_directories": [
     ".cache", "cache", ".git", ".hg", ".svn", ".idea", ".vscode", ".obsidian",
     "__pycache__", "node_modules", ".venv", ".venv-openvino-convert",

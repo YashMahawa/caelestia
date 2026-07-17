@@ -1,0 +1,113 @@
+#!/usr/bin/env python3
+"""Manage Gemini voice settings without exposing secrets in process arguments."""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+HOME = Path.home()
+CONFIG = HOME / ".config/caelestia/voice-typing.json"
+ATTRS = ["application", "caelestia", "purpose", "gemini-voice"]
+DEFAULT_PROMPT = "Transcribe the user's speech accurately. Remove accidental filler words and apply spoken mid-sentence corrections, keeping only the corrected wording. Add natural punctuation. Do not censor profanity. Do not answer the user or invent facts: output only what was spoken. If there is only silence, background noise, or unintelligible speech, output exactly <NO TEXT>."
+
+
+def lookup(slot: int) -> str | None:
+    result = subprocess.run(
+        ["secret-tool", "lookup", *ATTRS, "slot", str(slot)],
+        capture_output=True, text=True, check=False,
+    )
+    value = result.stdout.strip()
+    return value or None
+
+
+def store(slot: int, value: str) -> None:
+    if not 1 <= slot <= 3:
+        raise SystemExit("invalid slot")
+    value = value.strip()
+    if len(value) < 20:
+        raise SystemExit("API key looks too short")
+    result = subprocess.run(
+        ["secret-tool", "store", "--label", f"Caelestia Gemini voice key {slot}", *ATTRS, "slot", str(slot)],
+        input=value + "\n", text=True, check=False,
+    )
+    if result.returncode:
+        raise SystemExit("Secret Service rejected the key")
+
+
+def clear(slot: int) -> None:
+    subprocess.run(["secret-tool", "clear", *ATTRS, "slot", str(slot)], check=False)
+
+
+def load_config() -> dict:
+    try:
+        return json.loads(CONFIG.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"model": "gemini-3.1-flash-lite", "prompt": DEFAULT_PROMPT}
+
+
+def save_prompt(prompt: str) -> None:
+    prompt = prompt.strip()
+    if len(prompt) < 40:
+        raise SystemExit("Prompt is too short")
+    CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    config = load_config()
+    config["prompt"] = prompt
+    temporary = CONFIG.with_suffix(".tmp")
+    temporary.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, CONFIG)
+
+
+def migrate() -> None:
+    existing = [lookup(slot) for slot in range(1, 4)]
+    candidates = []
+    for path in (HOME / "gemini_voice_assistant/paid_key", HOME / ".gemini_api_key"):
+        try:
+            value = path.read_text(encoding="utf-8").strip()
+            if value and value not in candidates:
+                candidates.append(value)
+        except OSError:
+            pass
+    for value in candidates:
+        if value in existing:
+            continue
+        try:
+            slot = existing.index(None) + 1
+        except ValueError:
+            break
+        store(slot, value)
+        existing[slot - 1] = value
+
+
+def status() -> None:
+    config = load_config()
+    print(json.dumps({
+        "keys": [bool(lookup(slot)) for slot in range(1, 4)],
+        "prompt": config.get("prompt", DEFAULT_PROMPT),
+        "model": config.get("model", "gemini-3.1-flash-lite"),
+    }, ensure_ascii=False))
+
+
+def main() -> None:
+    command = sys.argv[1] if len(sys.argv) > 1 else "status"
+    if command == "status":
+        status()
+    elif command == "store":
+        store(int(sys.argv[2]), sys.stdin.readline())
+    elif command == "clear":
+        clear(int(sys.argv[2]))
+    elif command == "set-prompt":
+        save_prompt(json.loads(sys.stdin.readline()))
+    elif command == "migrate":
+        migrate()
+        status()
+    else:
+        raise SystemExit("usage: caelestia-voice-settings {status|store SLOT|clear SLOT|set-prompt|migrate}")
+
+
+if __name__ == "__main__":
+    main()

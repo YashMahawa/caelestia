@@ -9,6 +9,9 @@ not stored in Git.
 - `Super` and `Super+Shift+Space` open the native Caelestia launcher.
 - Results combine applications, folders, fuzzy filenames, indexed content and local
   semantic matches, capped at ten total results.
+- Every useful path is indexed immediately by filename, including Markdown and
+  source files. Top-level code projects are discovered with a one-level probe.
+  Compact filename vectors are backfilled before slower content extraction/OCR.
 - EmbeddingGemma INT4 generates document embeddings through OpenVINO. A reusable
   OpenCL kernel performs top-K vector scoring on Intel graphics; it exits 45 seconds
   after the last query.
@@ -43,8 +46,11 @@ The battery popout also exposes Ultra alongside the normal manual power profiles
 recording stops; there is no permanent keyboard-listener process. Caelestia renders
 listening, processing, success and error states from an event-watched JSON file.
 
-Credentials are read at runtime from a private local key file or environment. Never
-commit credentials. The repository contains no API keys.
+Settings > Voice typing manages three Gemini key slots and the transcription prompt.
+Keys are passed over stdin into the desktop Secret Service keyring, never placed in
+JSON, process arguments or Git. A slot is selected randomly per transcription and
+the remaining keys provide automatic failover. Legacy private key files remain a
+compatibility fallback. The repository contains no API keys.
 
 ## Safety properties
 

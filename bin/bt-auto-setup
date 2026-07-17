@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+
+pick_best_a2dp_profile() {
+    local card="$1"
+    local card_info profile
+
+    card_info=$(pactl list cards 2>/dev/null | awk -v target="$card" '
+        $1 == "Name:" && $2 == target { found=1 }
+        found && $1 == "Profiles:" { in_profiles=1; next }
+        in_profiles && $1 ~ /^[[:space:]]/ {
+            sub(/^[[:space:]]+/, "", $0)
+            split($0, parts, ":")
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", parts[1])
+            print parts[1]
+            next
+        }
+        in_profiles && $1 !~ /^[[:space:]]/ { exit }
+    ')
+
+    for profile in a2dp-sink-aac a2dp-sink-aptx_hd a2dp-sink-aptx a2dp-sink-ldac a2dp-sink-sbc_xq a2dp-sink; do
+        if grep -qx "$profile" <<<"$card_info"; then
+            printf '%s\n' "$profile"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+setup_bt_device() {
+    local device_name=$1
+    local card_name="" sink_name="" profile="" attempt
+    printf 'Setting up Bluetooth device: %s\n' "$device_name"
+
+    for attempt in {1..20}; do
+        card_name=$(pactl list cards short 2>/dev/null | awk '/bluez/ { print $2; exit }')
+        [[ -n "$card_name" ]] && break
+        sleep 0.25
+    done
+
+    if [[ -n "$card_name" ]]; then
+        if profile=$(pick_best_a2dp_profile "$card_name"); then
+            pactl set-card-profile "$card_name" "$profile"
+        else
+            pactl set-card-profile "$card_name" a2dp-sink
+        fi
+    fi
+
+    for attempt in {1..12}; do
+        sink_name=$(pactl list sinks short 2>/dev/null | awk '/bluez/ { print $2; exit }')
+        [[ -n "$sink_name" ]] && break
+        sleep 0.25
+    done
+
+    if [[ -n "$sink_name" ]]; then
+        pactl set-default-sink "$sink_name"
+        pactl set-sink-mute "$sink_name" 0
+    fi
+}
+
+setup_bt_device "Initial"
+
+pactl subscribe | while read -r line; do
+    if [[ "$line" == *"Event 'new' on card"* ]]; then
+        setup_bt_device "New connection detected"
+    fi
+done

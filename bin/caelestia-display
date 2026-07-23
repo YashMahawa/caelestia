@@ -18,6 +18,8 @@ STATE_DIR = Path.home() / ".local/state/caelestia"
 CONTROL_CONF = Path.home() / ".config/hypr/caelestia-display.conf"
 HYPR_CONF = Path.home() / ".config/hypr/hyprland.conf"
 VALID_NAME = re.compile(r"^[A-Za-z0-9_.:-]+$")
+VALID_RESOLUTION = re.compile(r"^\d+x\d+@[\d.]+$")
+VALID_POSITION = re.compile(r"^-?\d+x-?\d+$")
 
 
 def run(args: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -212,17 +214,15 @@ def profile_rules(profile: str, values: list[dict]) -> list[str]:
     return rules
 
 
-def apply_profile(profile: str) -> int:
-    values = monitors()
-    rules = profile_rules(profile, values)
+def start_change(values: list[dict], apply_rules: list[str], persist_rules: list[str], label: str) -> int:
     token = uuid.uuid4().hex[:12]
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     state = STATE_DIR / f"display-revert-{token}.json"
     state.write_text(json.dumps({
-        "created": time.time(), "monitors": values, "rules": rules
+        "created": time.time(), "monitors": values, "rules": persist_rules
     }), encoding="utf-8")
     try:
-        for rule in rules:
+        for rule in apply_rules:
             apply_rule(rule)
     except Exception:
         rollback(token)
@@ -232,8 +232,44 @@ def apply_profile(profile: str) -> int:
         "systemd-run", "--user", "--quiet", f"--unit=caelestia-display-revert-{token}",
         "--on-active=20s", executable, "rollback", token
     ], check=True, timeout=10)
-    print(json.dumps({"token": token, "profile": profile, "timeout": 20}))
+    print(json.dumps({"token": token, "profile": label, "timeout": 20}))
     return 0
+
+
+def apply_profile(profile: str) -> int:
+    values = monitors()
+    rules = profile_rules(profile, values)
+    return start_change(values, rules, rules, profile)
+
+
+def apply_custom(name: str, resolution: str, position: str, scale_text: str, transform_text: str) -> int:
+    name = validate_name(name)
+    values = monitors()
+    selected = next((monitor for monitor in values if monitor["name"] == name), None)
+    if selected is None:
+        raise ValueError("Display is not currently active")
+    if resolution == "disable":
+        if len(values) < 2:
+            raise ValueError("Another active display is required before disabling this one")
+        rule = f"{name},disable"
+    else:
+        if resolution != "preferred" and not VALID_RESOLUTION.fullmatch(resolution):
+            raise ValueError("Invalid display resolution")
+        if not VALID_POSITION.fullmatch(position):
+            raise ValueError("Invalid display position")
+        try:
+            scale = float(scale_text)
+            transform = int(transform_text)
+        except ValueError as error:
+            raise ValueError("Invalid display scale or orientation") from error
+        if not 0.5 <= scale <= 4:
+            raise ValueError("Display scale must be between 50% and 400%")
+        if transform not in range(8):
+            raise ValueError("Invalid display orientation")
+        rule = f"{name},{resolution},{position},{scale:g},transform,{transform}"
+
+    persist_rules = [rule if monitor["name"] == name else rule_for(monitor) for monitor in values]
+    return start_change(values, [rule], persist_rules, "custom")
 
 
 def rollback(token: str) -> int:
@@ -321,6 +357,12 @@ def main() -> int:
         item.add_argument("monitor")
     mode = sub.add_parser("mode")
     mode.add_argument("profile", choices=("extend", "mirror", "laptop", "external"))
+    apply = sub.add_parser("apply")
+    apply.add_argument("--name", required=True)
+    apply.add_argument("--resolution", required=True)
+    apply.add_argument("--position", default="0x0")
+    apply.add_argument("--scale", default="1")
+    apply.add_argument("--transform", default="0")
     for command in ("confirm", "rollback"):
         item = sub.add_parser(command)
         item.add_argument("token")
@@ -342,6 +384,8 @@ def main() -> int:
             return set_primary(args.monitor)
         if args.command == "mode":
             return apply_profile(args.profile)
+        if args.command == "apply":
+            return apply_custom(args.name, args.resolution, args.position, args.scale, args.transform)
         if args.command == "confirm":
             return confirm(args.token)
         if args.command == "rollback":

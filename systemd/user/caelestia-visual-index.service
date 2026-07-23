@@ -18,5 +18,5 @@ TasksMax=48
 TimeoutStartSec=10min
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=%h/.local/share/caelestia-search %h/.cache/caelestia-search
+ReadWritePaths=%h/.local/share/caelestia-search %h/.cache/caelestia-search %t
 PrivateTmp=true

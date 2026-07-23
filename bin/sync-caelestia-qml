@@ -44,6 +44,18 @@ rm -f \
 
 chown -R "$user_name:$user_name" "$stage/caelestia"
 
+# Build first. If a new Qt/Quickshell ABI is incompatible with the fork, the
+# live shell remains untouched and the hook fails safely.
+build_dir=""
+if [[ -f "$fork_src/CMakeLists.txt" ]]; then
+    build_dir="$user_home/.cache/caelestia-shell-plugin-build"
+    runuser -u "$user_name" -- env HOME="$user_home" \
+        cmake -S "$fork_src" -B "$build_dir" -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/ -DENABLE_MODULES=plugin
+    runuser -u "$user_name" -- env HOME="$user_home" \
+        cmake --build "$build_dir" -j4
+fi
+
 # Replace the live tree transactionally and retain the previous copy only until
 # the new one is in place.
 rm -rf "$previous"
@@ -56,15 +68,9 @@ if ! mv "$stage/caelestia" "$dst"; then
 fi
 rm -rf "$previous"
 
-# Package upgrades replace the QML plugin as well. Rebuild the fork against the
-# newly installed Qt/Quickshell ABI so custom services remain compatible.
-if [[ -f "$fork_src/CMakeLists.txt" ]]; then
-    build_dir="$user_home/.cache/caelestia-shell-plugin-build"
-    runuser -u "$user_name" -- env HOME="$user_home" \
-        cmake -S "$fork_src" -B "$build_dir" -G Ninja \
-        -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/ -DENABLE_MODULES=plugin
-    runuser -u "$user_name" -- env HOME="$user_home" \
-        cmake --build "$build_dir" -j4
+# Package upgrades replace the QML plugin as well. Install the fork build made
+# against the newly installed ABI so custom services remain compatible.
+if [[ -n "$build_dir" ]]; then
     cmake --install "$build_dir"
 fi
 

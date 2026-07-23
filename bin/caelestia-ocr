@@ -1,12 +1,59 @@
 #!/usr/bin/env bash
+# Shared OCR helper for Caelestia — same stack as Super+C.
+#
+#   caelestia-ocr                 Interactive region (grim+slurp) → clipboard
+#   caelestia-ocr --stdout FILE   OCR an existing image file → stdout
+#
+# Used by:
+#   Super+C / Super+Shift+T (interactive)
+#   caelestia-clipboard (image history labels + copy-text)
 set -euo pipefail
 
-image="$(mktemp --suffix=.png)"
-text="$(mktemp)"
-trap 'rm -f "$image" "$text" "$text.txt"' EXIT
+# Same engine/lang/cleanup as the long-standing Super+C wayland_ocr.sh flow.
+ocr_file() {
+    local image="$1"
+    tesseract -l eng "$image" stdout 2>/dev/null \
+        | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
+}
 
-geometry="$(slurp)" || exit 0
-grim -g "$geometry" "$image"
-tesseract "$image" "$text" -l eng >/dev/null 2>&1
-wl-copy < "$text.txt"
-notify-send "Text copied" "OCR result is now on the clipboard"
+ocr_stdin_png() {
+    tesseract -l eng - stdout 2>/dev/null \
+        | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
+}
+
+copy_text() {
+    local text="$1"
+    printf '%s' "$text" | wl-copy
+    # Keep cliphist in sync when present (legacy Super+C behavior).
+    if command -v cliphist &>/dev/null; then
+        printf '%s' "$text" | cliphist store 2>/dev/null || true
+    fi
+}
+
+if [[ "${1:-}" == "--stdout" && -n "${2:-}" ]]; then
+    if [[ ! -f "$2" ]]; then
+        echo "caelestia-ocr: file not found: $2" >&2
+        exit 1
+    fi
+    ocr_file "$2"
+    exit 0
+fi
+
+# Interactive region OCR (grim + slurp + tesseract) — Super+C path
+if ! command -v grim &>/dev/null || ! command -v slurp &>/dev/null; then
+    notify-send "OCR Error" "Please install grim and slurp"
+    exit 1
+fi
+
+notify-send -t 1500 "OCR" "Select an area to extract text..."
+
+# Capture region, pipe to tesseract (same as wayland_ocr.sh)
+TEXT=$(grim -g "$(slurp)" - | ocr_stdin_png) || true
+
+if [[ -n "${TEXT:-}" ]]; then
+    copy_text "$TEXT"
+    notify-send -t 3000 "OCR Success" "Text copied to clipboard"
+else
+    notify-send "OCR Failed" "No text found in selection."
+    exit 1
+fi

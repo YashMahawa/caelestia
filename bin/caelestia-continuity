@@ -1,21 +1,24 @@
 #!/usr/bin/env python3
-"""Caelestia Link helper: connectivity, sharing, and privacy controls."""
+"""Caelestia Link LAN helper: sharing and explicit privacy controls."""
 
 from __future__ import annotations
 
 import argparse
 import json
+import select
+import socket
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 CONFIG = Path.home() / ".config/caelestia/continuity.json"
+STATE = Path.home() / ".local/state/caelestia/continuity.json"
 DEFAULTS = {
-    "deviceId": "2d66b7a5cb214ae4be66b7b8f2ff46bb",
-    "deviceName": "V2240",
+    "deviceId": "",
+    "deviceName": "Phone",
     "autoClipboardSync": False,
-    "callsEnabled": True,
-    "notificationsEnabled": True,
+    "notificationsEnabled": False,
 }
 
 
@@ -23,18 +26,18 @@ def run(*args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(args, text=True, capture_output=True, timeout=30, check=False)
 
 
-def device() -> str | None:
-    result = run("kdeconnect-cli", "--list-available", "--id-only")
-    available = result.stdout.split() if result.returncode == 0 else []
-    preferred = str(config().get("deviceId", ""))
-    return preferred if preferred in available else (available[0] if available else None)
-
-
 def config() -> dict:
     value = dict(DEFAULTS)
     if CONFIG.exists():
-        value.update(json.loads(CONFIG.read_text(encoding="utf-8")))
-    value.pop("syncRules", None)
+        try:
+            value.update(json.loads(CONFIG.read_text(encoding="utf-8")))
+        except (OSError, json.JSONDecodeError):
+            pass
+    for obsolete in (
+        "callsEnabled", "callAudioOnLaptop", "phoneAudioEnabled", "phoneAudioError",
+        "phoneBluetoothAddress", "transportMode", "syncRules",
+    ):
+        value.pop(obsolete, None)
     return value
 
 
@@ -45,41 +48,189 @@ def save_config(value: dict) -> None:
     temporary.replace(CONFIG)
 
 
-def status() -> int:
-    current = device()
-    print(json.dumps({"reachable": current is not None, "deviceId": current, **config()}, ensure_ascii=False))
-    return 0 if current else 2
+def write_state(value: dict) -> None:
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    temporary = STATE.with_suffix(".tmp")
+    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(STATE)
 
 
-def share(paths: list[str]) -> int:
-    return subprocess.call(["caelestia-clipboard", "send-path", *paths])
+def device_path(device_id: str) -> str:
+    return f"/modules/kdeconnect/devices/{device_id}"
 
 
-def auto_clipboard(mode: str) -> int:
-    settings = config()
-    enabled = bool(settings.get("autoClipboardSync", False))
-    enabled = not enabled if mode == "toggle" else mode == "on"
-    current = device()
-    if current is None:
-        print("Caelestia Link phone is not reachable", file=sys.stderr)
-        return 2
-    result = run(
-        "qdbus6", "org.kde.kdeconnect", f"/modules/kdeconnect/devices/{current}",
-        "org.kde.kdeconnect.device.setPluginEnabled", "kdeconnect_clipboard",
-        "true" if enabled else "false",
+def device_value(device_id: str, name: str) -> subprocess.CompletedProcess[str]:
+    return run(
+        "qdbus6", "org.kde.kdeconnect", device_path(device_id),
+        "org.freedesktop.DBus.Properties.Get", "org.kde.kdeconnect.device", name,
     )
+
+
+def known_device() -> str | None:
+    preferred = str(config().get("deviceId", ""))
+    reachable_result = run(
+        "qdbus6", "org.kde.kdeconnect", "/modules/kdeconnect",
+        "org.kde.kdeconnect.daemon.devices", "true", "true",
+    )
+    reachable = reachable_result.stdout.split() if reachable_result.returncode == 0 else []
+    if preferred in reachable:
+        return preferred
+    if reachable:
+        return reachable[0]
+    paired_result = run(
+        "qdbus6", "org.kde.kdeconnect", "/modules/kdeconnect",
+        "org.kde.kdeconnect.daemon.devices", "false", "true",
+    )
+    paired = paired_result.stdout.split() if paired_result.returncode == 0 else []
+    return preferred if preferred in paired else (paired[0] if paired else None)
+
+
+def dbus_reachable(device_id: str) -> bool:
+    result = device_value(device_id, "isReachable")
+    return result.returncode == 0 and result.stdout.strip().lower() == "true"
+
+
+def reachable_addresses(device_id: str) -> list[str]:
+    result = device_value(device_id, "reachableAddresses")
+    return result.stdout.split() if result.returncode == 0 else []
+
+
+def probe(address: str) -> bool:
+    """Detect silently dead links that KDE's cached D-Bus state has not reaped."""
+    try:
+        with socket.create_connection((address, 1716), timeout=0.7):
+            return True
+    except OSError:
+        return False
+
+
+def route_device(address: str) -> str:
+    result = run("ip", "-json", "route", "get", address)
     if result.returncode != 0:
-        print(result.stderr.strip(), file=sys.stderr)
-        return result.returncode
-    settings["autoClipboardSync"] = enabled
-    save_config(settings)
-    print("on" if enabled else "off")
-    return 0
+        return ""
+    try:
+        rows = json.loads(result.stdout)
+        return str(rows[0].get("dev", "")) if rows else ""
+    except (json.JSONDecodeError, IndexError, TypeError):
+        return ""
 
 
-def privacy_toggle(setting: str, plugin: str, mode: str) -> int:
+def transport_for(interfaces: list[str]) -> tuple[str, str]:
+    kinds: list[str] = []
+    for interface in interfaces:
+        kind = "wifi" if interface.startswith(("wl", "wifi")) else "lan"
+        if kind not in kinds:
+            kinds.append(kind)
+    if len(kinds) > 1:
+        return "both", "Wi-Fi + LAN"
+    if kinds == ["wifi"]:
+        return "wifi", "Wi-Fi"
+    if kinds == ["lan"]:
+        return "lan", "LAN"
+    return "lan", "local network"
+
+
+def snapshot(verify: bool = True) -> dict:
     settings = config()
-    enabled = bool(settings.get(setting, True))
+    current = known_device()
+    addresses = reachable_addresses(current) if current and dbus_reachable(current) else []
+    live_addresses = [address for address in addresses if not verify or probe(address)]
+    interfaces = list(dict.fromkeys(filter(None, (route_device(address) for address in live_addresses))))
+    transport, label = transport_for(interfaces)
+    reachable = bool(current and addresses and live_addresses)
+    return {
+        **settings,
+        "reachable": reachable,
+        "deviceId": current,
+        "connection": "connected" if reachable else "offline",
+        "transport": transport if reachable else "offline",
+        "transportLabel": label if reachable else "Disconnected",
+        "addresses": live_addresses,
+        "interfaces": interfaces,
+        "checkedAtMs": int(time.time() * 1000),
+    }
+
+
+def device() -> str | None:
+    value = snapshot()
+    return str(value["deviceId"]) if value["reachable"] else None
+
+
+def status() -> int:
+    value = snapshot()
+    current = value["deviceId"]
+    settings = config()
+    if value["reachable"] and current and settings.get("deviceId") != current:
+        settings["deviceId"] = current
+        save_config(settings)
+    write_state(value)
+    print(json.dumps(value, ensure_ascii=False))
+    return 0 if value["reachable"] else 2
+
+
+def reconnect() -> int:
+    # Ask the LAN provider to rediscover immediately. KDE Connect preserves the
+    # pairing certificate, so a Wi-Fi/tethering path change needs no re-pairing.
+    run("kdeconnect-cli", "--enable-backend", "LanLinkProvider")
+    result = run("kdeconnect-cli", "--refresh")
+    for _ in range(8):
+        if device():
+            status()
+            return 0
+        time.sleep(0.5)
+    status()
+    return result.returncode if result.returncode else 2
+
+
+def watch() -> int:
+    """Track KDE Connect reachability and heal LAN path changes."""
+    monitor = subprocess.Popen(
+        ["dbus-monitor", "--session", "type='signal',sender='org.kde.kdeconnect'"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        bufsize=1,
+    )
+    last_reachable: bool | None = None
+    last_probe = 0.0
+    try:
+        while True:
+            now = time.monotonic()
+            timeout = max(0.1, 5.0 - (now - last_probe))
+            ready, _, _ = select.select([monitor.stdout], [], [], timeout) if monitor.stdout else ([], [], [])
+            event = monitor.stdout.readline() if ready and monitor.stdout else ""
+            significant = any(token in event for token in (
+                "reachableChanged", "PropertiesChanged", "linksChanged", "NameOwnerChanged",
+            ))
+            now = time.monotonic()
+            if significant or now - last_probe >= 5.0:
+                value = snapshot()
+                current = value["deviceId"]
+                reachable = bool(value["reachable"])
+                if not reachable and (last_reachable is not False or now - last_probe >= 5.0):
+                    run("kdeconnect-cli", "--refresh")
+                    time.sleep(0.2)
+                    value = snapshot()
+                    current = value["deviceId"]
+                    reachable = bool(value["reachable"])
+                settings = config()
+                if reachable and current and settings.get("deviceId") != current:
+                    settings["deviceId"] = current
+                    save_config(settings)
+                value.update(settings)
+                write_state(value)
+                last_reachable = reachable
+                last_probe = now
+            if monitor.poll() is not None:
+                return monitor.returncode or 1
+    finally:
+        if monitor.poll() is None:
+            monitor.terminate()
+
+
+def set_plugin(setting: str, plugin: str, mode: str) -> int:
+    settings = config()
+    enabled = bool(settings.get(setting, False))
     enabled = not enabled if mode == "toggle" else mode == "on"
     current = device()
     if current is None:
@@ -87,8 +238,7 @@ def privacy_toggle(setting: str, plugin: str, mode: str) -> int:
         return 2
     result = run(
         "qdbus6", "org.kde.kdeconnect", f"/modules/kdeconnect/devices/{current}",
-        "org.kde.kdeconnect.device.setPluginEnabled", plugin,
-        "true" if enabled else "false",
+        "org.kde.kdeconnect.device.setPluginEnabled", plugin, "true" if enabled else "false",
     )
     if result.returncode != 0:
         print(result.stderr.strip(), file=sys.stderr)
@@ -99,34 +249,98 @@ def privacy_toggle(setting: str, plugin: str, mode: str) -> int:
     return 0
 
 
+def set_clipboard_sync(mode: str) -> int:
+    """Keep manual receive/send available while gating automatic sharing."""
+    settings = config()
+    enabled = bool(settings.get("autoClipboardSync", False))
+    enabled = not enabled if mode == "toggle" else mode == "on"
+    current = device()
+    if current is None:
+        print("Caelestia Link phone is not reachable", file=sys.stderr)
+        return 2
+    plugin_config = Path.home() / ".config/kdeconnect" / current / "kdeconnect_clipboard" / "config"
+    plugin_config.parent.mkdir(parents=True, exist_ok=True)
+    result = run("kwriteconfig6", "--file", str(plugin_config), "--key", "autoShare", "true" if enabled else "false")
+    if result.returncode != 0:
+        print(result.stderr.strip(), file=sys.stderr)
+        return result.returncode
+    path = f"/modules/kdeconnect/devices/{current}"
+    # Reload the plugin so its config watcher observes the new value. The
+    # plugin remains enabled because manual Send Clipboard and incoming text
+    # must work even when automatic mirroring is off.
+    run("qdbus6", "org.kde.kdeconnect", path, "org.kde.kdeconnect.device.setPluginEnabled", "kdeconnect_clipboard", "false")
+    result = run("qdbus6", "org.kde.kdeconnect", path, "org.kde.kdeconnect.device.setPluginEnabled", "kdeconnect_clipboard", "true")
+    if result.returncode != 0:
+        print(result.stderr.strip(), file=sys.stderr)
+        return result.returncode
+    settings["autoClipboardSync"] = enabled
+    save_config(settings)
+    print("on" if enabled else "off")
+    return 0
+
+
+def reconcile() -> int:
+    # Caelestia Link deliberately uses only KDE Connect's LAN provider.
+    run("qdbus6", "org.kde.kdeconnect", "/modules/kdeconnect", "org.kde.kdeconnect.daemon.setLinkProviderState", "AsyncLinkProvider", "false")
+    run("qdbus6", "org.kde.kdeconnect", "/modules/kdeconnect", "org.kde.kdeconnect.daemon.setLinkProviderState", "LanLinkProvider", "true")
+    settings = config()
+    settings["callsEnabled"] = False
+    current = device()
+    if current:
+        run(
+            "qdbus6", "org.kde.kdeconnect", f"/modules/kdeconnect/devices/{current}",
+            "org.kde.kdeconnect.device.setPluginEnabled", "kdeconnect_telephony", "false",
+        )
+        # Manual clipboard sharing is always available. autoShare controls
+        # only unsolicited clipboard mirroring.
+        plugin_config = Path.home() / ".config/kdeconnect" / current / "kdeconnect_clipboard" / "config"
+        plugin_config.parent.mkdir(parents=True, exist_ok=True)
+        run("kwriteconfig6", "--file", str(plugin_config), "--key", "autoShare", "true" if settings.get("autoClipboardSync", False) else "false")
+        run(
+            "qdbus6", "org.kde.kdeconnect", f"/modules/kdeconnect/devices/{current}",
+            "org.kde.kdeconnect.device.setPluginEnabled", "kdeconnect_clipboard", "true",
+        )
+        run(
+            "qdbus6", "org.kde.kdeconnect", f"/modules/kdeconnect/devices/{current}",
+            "org.kde.kdeconnect.device.setPluginEnabled", "kdeconnect_connectivity_report", "false",
+        )
+    settings.pop("callsEnabled", None)
+    save_config(settings)
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("status")
     commands.add_parser("ring")
-    auto = commands.add_parser("auto-clipboard")
-    auto.add_argument("mode", choices=("on", "off", "toggle"))
-    calls = commands.add_parser("calls")
-    calls.add_argument("mode", choices=("on", "off", "toggle"))
-    notifications = commands.add_parser("notifications")
-    notifications.add_argument("mode", choices=("on", "off", "toggle"))
+    commands.add_parser("reconcile")
+    commands.add_parser("reconnect")
+    commands.add_parser("watch")
     send = commands.add_parser("send")
     send.add_argument("paths", nargs="+")
+    clipboard = commands.add_parser("auto-clipboard")
+    clipboard.add_argument("mode", choices=("on", "off", "toggle"))
+    notifications = commands.add_parser("notifications")
+    notifications.add_argument("mode", choices=("on", "off", "toggle"))
     args = parser.parse_args()
+
     if args.command == "status":
         return status()
+    if args.command == "reconcile":
+        return reconcile()
+    if args.command == "reconnect":
+        return reconnect()
+    if args.command == "watch":
+        return watch()
     if args.command == "send":
-        return share(args.paths)
-    if args.command == "ring":
-        current = device()
-        return subprocess.call(["kdeconnect-cli", "-d", current, "--ring"]) if current else 2
+        return subprocess.call(["caelestia-clipboard", "send-path", *args.paths])
     if args.command == "auto-clipboard":
-        return auto_clipboard(args.mode)
-    if args.command == "calls":
-        return privacy_toggle("callsEnabled", "kdeconnect_telephony", args.mode)
+        return set_clipboard_sync(args.mode)
     if args.command == "notifications":
-        return privacy_toggle("notificationsEnabled", "kdeconnect_notifications", args.mode)
-    return 2
+        return set_plugin("notificationsEnabled", "kdeconnect_notifications", args.mode)
+    current = device()
+    return subprocess.call(["kdeconnect-cli", "-d", current, "--ring"]) if current else 2
 
 
 if __name__ == "__main__":

@@ -1,0 +1,16 @@
+[Unit]
+Description=Caelestia Link connection health monitor
+After=caelestia-kdeconnect.service network.target
+Requires=caelestia-kdeconnect.service
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/caelestia-continuity watch
+Restart=always
+RestartSec=2
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

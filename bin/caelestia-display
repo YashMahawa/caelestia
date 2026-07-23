@@ -1,0 +1,325 @@
+#!/usr/bin/env python3
+"""Safe multi-display control for the Caelestia dashboard and Nexus settings."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import uuid
+from pathlib import Path
+
+
+STATE_DIR = Path.home() / ".local/state/caelestia"
+CONTROL_CONF = Path.home() / ".config/hypr/caelestia-display.conf"
+HYPR_CONF = Path.home() / ".config/hypr/hyprland.conf"
+VALID_NAME = re.compile(r"^[A-Za-z0-9_.:-]+$")
+
+
+def run(args: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(args, text=True, capture_output=True, check=check, timeout=10)
+
+
+def hypr_json(*args: str):
+    return json.loads(run(["hyprctl", "-j", *args]).stdout)
+
+
+def monitors() -> list[dict]:
+    value = hypr_json("monitors", "all")
+    return value if isinstance(value, list) else []
+
+
+def validate_name(name: str) -> str:
+    if not VALID_NAME.fullmatch(name):
+        raise ValueError("Invalid monitor name")
+    return name
+
+
+def internal_monitor(values: list[dict]) -> dict | None:
+    return next((m for m in values if m["name"].startswith(("eDP-", "LVDS-", "DSI-"))), values[0] if values else None)
+
+
+def external_monitors(values: list[dict]) -> list[dict]:
+    internal = internal_monitor(values)
+    return [m for m in values if internal is None or m["name"] != internal["name"]]
+
+
+def option(name: str):
+    try:
+        value = hypr_json("getoption", name)
+        if "int" in value:
+            return value["int"]
+        return value.get("str", "")
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+        return None
+
+
+def status() -> int:
+    values = monitors()
+    focused = next((m for m in values if m.get("focused")), values[0] if values else None)
+    print(json.dumps({
+        "monitors": values,
+        "focused": focused["name"] if focused else "",
+        "internal": internal_monitor(values)["name"] if values else "",
+        "external": [m["name"] for m in external_monitors(values)],
+        "pointerFollowsMonitor": bool(option("misc:mouse_move_focuses_monitor")),
+        "warpPointerWithWorkspace": int(option("cursor:warp_on_change_workspace") or 0) > 0,
+        "defaultMonitor": option("cursor:default_monitor") or "",
+    }))
+    return 0
+
+
+def dispatch(command: str, value: str) -> None:
+    result = run(["hyprctl", "dispatch", command, value])
+    if "ok" not in result.stdout.lower():
+        raise RuntimeError(result.stdout.strip() or result.stderr.strip())
+
+
+def focus(name: str) -> int:
+    name = validate_name(name)
+    monitor = next((m for m in monitors() if m["name"] == name), None)
+    if monitor is None:
+        raise ValueError("Display is not connected")
+    dispatch("focusmonitor", name)
+    x = int(monitor["x"] + monitor["width"] / max(float(monitor.get("scale", 1)), 0.25) / 2)
+    y = int(monitor["y"] + monitor["height"] / max(float(monitor.get("scale", 1)), 0.25) / 2)
+    dispatch("movecursor", f"{x} {y}")
+    print(f"Focused {name}")
+    return 0
+
+
+def move_workspace(name: str) -> int:
+    name = validate_name(name)
+    dispatch("movecurrentworkspacetomonitor", name)
+    return focus(name)
+
+
+def move_window(name: str) -> int:
+    name = validate_name(name)
+    dispatch("movewindow", f"mon:{name}")
+    return focus(name)
+
+
+def rule_for(monitor: dict) -> str:
+    name = validate_name(monitor["name"])
+    refresh = float(monitor.get("refreshRate", 60))
+    res = f"{monitor['width']}x{monitor['height']}@{refresh:.2f}"
+    pos = f"{monitor.get('x', 0)}x{monitor.get('y', 0)}"
+    scale = monitor.get("scale", 1)
+    transform = monitor.get("transform", 0)
+    rule = f"{name},{res},{pos},{scale},transform,{transform}"
+    mirror = monitor.get("mirrorOf")
+    if mirror and mirror != "none":
+        rule += f",mirror,{validate_name(mirror)}"
+    return rule
+
+
+def apply_rule(rule: str) -> None:
+    result = run(["hyprctl", "keyword", "monitor", rule])
+    output = (result.stdout + result.stderr).lower()
+    if any(word in output for word in ("invalid", "error", "failed")):
+        raise RuntimeError(output.strip())
+
+
+def save_snapshot(values: list[dict]) -> None:
+    CONTROL_CONF.parent.mkdir(parents=True, exist_ok=True)
+    monitor_file = CONTROL_CONF.parent / "monitors.conf"
+    monitor_file.write_text("".join(f"monitor = {rule_for(m)}\n" for m in values), encoding="utf-8")
+    ensure_source(monitor_file)
+
+
+def save_rules(rules: list[str]) -> None:
+    CONTROL_CONF.parent.mkdir(parents=True, exist_ok=True)
+    monitor_file = CONTROL_CONF.parent / "monitors.conf"
+    monitor_file.write_text("".join(f"monitor = {rule}\n" for rule in rules), encoding="utf-8")
+    ensure_source(monitor_file)
+
+
+def ensure_source(path: Path) -> None:
+    if not HYPR_CONF.exists():
+        return
+    source = f"source = {path}"
+    content = HYPR_CONF.read_text(encoding="utf-8")
+    if source not in content:
+        HYPR_CONF.write_text(content.rstrip() + f"\n\n{source}\n", encoding="utf-8")
+
+
+def profile_rules(profile: str, values: list[dict]) -> list[str]:
+    internal = internal_monitor(values)
+    externals = external_monitors(values)
+    if internal is None:
+        raise ValueError("No display is available")
+    if profile != "laptop" and not externals:
+        raise ValueError("Connect an external display first")
+
+    rules: list[str] = []
+    if profile == "extend":
+        rules.append(f"{internal['name']},preferred,0x0,1")
+        for index, monitor in enumerate(externals):
+            position = "auto-right" if index == 0 else "auto-right"
+            rules.append(f"{monitor['name']},preferred,{position},1")
+    elif profile == "mirror":
+        rules.append(f"{internal['name']},preferred,0x0,1")
+        for monitor in externals:
+            rules.append(f"{monitor['name']},preferred,0x0,1,mirror,{internal['name']}")
+    elif profile == "laptop":
+        rules.append(f"{internal['name']},preferred,0x0,1")
+        rules.extend(f"{monitor['name']},disable" for monitor in externals)
+    elif profile == "external":
+        primary = externals[0]
+        rules.append(f"{primary['name']},preferred,0x0,1")
+        rules.extend(f"{monitor['name']},preferred,auto-right,1" for monitor in externals[1:])
+        rules.append(f"{internal['name']},disable")
+    else:
+        raise ValueError("Unknown display profile")
+    return rules
+
+
+def apply_profile(profile: str) -> int:
+    values = monitors()
+    rules = profile_rules(profile, values)
+    token = uuid.uuid4().hex[:12]
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    state = STATE_DIR / f"display-revert-{token}.json"
+    state.write_text(json.dumps({
+        "created": time.time(), "monitors": values, "rules": rules
+    }), encoding="utf-8")
+    try:
+        for rule in rules:
+            apply_rule(rule)
+    except Exception:
+        rollback(token)
+        raise
+    executable = str(Path(__file__).resolve())
+    subprocess.run([
+        "systemd-run", "--user", "--quiet", f"--unit=caelestia-display-revert-{token}",
+        "--on-active=20s", executable, "rollback", token
+    ], check=True, timeout=10)
+    print(json.dumps({"token": token, "profile": profile, "timeout": 20}))
+    return 0
+
+
+def rollback(token: str) -> int:
+    if not re.fullmatch(r"[0-9a-f]{12}", token):
+        raise ValueError("Invalid rollback token")
+    state = STATE_DIR / f"display-revert-{token}.json"
+    if not state.exists():
+        return 0
+    payload = json.loads(state.read_text(encoding="utf-8"))
+    for monitor in payload.get("monitors", []):
+        apply_rule(rule_for(monitor))
+    state.unlink(missing_ok=True)
+    return 0
+
+
+def confirm(token: str) -> int:
+    if not re.fullmatch(r"[0-9a-f]{12}", token):
+        raise ValueError("Invalid confirmation token")
+    subprocess.run([
+        "systemctl", "--user", "stop", f"caelestia-display-revert-{token}.timer",
+        f"caelestia-display-revert-{token}.service"
+    ], capture_output=True, timeout=10)
+    state = STATE_DIR / f"display-revert-{token}.json"
+    if not state.exists():
+        raise ValueError("Display confirmation expired")
+    payload = json.loads(state.read_text(encoding="utf-8"))
+    save_rules(payload.get("rules", []))
+    state.unlink()
+    print("Display layout saved")
+    return 0
+
+
+def write_policies(pointer_follows: bool, warp: bool, default_monitor: str) -> None:
+    if default_monitor and default_monitor != "[[EMPTY]]":
+        validate_name(default_monitor)
+    CONTROL_CONF.parent.mkdir(parents=True, exist_ok=True)
+    CONTROL_CONF.write_text(
+        "misc {\n"
+        f"    mouse_move_focuses_monitor = {'true' if pointer_follows else 'false'}\n"
+        "}\n\n"
+        "cursor {\n"
+        f"    warp_on_change_workspace = {1 if warp else 0}\n"
+        f"    default_monitor = {default_monitor if default_monitor else '[[EMPTY]]'}\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    ensure_source(CONTROL_CONF)
+    run(["hyprctl", "keyword", "misc:mouse_move_focuses_monitor", "1" if pointer_follows else "0"])
+    run(["hyprctl", "keyword", "cursor:warp_on_change_workspace", "1" if warp else "0"])
+    run(["hyprctl", "keyword", "cursor:default_monitor", default_monitor or "[[EMPTY]]"])
+
+
+def set_policy(name: str, value: str) -> int:
+    pointer = bool(option("misc:mouse_move_focuses_monitor"))
+    warp = int(option("cursor:warp_on_change_workspace") or 0) > 0
+    default = str(option("cursor:default_monitor") or "")
+    if default == "[[EMPTY]]":
+        default = ""
+    enabled = value == "on"
+    if name == "pointer":
+        pointer = enabled
+    elif name == "warp":
+        warp = enabled
+    else:
+        raise ValueError("Unknown focus policy")
+    write_policies(pointer, warp, default)
+    return 0
+
+
+def set_primary(name: str) -> int:
+    name = validate_name(name)
+    pointer = bool(option("misc:mouse_move_focuses_monitor"))
+    warp = int(option("cursor:warp_on_change_workspace") or 0) > 0
+    write_policies(pointer, warp, name)
+    print(f"{name} will receive focus at startup")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("status")
+    for command in ("focus", "move-workspace", "move-window", "primary"):
+        item = sub.add_parser(command)
+        item.add_argument("monitor")
+    mode = sub.add_parser("mode")
+    mode.add_argument("profile", choices=("extend", "mirror", "laptop", "external"))
+    for command in ("confirm", "rollback"):
+        item = sub.add_parser(command)
+        item.add_argument("token")
+    policy = sub.add_parser("policy")
+    policy.add_argument("name", choices=("pointer", "warp"))
+    policy.add_argument("value", choices=("on", "off"))
+    args = parser.parse_args()
+
+    try:
+        if args.command == "status":
+            return status()
+        if args.command == "focus":
+            return focus(args.monitor)
+        if args.command == "move-workspace":
+            return move_workspace(args.monitor)
+        if args.command == "move-window":
+            return move_window(args.monitor)
+        if args.command == "primary":
+            return set_primary(args.monitor)
+        if args.command == "mode":
+            return apply_profile(args.profile)
+        if args.command == "confirm":
+            return confirm(args.token)
+        if args.command == "rollback":
+            return rollback(args.token)
+        if args.command == "policy":
+            return set_policy(args.name, args.value)
+    except (ValueError, RuntimeError, OSError, subprocess.SubprocessError, json.JSONDecodeError) as error:
+        print(str(error), file=sys.stderr)
+        return 1
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

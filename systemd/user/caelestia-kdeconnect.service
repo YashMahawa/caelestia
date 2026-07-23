@@ -1,15 +1,14 @@
 [Unit]
-Description=KDE Connect transport for Caelestia Continuity
+Description=Caelestia Link LAN transport
 After=graphical-session.target network.target
 PartOf=graphical-session.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/kdeconnectd
+ExecStart=/usr/bin/kdeconnectd --replace
 Restart=on-failure
 RestartSec=2
 NoNewPrivileges=true
-PrivateTmp=true
 
 [Install]
 WantedBy=default.target

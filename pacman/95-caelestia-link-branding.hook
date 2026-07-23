@@ -1,0 +1,10 @@
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Package
+Target = kdeconnect
+
+[Action]
+Description = Restoring Caelestia Link desktop integration
+When = PostTransaction
+Exec = /usr/local/bin/caelestia-link-branding

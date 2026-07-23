@@ -58,16 +58,9 @@ def main() -> int:
     if command_succeeds(["systemctl", "is-active", "--quiet", "waydroid-container.service"]):
         return deny("Waydroid is running")
 
-    if command_succeeds(["playerctl", "--all-players", "status"]):
-        result = subprocess.run(
-            ["playerctl", "--all-players", "status"],
-            capture_output=True,
-            text=True,
-            timeout=3,
-            check=False,
-        )
-        if any(line.strip() == "Playing" for line in result.stdout.splitlines()):
-            return deny("media playback is active")
+    # Media playback is allowed.  Index workers are deliberately low priority,
+    # CPU-quota limited, and the visual/semantic services disable automatic GPU
+    # use, so decoding and audio remain responsive while indexing catches up.
 
     try:
         load_1m = os.getloadavg()[0]

@@ -13,6 +13,7 @@ import subprocess
 import sys
 import time
 import urllib.parse
+import stat
 from pathlib import Path
 
 HOME = Path.home()
@@ -67,8 +68,54 @@ def setup() -> sqlite3.Connection:
     return connection
 
 
-def run(*args: str, input_data: bytes | None = None) -> subprocess.CompletedProcess[bytes]:
-    return subprocess.run(args, input=input_data, capture_output=True, check=False, timeout=20)
+def run(*args: str, input_data: bytes | None = None, timeout: int = 20) -> subprocess.CompletedProcess[bytes]:
+    try:
+        return subprocess.run(args, input=input_data, capture_output=True, check=False, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(args, 124, b"", b"timed out")
+
+
+def ocr_image(path: str | Path) -> str:
+    """OCR via shared caelestia-ocr (same stack as Super+C / Super+Shift+T)."""
+    target = Path(path)
+    if not target.is_file():
+        return ""
+    # Prefer the shared helper so clipboard OCR stays in lockstep with Super+C.
+    helper = Path.home() / ".local" / "bin" / "caelestia-ocr"
+    if helper.is_file():
+        result = run(str(helper), "--stdout", str(target), timeout=15)
+    else:
+        # Fallback identical to caelestia-ocr / wayland_ocr.sh
+        result = run("tesseract", "-l", "eng", str(target), "stdout", timeout=15)
+    if result.returncode != 0:
+        return ""
+    text = result.stdout.decode("utf-8", "replace").replace("\x00", "").strip()
+    if not text:
+        return ""
+    encoded = text.encode("utf-8")
+    if len(encoded) > MAX_TEXT:
+        text = encoded[:MAX_TEXT].decode("utf-8", "ignore").rstrip()
+    return text
+
+
+def backfill_ocr(connection: sqlite3.Connection, limit: int = 8) -> None:
+    """Fill OCR text for recent images still labeled as placeholders."""
+    rows = connection.execute(
+        """SELECT id, path, text FROM items
+           WHERE kind='image' AND path != ''
+             AND (text='' OR text='Copied image' OR text='Image' OR text='Scanning…')
+           ORDER BY created DESC LIMIT ?""",
+        (limit,),
+    ).fetchall()
+    changed = False
+    for item_id, path, _text in rows:
+        ocr = ocr_image(path)
+        if not ocr:
+            continue
+        connection.execute("UPDATE items SET text=? WHERE id=?", (ocr, item_id))
+        changed = True
+    if changed:
+        connection.commit()
 
 
 def export_state(connection: sqlite3.Connection) -> None:
@@ -142,7 +189,7 @@ def capture() -> int:
         if not target.exists():
             target.write_bytes(data)
         path = str(target)
-        text = "Copied image"
+        text = ocr_image(target)
     else:
         text = data.decode("utf-8", "replace").replace("\x00", "").strip()
         if not text:
@@ -156,6 +203,50 @@ def capture() -> int:
         ON CONFLICT(digest) DO UPDATE SET created=excluded.created""",
         (digest, kind, mime, text, path, now),
     )
+    prune(connection)
+    connection.commit()
+    export_state(connection)
+    return 0
+
+
+def capture_stdin() -> int:
+    """Store the payload wl-paste --watch already supplied on stdin."""
+    if os.environ.get("CLIPBOARD_STATE") in {"sensitive", "nil", "clear"}:
+        return 0
+    data = sys.stdin.buffer.read(MAX_IMAGE + 1)
+    if not data or len(data) > MAX_IMAGE:
+        return 0
+    signatures = ((b"\x89PNG\r\n\x1a\n", "image/png", ".png"), (b"\xff\xd8\xff", "image/jpeg", ".jpg"), (b"BM", "image/bmp", ".bmp"))
+    image = next(((mime, ext) for magic, mime, ext in signatures if data.startswith(magic)), None)
+    if data.startswith(b"RIFF") and data[8:12] == b"WEBP": image = ("image/webp", ".webp")
+    digest = hashlib.sha256(data).hexdigest()
+    connection = setup()
+    now = time.time()
+    if image:
+        mime, extension = image
+        target = FILES / f"{digest}{extension}"
+        if not target.exists():
+            target.write_bytes(data)
+        label = ocr_image(target)
+        connection.execute(
+            """INSERT INTO items(digest,kind,mime,text,path,created) VALUES(?,?,?,?,?,?)
+            ON CONFLICT(digest) DO UPDATE SET created=excluded.created,
+              text=CASE WHEN excluded.text != '' THEN excluded.text ELSE items.text END""",
+            (digest, "image", mime, label, str(target), now),
+        )
+    else:
+        if len(data) > MAX_TEXT:
+            return 0
+        text = data.decode("utf-8", "replace").replace("\x00", "").strip()
+        if not text:
+            return 0
+        kind = "files" if text.startswith("file://") else "text"
+        mime = "text/uri-list" if kind == "files" else "text/plain;charset=utf-8"
+        connection.execute(
+            """INSERT INTO items(digest,kind,mime,text,path,created) VALUES(?,?,?,?,?,?)
+            ON CONFLICT(digest) DO UPDATE SET created=excluded.created""",
+            (digest, kind, mime, text, "", now),
+        )
     prune(connection)
     connection.commit()
     export_state(connection)
@@ -178,6 +269,48 @@ def copy_item(item_id: int) -> int:
     process = subprocess.Popen(["wl-copy", "--type", mime], stdin=subprocess.PIPE)
     process.communicate(data)
     return process.returncode or 0
+
+
+def copy_text(item_id: int) -> int:
+    """Copy OCR/plain text for an item (not the image bytes)."""
+    connection = setup()
+    row = item(connection, item_id)
+    if row is None:
+        return 1
+    _, kind, _mime, text, path = row
+    if kind == "image" and (not text or text in {"Copied image", "Image", "Scanning…"}):
+        text = ocr_image(path)
+        if text:
+            connection.execute("UPDATE items SET text=? WHERE id=?", (text, item_id))
+            connection.commit()
+            export_state(connection)
+    if not text or text in {"Copied image", "Image", "Scanning…"}:
+        return 2
+    process = subprocess.Popen(
+        ["wl-copy", "--type", "text/plain;charset=utf-8"],
+        stdin=subprocess.PIPE,
+    )
+    process.communicate(text.encode("utf-8"))
+    return process.returncode or 0
+
+
+def ensure_ocr(item_id: int) -> int:
+    """OCR an image item and write text into history (idempotent)."""
+    connection = setup()
+    row = item(connection, item_id)
+    if row is None or row[1] != "image" or not row[4]:
+        return 1
+    if row[3] and row[3] not in {"Copied image", "Image", "Scanning…"}:
+        print(row[3])
+        return 0
+    text = ocr_image(row[4])
+    if not text:
+        return 2
+    connection.execute("UPDATE items SET text=? WHERE id=?", (text, item_id))
+    connection.commit()
+    export_state(connection)
+    print(text)
+    return 0
 
 
 def reachable_device() -> str | None:
@@ -210,11 +343,46 @@ def send_item(item_id: int) -> int:
     return subprocess.call(command)
 
 
+def send_clipboard_item(item_id: int) -> int:
+    """Put a history item on the local clipboard, then use KDE Connect's
+    clipboard protocol (rather than its share-text notification protocol)."""
+    connection = setup()
+    row = item(connection, item_id)
+    device = reachable_device()
+    if row is None or device is None:
+        return 2
+    # The Android Caelestia Link clipboard protocol currently transports text
+    # only.  Sending an image through --send-clipboard would silently coerce it
+    # to text (usually an empty string).  Preserve the user's image instead by
+    # using the reliable share/file packet; the phone receives the original
+    # image in its Download folder.
+    if row[1] == "image":
+        return send_item(item_id)
+    if copy_item(item_id) != 0:
+        return 1
+    return subprocess.call(["kdeconnect-cli", "-d", device, "--send-clipboard"])
+
+
 def send_latest() -> int:
     """Explicitly send the newest clipboard entry without exposing history UI."""
     connection = setup()
     row = connection.execute("SELECT id FROM items ORDER BY created DESC LIMIT 1").fetchone()
-    return send_item(int(row[0])) if row else 1
+    if not row:
+        return 1
+    latest = item(connection, int(row[0]))
+    return send_clipboard_item(int(row[0])) if latest and latest[1] in {"text", "image"} else send_item(int(row[0]))
+
+
+def send_text(text: str) -> int:
+    """Explicitly send text to the phone clipboard without enabling auto-sync."""
+    device = reachable_device()
+    if device is None or not text:
+        return 2
+    process = subprocess.Popen(["wl-copy", "--type", "text/plain;charset=utf-8"], stdin=subprocess.PIPE)
+    process.communicate(text.encode("utf-8"))
+    if process.returncode not in (0, None):
+        return process.returncode
+    return subprocess.call(["kdeconnect-cli", "-d", device, "--send-clipboard"])
 
 
 def send_paths(values: list[str]) -> int:
@@ -288,10 +456,12 @@ def add_path(value: str) -> int:
         target = FILES / f"{digest}{source.suffix.lower()}"
         if not target.exists():
             target.write_bytes(data)
+        label = ocr_image(target) or source.name
         connection.execute(
             """INSERT INTO items(digest,kind,mime,text,path,created) VALUES(?,?,?,?,?,?)
-            ON CONFLICT(digest) DO UPDATE SET created=excluded.created""",
-            (digest, "image", mime, source.name, str(target), now),
+            ON CONFLICT(digest) DO UPDATE SET created=excluded.created,
+              text=CASE WHEN excluded.text != '' THEN excluded.text ELSE items.text END""",
+            (digest, "image", mime, label, str(target), now),
         )
     else:
         uri = source.as_uri()
@@ -318,9 +488,28 @@ def clear() -> int:
 
 
 def serve() -> int:
+    # User services can start before the compositor exports WAYLAND_DISPLAY to
+    # systemd. Resolve the live socket once, then let wl-paste remain fully
+    # event-driven instead of entering a one-second failure loop.
+    if not os.environ.get("WAYLAND_DISPLAY"):
+        runtime = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
+        while not os.environ.get("WAYLAND_DISPLAY"):
+            for candidate in sorted(runtime.glob("wayland-*")):
+                try:
+                    if stat.S_ISSOCK(candidate.stat().st_mode):
+                        os.environ["WAYLAND_DISPLAY"] = candidate.name
+                        break
+                except OSError:
+                    continue
+            if not os.environ.get("WAYLAND_DISPLAY"):
+                time.sleep(1)
     connection = setup()
+    try:
+        backfill_ocr(connection, limit=12)
+    except Exception:
+        pass
     export_state(connection)
-    command = ["wl-paste", "--watch", str(Path(__file__).resolve()), "capture"]
+    command = ["wl-paste", "--watch", str(Path(__file__).resolve()), "capture-stdin"]
     while True:
         process = subprocess.Popen(command)
         result = process.wait()
@@ -334,12 +523,13 @@ def main() -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("serve")
     sub.add_parser("capture")
+    sub.add_parser("capture-stdin")
     sub.add_parser("clear")
     sub.add_parser("send-latest")
     sub.add_parser("retention-status")
     retention = sub.add_parser("retention")
     retention.add_argument("days", type=int, choices=(1, 2, 7))
-    for name in ("copy", "send", "delete", "pin"):
+    for name in ("copy", "copy-text", "send", "delete", "pin", "ocr"):
         command = sub.add_parser(name)
         command.add_argument("id", type=int)
     edit = sub.add_parser("edit")
@@ -349,9 +539,12 @@ def main() -> int:
     add.add_argument("path")
     send_path = sub.add_parser("send-path")
     send_path.add_argument("paths", nargs="+")
+    send_text_command = sub.add_parser("send-text")
+    send_text_command.add_argument("text")
     args = parser.parse_args()
     if args.command == "serve": return serve()
     if args.command == "capture": return capture()
+    if args.command == "capture-stdin": return capture_stdin()
     if args.command == "clear": return clear()
     if args.command == "send-latest": return send_latest()
     if args.command == "retention-status":
@@ -359,8 +552,11 @@ def main() -> int:
         return 0
     if args.command == "retention": return set_retention(args.days)
     if args.command == "copy": return copy_item(args.id)
-    if args.command == "send": return send_item(args.id)
+    if args.command == "copy-text": return copy_text(args.id)
+    if args.command == "ocr": return ensure_ocr(args.id)
+    if args.command == "send": return send_clipboard_item(args.id)
     if args.command == "send-path": return send_paths(args.paths)
+    if args.command == "send-text": return send_text(args.text)
     if args.command == "delete": return delete_item(args.id)
     if args.command == "pin": return toggle_pin(args.id)
     if args.command == "edit": return edit_item(args.id, args.text)

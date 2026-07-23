@@ -1,0 +1,28 @@
+#!/bin/sh
+set -eu
+
+# KDE Connect is retained as the protocol engine; every user-facing desktop
+# surface is branded as Caelestia Link after package upgrades.
+for desktop in \
+    /usr/share/applications/org.kde.kdeconnect.app.desktop \
+    /usr/share/applications/org.kde.kdeconnect.daemon.desktop \
+    /usr/share/applications/org.kde.kdeconnect.handler.desktop; do
+    [ ! -f "$desktop" ] || sed -i '0,/^Name=.*/s//Name=Caelestia Link/' "$desktop"
+done
+
+desktop=/usr/share/applications/org.kde.kdeconnect.nonplasma.desktop
+[ ! -f "$desktop" ] || sed -i '0,/^Name=.*/s//Name=Caelestia Link/' "$desktop"
+
+desktop=/usr/share/applications/org.kde.kdeconnect.sms.desktop
+[ ! -f "$desktop" ] || sed -i '0,/^Name=.*/s//Name=Caelestia Link Messages/' "$desktop"
+
+extension=/usr/share/nautilus-python/extensions/kdeconnect-share.py
+if [ -f "$extension" ]; then
+    sed -i \
+        -e 's/Share files to your phone via KDE Connect/Share files with Caelestia Link/' \
+        -e 's/Send to %s via KDE Connect/Send to %s via Caelestia Link/' \
+        -e 's/Send via KDE Connect/Send via Caelestia Link/' \
+        "$extension"
+fi
+
+command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database /usr/share/applications || true

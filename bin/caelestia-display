@@ -33,6 +33,21 @@ def monitors() -> list[dict]:
     return value if isinstance(value, list) else []
 
 
+def connected_output_names() -> list[str]:
+    """Return connected DRM connector names, including currently disabled outputs."""
+    names: list[str] = []
+    for status_file in Path("/sys/class/drm").glob("card*-*/status"):
+        try:
+            if status_file.read_text(encoding="utf-8").strip() != "connected":
+                continue
+        except OSError:
+            continue
+        name = re.sub(r"^card\d+-", "", status_file.parent.name)
+        if VALID_NAME.fullmatch(name):
+            names.append(name)
+    return sorted(set(names))
+
+
 def validate_name(name: str) -> str:
     if not VALID_NAME.fullmatch(name):
         raise ValueError("Invalid monitor name")
@@ -48,6 +63,22 @@ def external_monitors(values: list[dict]) -> list[dict]:
     return [m for m in values if internal is None or m["name"] != internal["name"]]
 
 
+def output_names(values: list[dict]) -> list[str]:
+    connected = connected_output_names()
+    return connected or [validate_name(m["name"]) for m in values]
+
+
+def internal_name(values: list[dict]) -> str:
+    names = output_names(values)
+    return next((name for name in names if name.startswith(("eDP-", "LVDS-", "DSI-"))), names[0] if names else "")
+
+
+def external_names(values: list[dict]) -> list[str]:
+    names = output_names(values)
+    internal = internal_name(values)
+    return [name for name in names if name != internal]
+
+
 def option(name: str):
     try:
         value = hypr_json("getoption", name)
@@ -61,14 +92,17 @@ def option(name: str):
 def status() -> int:
     values = monitors()
     focused = next((m for m in values if m.get("focused")), values[0] if values else None)
+    default_monitor = option("cursor:default_monitor") or ""
+    if default_monitor == "[[EMPTY]]":
+        default_monitor = ""
     print(json.dumps({
         "monitors": values,
         "focused": focused["name"] if focused else "",
-        "internal": internal_monitor(values)["name"] if values else "",
-        "external": [m["name"] for m in external_monitors(values)],
+        "internal": internal_name(values),
+        "external": external_names(values),
         "pointerFollowsMonitor": bool(option("misc:mouse_move_focuses_monitor")),
         "warpPointerWithWorkspace": int(option("cursor:warp_on_change_workspace") or 0) > 0,
-        "defaultMonitor": option("cursor:default_monitor") or "",
+        "defaultMonitor": default_monitor,
     }))
     return 0
 
@@ -149,31 +183,30 @@ def ensure_source(path: Path) -> None:
 
 
 def profile_rules(profile: str, values: list[dict]) -> list[str]:
-    internal = internal_monitor(values)
-    externals = external_monitors(values)
-    if internal is None:
+    internal = internal_name(values)
+    externals = external_names(values)
+    if not internal:
         raise ValueError("No display is available")
     if profile != "laptop" and not externals:
         raise ValueError("Connect an external display first")
 
     rules: list[str] = []
     if profile == "extend":
-        rules.append(f"{internal['name']},preferred,0x0,1")
-        for index, monitor in enumerate(externals):
-            position = "auto-right" if index == 0 else "auto-right"
-            rules.append(f"{monitor['name']},preferred,{position},1")
-    elif profile == "mirror":
-        rules.append(f"{internal['name']},preferred,0x0,1")
+        rules.append(f"{internal},preferred,0x0,1")
         for monitor in externals:
-            rules.append(f"{monitor['name']},preferred,0x0,1,mirror,{internal['name']}")
+            rules.append(f"{monitor},preferred,auto-right,1")
+    elif profile == "mirror":
+        rules.append(f"{internal},preferred,0x0,1")
+        for monitor in externals:
+            rules.append(f"{monitor},preferred,0x0,1,mirror,{internal}")
     elif profile == "laptop":
-        rules.append(f"{internal['name']},preferred,0x0,1")
-        rules.extend(f"{monitor['name']},disable" for monitor in externals)
+        rules.append(f"{internal},preferred,0x0,1")
+        rules.extend(f"{monitor},disable" for monitor in externals)
     elif profile == "external":
         primary = externals[0]
-        rules.append(f"{primary['name']},preferred,0x0,1")
-        rules.extend(f"{monitor['name']},preferred,auto-right,1" for monitor in externals[1:])
-        rules.append(f"{internal['name']},disable")
+        rules.append(f"{primary},preferred,0x0,1")
+        rules.extend(f"{monitor},preferred,auto-right,1" for monitor in externals[1:])
+        rules.append(f"{internal},disable")
     else:
         raise ValueError("Unknown display profile")
     return rules

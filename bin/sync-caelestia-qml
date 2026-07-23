@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+user_name="${1:-yash}"
+user_home="$(getent passwd "$user_name" | cut -d: -f6)"
+user_id="$(id -u "$user_name")"
+
+package_src="/etc/xdg/quickshell/caelestia"
+fork_src="$user_home/caelestia-repo-work/shell"
+dst="$user_home/.config/quickshell/caelestia"
+parent="$(dirname "$dst")"
+stage="$(mktemp -d "$parent/.caelestia-sync.XXXXXX")"
+previous="$parent/.caelestia-previous-sync"
+
+cleanup() {
+    rm -rf "$stage"
+}
+trap cleanup EXIT
+
+if [[ ! -d "$package_src" ]]; then
+    echo "Caelestia package QML source not found: $package_src" >&2
+    exit 0
+fi
+
+cp -a "$package_src" "$stage/caelestia"
+
+# The fork is the canonical customized shell. Overlaying it after the packaged
+# tree keeps local features while still supplying any new package-only files.
+if [[ -d "$fork_src/.git" ]]; then
+    for entry in assets components modules services utils shell.qml greeter.qml; do
+        if [[ -e "$fork_src/$entry" ]]; then
+            cp -a "$fork_src/$entry" "$stage/caelestia/"
+        fi
+    done
+elif [[ -d "$user_home/CaelestiaUpdateCenter/caelestia-overrides" ]]; then
+    cp -a "$user_home/CaelestiaUpdateCenter/caelestia-overrides/." "$stage/caelestia/"
+fi
+
+# Removed custom surfaces must not be resurrected by an older package tree.
+rm -f \
+    "$stage/caelestia/modules/continuity/CallGuard.qml" \
+    "$stage/caelestia/modules/continuity/ContinuityIsland.qml" \
+    "$stage/caelestia/modules/dashboard/AgentsTab.qml"
+
+chown -R "$user_name:$user_name" "$stage/caelestia"
+
+# Replace the live tree transactionally and retain the previous copy only until
+# the new one is in place.
+rm -rf "$previous"
+if [[ -e "$dst" ]]; then
+    mv "$dst" "$previous"
+fi
+if ! mv "$stage/caelestia" "$dst"; then
+    [[ -e "$previous" ]] && mv "$previous" "$dst"
+    exit 1
+fi
+rm -rf "$previous"
+
+# Package upgrades replace the QML plugin as well. Rebuild the fork against the
+# newly installed Qt/Quickshell ABI so custom services remain compatible.
+if [[ -f "$fork_src/CMakeLists.txt" ]]; then
+    build_dir="$user_home/.cache/caelestia-shell-plugin-build"
+    runuser -u "$user_name" -- env HOME="$user_home" \
+        cmake -S "$fork_src" -B "$build_dir" -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/ -DENABLE_MODULES=plugin
+    runuser -u "$user_name" -- env HOME="$user_home" \
+        cmake --build "$build_dir" -j4
+    cmake --install "$build_dir"
+fi
+
+runuser -u "$user_name" -- env \
+    HOME="$user_home" XDG_RUNTIME_DIR="/run/user/$user_id" \
+    systemctl --user restart caelestia-quickshell.service >/dev/null 2>&1 || true
+
+echo "Synced the customized Caelestia shell for $user_name"

@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+runtime="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+
+# User services can start before Hyprland imports its environment. Resolve the
+# live sockets directly so Qt never falls back to X11 during login.
+for _ in $(seq 1 80); do
+    hypr_socket="$(find "$runtime/hypr" -mindepth 2 -maxdepth 2 -name .socket.sock -printf '%T@ %h\n' 2>/dev/null | sort -nr | head -n1 | cut -d' ' -f2- || true)"
+    wayland_socket="$(find "$runtime" -maxdepth 1 -type s -name 'wayland-*' -printf '%T@ %f\n' 2>/dev/null | sort -nr | head -n1 | cut -d' ' -f2- || true)"
+    if [[ -n "$hypr_socket" && -n "$wayland_socket" ]]; then
+        export HYPRLAND_INSTANCE_SIGNATURE="${hypr_socket##*/}"
+        export WAYLAND_DISPLAY="$wayland_socket"
+        export QT_QPA_PLATFORM=wayland
+        exec /usr/sbin/qs -c caelestia -n --log-rules '*.debug=false'
+    fi
+    sleep 0.25
+done
+
+echo "Caelestia: Wayland session did not become ready" >&2
+exit 1

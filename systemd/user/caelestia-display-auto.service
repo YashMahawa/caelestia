@@ -3,6 +3,7 @@ Description=Caelestia automatic single-display policy
 After=graphical-session.target hyprland-session-anchor.service
 Wants=hyprland-session-anchor.service
 PartOf=graphical-session.target
+Before=caelestia-quickshell.service
 
 [Service]
 Type=simple

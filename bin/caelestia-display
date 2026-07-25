@@ -73,16 +73,6 @@ def connected_output_names() -> list[str]:
     return sorted(set(names))
 
 
-def lid_is_closed() -> bool:
-    for state_file in Path("/proc/acpi/button/lid").glob("*/state"):
-        try:
-            if "closed" in state_file.read_text(encoding="utf-8").lower():
-                return True
-        except OSError:
-            continue
-    return False
-
-
 def validate_name(name: str) -> str:
     if not VALID_NAME.fullmatch(name):
         raise ValueError("Invalid monitor name")
@@ -340,15 +330,8 @@ def apply_automatic() -> int:
         if target != internal:
             target_rule += ",cm,srgb"
 
-    # Never let Hyprland reach zero logical outputs. The headless fallback also
-    # covers closed-lid use, while an available panel is retained DPMS-off.
-    internal_state = next((m for m in values if m["name"] == internal), None)
-    if (
-        (internal_state is None or internal_state.get("disabled"))
-        and not lid_is_closed()
-    ):
-        apply_rule(saved_monitor_rule(internal) or f"{internal},preferred,0x0,1")
-
+    # Bring up the chosen physical output before moving workspaces or disabling
+    # the previous one. HEADLESS remains available only as a compositor guard.
     target_state = next((m for m in values if m["name"] == target), None)
     if target_state is None or target_state.get("disabled"):
         apply_rule(target_rule)
@@ -364,13 +347,14 @@ def apply_automatic() -> int:
             move_workspace_to(workspace.get("name", workspace.get("id")), target)
     centre_pointer(target)
 
-    for output in externals:
+    # DPMS-off is not enough: a lid event can wake eDP and make Qt create a
+    # second shell. Keep exactly one physical output in the desktop instead.
+    for output in [internal, *externals]:
         if output != target:
             apply_rule(f"{output},disable")
-    if target != internal:
-        set_dpms(internal, False)
 
     run(["hyprctl", "keyword", "cursor:default_monitor", target], check=False)
+    centre_pointer(target)
     print(json.dumps({
         "mode": "external-only" if externals else "laptop-only",
         "target": target,

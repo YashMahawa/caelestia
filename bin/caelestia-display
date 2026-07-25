@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 import time
@@ -16,6 +17,7 @@ from pathlib import Path
 
 STATE_DIR = Path.home() / ".local/state/caelestia"
 CONTROL_CONF = Path.home() / ".config/hypr/caelestia-display.conf"
+MONITORS_CONF = Path.home() / ".config/hypr/monitors.conf"
 HYPR_CONF = Path.home() / ".config/hypr/hyprland.conf"
 VALID_NAME = re.compile(r"^[A-Za-z0-9_.:-]+$")
 VALID_RESOLUTION = re.compile(r"^\d+x\d+@[\d.]+$")
@@ -110,6 +112,7 @@ def status() -> int:
         "pointerFollowsMonitor": bool(option("misc:mouse_move_focuses_monitor")),
         "warpPointerWithWorkspace": int(option("cursor:warp_on_change_workspace") or 0) > 0,
         "defaultMonitor": default_monitor,
+        "automaticSingleDisplay": True,
     }))
     return 0
 
@@ -181,9 +184,18 @@ def save_snapshot(values: list[dict]) -> None:
 
 def save_rules(rules: list[str]) -> None:
     CONTROL_CONF.parent.mkdir(parents=True, exist_ok=True)
-    monitor_file = CONTROL_CONF.parent / "monitors.conf"
-    monitor_file.write_text("".join(f"monitor = {rule}\n" for rule in rules), encoding="utf-8")
-    ensure_source(monitor_file)
+    safe_rules: list[str] = []
+    for rule in rules:
+        name = rule.split(",", 1)[0]
+        if name.startswith(("eDP-", "LVDS-", "DSI-")) and rule.endswith(",disable"):
+            # The event-driven policy disables the panel at runtime. Keeping a
+            # usable internal rule on disk prevents a black login if no monitor
+            # is attached before the watcher starts.
+            safe_rules.append(f"{name},preferred,0x0,1")
+        else:
+            safe_rules.append(rule)
+    MONITORS_CONF.write_text("".join(f"monitor = {rule}\n" for rule in safe_rules), encoding="utf-8")
+    ensure_source(MONITORS_CONF)
 
 
 def ensure_source(path: Path) -> None:
@@ -238,6 +250,108 @@ def centre_pointer(name: str) -> None:
     x = int(monitor["x"] + monitor["width"] / max(float(monitor.get("scale", 1)), 0.25) / 2)
     y = int(monitor["y"] + monitor["height"] / max(float(monitor.get("scale", 1)), 0.25) / 2)
     dispatch("movecursor", f"{x} {y}")
+
+
+def saved_monitor_rule(name: str) -> str:
+    if not MONITORS_CONF.exists():
+        return ""
+    prefix = f"monitor = {name},"
+    for line in MONITORS_CONF.read_text(encoding="utf-8").splitlines():
+        if line.strip().startswith(prefix):
+            rule = line.strip()[len("monitor = "):]
+            if not rule.endswith(",disable"):
+                return rule
+    return ""
+
+
+def apply_automatic() -> int:
+    """Use exactly one screen: an external monitor when present, else the panel."""
+    values = monitors()
+    internal = internal_name(values)
+    externals = external_names(values)
+    if not internal:
+        raise ValueError("No laptop display was found")
+
+    target = externals[0] if externals else internal
+    target_rule = saved_monitor_rule(target)
+    if not target_rule:
+        target_rule = f"{target},preferred,0x0,1"
+        if target != internal:
+            target_rule += ",cm,srgb"
+
+    # Bring the destination up before moving workspaces or disabling anything.
+    apply_rule(target_rule)
+    current_workspaces = workspaces()
+    for workspace in current_workspaces:
+        if workspace.get("monitor") != target:
+            move_workspace_to(workspace.get("name", workspace.get("id")), target)
+    centre_pointer(target)
+
+    for output in [internal, *externals]:
+        if output != target:
+            apply_rule(f"{output},disable")
+
+    run(["hyprctl", "keyword", "cursor:default_monitor", target], check=False)
+    print(json.dumps({
+        "mode": "external-only" if externals else "laptop-only",
+        "target": target,
+    }))
+    return 0
+
+
+def event_socket_path() -> Path:
+    runtime = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
+    signature = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE", "")
+    if signature:
+        candidate = runtime / "hypr" / signature / ".socket2.sock"
+        if candidate.exists():
+            return candidate
+    candidates = sorted(
+        (runtime / "hypr").glob("*/.socket2.sock"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    if not candidates:
+        raise FileNotFoundError("Hyprland event socket is unavailable")
+    return candidates[0]
+
+
+def watch() -> int:
+    """Follow monitor hotplug/config events without polling."""
+    while True:
+        try:
+            # Apply once at service startup, including sessions that began with
+            # the external monitor already attached.
+            for _ in range(20):
+                try:
+                    apply_automatic()
+                    break
+                except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+                    time.sleep(0.5)
+
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                client.connect(str(event_socket_path()))
+                buffer = ""
+                while True:
+                    chunk = client.recv(8192)
+                    if not chunk:
+                        break
+                    buffer += chunk.decode("utf-8", errors="replace")
+                    lines = buffer.split("\n")
+                    buffer = lines.pop()
+                    if any(line.startswith((
+                        "monitoradded", "monitorremoved", "configreloaded"
+                    )) for line in lines):
+                        time.sleep(0.7)
+                        try:
+                            apply_automatic()
+                        except Exception as error:  # keep watcher alive
+                            print(f"automatic display update failed: {error}", file=sys.stderr)
+        except KeyboardInterrupt:
+            return 0
+        except Exception as error:
+            print(f"display watcher reconnecting: {error}", file=sys.stderr)
+            time.sleep(1)
 
 
 def start_change(
@@ -438,6 +552,8 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("status")
+    sub.add_parser("auto")
+    sub.add_parser("watch")
     for command in ("focus", "move-workspace", "move-window", "primary"):
         item = sub.add_parser(command)
         item.add_argument("monitor")
@@ -460,6 +576,10 @@ def main() -> int:
     try:
         if args.command == "status":
             return status()
+        if args.command == "auto":
+            return apply_automatic()
+        if args.command == "watch":
+            return watch()
         if args.command == "focus":
             return focus(args.monitor)
         if args.command == "move-workspace":

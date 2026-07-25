@@ -1,0 +1,185 @@
+#!/usr/bin/env python3
+"""Allowlisted DDC/CI controls for Caelestia's active external monitor."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+
+
+RANGE_CONTROLS = {
+    "brightness": "10",
+    "contrast": "12",
+    "redGain": "16",
+    "greenGain": "18",
+    "blueGain": "1a",
+    "volume": "62",
+}
+ENUM_CONTROLS = {
+    "temperature": {
+        "6500": "05",
+        "7500": "06",
+        "9300": "08",
+        "user": "0b",
+    },
+    "input": {
+        "displayport": "0f",
+        "hdmi1": "11",
+        "hdmi2": "12",
+    },
+    "muted": {
+        "true": "01",
+        "false": "02",
+        "on": "01",
+        "off": "02",
+    },
+}
+INPUT_NAMES = {0x0F: "displayport", 0x11: "hdmi1", 0x12: "hdmi2"}
+TEMPERATURE_NAMES = {0x05: "6500", 0x06: "7500", 0x08: "9300", 0x0B: "user"}
+
+
+def run(args: list[str], timeout: int = 15) -> str:
+    result = subprocess.run(
+        args, text=True, capture_output=True, timeout=timeout, check=True
+    )
+    return result.stdout
+
+
+def detect() -> dict:
+    output = run(["ddcutil", "detect", "--brief"])
+    blocks = re.split(r"\n\s*\n", output.strip())
+    candidates: list[dict] = []
+    for block in blocks:
+        bus = re.search(r"I2C bus:\s*/dev/i2c-(\d+)", block)
+        connector = re.search(r"DRM connector:\s+card\d+-(\S+)", block)
+        monitor = re.search(r"Monitor:\s+([^:\n]*):([^:\n]*):([^\n]*)", block)
+        if not bus or not connector:
+            continue
+        candidates.append({
+            "bus": bus.group(1),
+            "connector": connector.group(1),
+            "make": monitor.group(1).strip() if monitor else "",
+            "model": monitor.group(2).strip() if monitor else connector.group(1),
+            "serial": monitor.group(3).strip() if monitor else "",
+        })
+    if not candidates:
+        raise RuntimeError("No DDC/CI monitor is available")
+
+    try:
+        active = json.loads(run(["hyprctl", "monitors", "all", "-j"], timeout=5))
+        active_external = next((
+            item["name"] for item in active
+            if not item.get("disabled")
+            and not item["name"].startswith(("eDP-", "LVDS-", "DSI-"))
+        ), "")
+        selected = next(
+            (item for item in candidates if item["connector"] == active_external),
+            None,
+        )
+        if selected:
+            return selected
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+        pass
+    return candidates[0]
+
+
+def parse_status(output: str, monitor: dict) -> dict:
+    state: dict = {
+        "available": True,
+        **monitor,
+        "brightness": 0,
+        "contrast": 50,
+        "redGain": 50,
+        "greenGain": 50,
+        "blueGain": 50,
+        "volume": 0,
+        "muted": False,
+        "temperature": "6500",
+        "input": "hdmi1",
+    }
+    range_names = {int(code, 16): name for name, code in RANGE_CONTROLS.items()}
+    for line in output.splitlines():
+        code_match = re.search(r"VCP code 0x([0-9a-fA-F]{2})", line)
+        if not code_match:
+            continue
+        code = int(code_match.group(1), 16)
+        value_match = re.search(
+            r"current value =\s*(\d+), max value =\s*(\d+)", line
+        )
+        if code in range_names and value_match:
+            maximum = max(1, int(value_match.group(2)))
+            state[range_names[code]] = round(int(value_match.group(1)) * 100 / maximum)
+            continue
+        enum_match = re.search(r"\(sl=0x([0-9a-fA-F]{2})\)", line)
+        if not enum_match:
+            continue
+        value = int(enum_match.group(1), 16)
+        if code == 0x14:
+            state["temperature"] = TEMPERATURE_NAMES.get(value, "user")
+        elif code == 0x60:
+            state["input"] = INPUT_NAMES.get(value, f"0x{value:02x}")
+        elif code == 0x8D:
+            state["muted"] = value == 0x01
+    return state
+
+
+def status() -> int:
+    monitor = detect()
+    output = run(["ddcutil", "-b", monitor["bus"], "getvcp", "known"])
+    print(json.dumps(parse_status(output, monitor)))
+    return 0
+
+
+def set_control(name: str, value: str) -> int:
+    monitor = detect()
+    if name in RANGE_CONTROLS:
+        try:
+            numeric = max(0, min(100, int(round(float(value)))))
+        except ValueError as error:
+            raise ValueError(f"{name} must be between 0 and 100") from error
+        code = RANGE_CONTROLS[name]
+        encoded = str(numeric)
+        result_value: int | str | bool = numeric
+    elif name in ENUM_CONTROLS:
+        key = value.lower().replace("-", "")
+        if key not in ENUM_CONTROLS[name]:
+            choices = ", ".join(ENUM_CONTROLS[name])
+            raise ValueError(f"{name} must be one of: {choices}")
+        code = {"temperature": "14", "input": "60", "muted": "8d"}[name]
+        encoded = ENUM_CONTROLS[name][key]
+        result_value = key in ("true", "on") if name == "muted" else key
+    else:
+        raise ValueError("Unsupported monitor control")
+
+    run(["ddcutil", "-b", monitor["bus"], "setvcp", code, encoded])
+    print(json.dumps({
+        "ok": True,
+        "control": name,
+        "value": result_value,
+        "connector": monitor["connector"],
+    }))
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("status")
+    setter = sub.add_parser("set")
+    setter.add_argument("control", choices=(*RANGE_CONTROLS, *ENUM_CONTROLS))
+    setter.add_argument("value")
+    args = parser.parse_args()
+    try:
+        if args.command == "status":
+            return status()
+        return set_control(args.control, args.value)
+    except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as error:
+        print(str(error), file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

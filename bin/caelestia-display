@@ -288,6 +288,22 @@ def ensure_headless_fallback(values: list[dict]) -> tuple[list[dict], str]:
             m for m in values
             if m["name"].startswith("HEADLESS-") and not m.get("disabled")
         ), None)
+    if fallback is not None and (
+        fallback.get("width") != 16
+        or fallback.get("height") != 16
+        or fallback.get("x") != 100000
+        or fallback.get("y") != 100000
+    ):
+        # Do not leave the guard adjacent to a physical output. Otherwise the
+        # cursor can cross onto its invisible workspace, breaking edge hovers
+        # and sending keyboard focus away from the real monitor.
+        apply_rule(f"{fallback['name']},16x16@60,100000x100000,1")
+        time.sleep(0.1)
+        values = monitors()
+        fallback = next((
+            m for m in values
+            if m["name"].startswith("HEADLESS-") and not m.get("disabled")
+        ), fallback)
     return values, fallback["name"] if fallback is not None else ""
 
 

@@ -73,6 +73,16 @@ def connected_output_names() -> list[str]:
     return sorted(set(names))
 
 
+def lid_is_closed() -> bool:
+    for state_file in Path("/proc/acpi/button/lid").glob("*/state"):
+        try:
+            if "closed" in state_file.read_text(encoding="utf-8").lower():
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def validate_name(name: str) -> str:
     if not VALID_NAME.fullmatch(name):
         raise ValueError("Invalid monitor name")
@@ -333,7 +343,10 @@ def apply_automatic() -> int:
     # Never let Hyprland reach zero logical outputs. The headless fallback also
     # covers closed-lid use, while an available panel is retained DPMS-off.
     internal_state = next((m for m in values if m["name"] == internal), None)
-    if internal_state is None or internal_state.get("disabled"):
+    if (
+        (internal_state is None or internal_state.get("disabled"))
+        and not lid_is_closed()
+    ):
         apply_rule(saved_monitor_rule(internal) or f"{internal},preferred,0x0,1")
 
     target_state = next((m for m in values if m["name"] == target), None)

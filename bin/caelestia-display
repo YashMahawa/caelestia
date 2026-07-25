@@ -35,6 +35,11 @@ def monitors() -> list[dict]:
     return value if isinstance(value, list) else []
 
 
+def workspaces() -> list[dict]:
+    value = hypr_json("workspaces")
+    return value if isinstance(value, list) else []
+
+
 def connected_output_names() -> list[str]:
     """Return connected DRM connector names, including currently disabled outputs."""
     names: list[str] = []
@@ -142,6 +147,8 @@ def move_window(name: str) -> int:
 
 def rule_for(monitor: dict) -> str:
     name = validate_name(monitor["name"])
+    if monitor.get("disabled"):
+        return f"{name},disable"
     refresh = float(monitor.get("refreshRate", 60))
     res = f"{monitor['width']}x{monitor['height']}@{refresh:.2f}"
     pos = f"{monitor.get('x', 0)}x{monitor.get('y', 0)}"
@@ -151,6 +158,10 @@ def rule_for(monitor: dict) -> str:
     mirror = monitor.get("mirrorOf")
     if mirror and mirror != "none":
         rule += f",mirror,{validate_name(mirror)}"
+    if not name.startswith(("eDP-", "LVDS-", "DSI-")):
+        # Keep normal desktop content colour-correct. HDR remains opt-in because
+        # forcing PQ for SDR applications produces a washed-out desktop.
+        rule += ",cm,srgb"
     return rule
 
 
@@ -196,7 +207,7 @@ def profile_rules(profile: str, values: list[dict]) -> list[str]:
     if profile == "extend":
         rules.append(f"{internal},preferred,0x0,1")
         for monitor in externals:
-            rules.append(f"{monitor},preferred,auto-right,1")
+            rules.append(f"{monitor},preferred,auto-right,1,cm,srgb")
     elif profile == "mirror":
         rules.append(f"{internal},preferred,0x0,1")
         for monitor in externals:
@@ -206,24 +217,71 @@ def profile_rules(profile: str, values: list[dict]) -> list[str]:
         rules.extend(f"{monitor},disable" for monitor in externals)
     elif profile == "external":
         primary = externals[0]
-        rules.append(f"{primary},preferred,0x0,1")
-        rules.extend(f"{monitor},preferred,auto-right,1" for monitor in externals[1:])
+        rules.append(f"{primary},preferred,0x0,1,cm,srgb")
+        rules.extend(f"{monitor},preferred,auto-right,1,cm,srgb" for monitor in externals[1:])
         rules.append(f"{internal},disable")
     else:
         raise ValueError("Unknown display profile")
     return rules
 
 
-def start_change(values: list[dict], apply_rules: list[str], persist_rules: list[str], label: str) -> int:
+def move_workspace_to(workspace: str | int, monitor: str) -> None:
+    monitor = validate_name(monitor)
+    dispatch("moveworkspacetomonitor", f"{workspace} {monitor}")
+
+
+def centre_pointer(name: str) -> None:
+    monitor = next((m for m in monitors() if m["name"] == name), None)
+    if monitor is None:
+        return
+    dispatch("focusmonitor", name)
+    x = int(monitor["x"] + monitor["width"] / max(float(monitor.get("scale", 1)), 0.25) / 2)
+    y = int(monitor["y"] + monitor["height"] / max(float(monitor.get("scale", 1)), 0.25) / 2)
+    dispatch("movecursor", f"{x} {y}")
+
+
+def start_change(
+    values: list[dict],
+    apply_rules: list[str],
+    persist_rules: list[str],
+    label: str,
+    *,
+    target: str = "",
+    migrate_from: list[str] | None = None,
+) -> int:
     token = uuid.uuid4().hex[:12]
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     state = STATE_DIR / f"display-revert-{token}.json"
+    focused = next((m["name"] for m in values if m.get("focused")), "")
+    assignments = [
+        {"workspace": workspace.get("name", workspace.get("id")), "monitor": workspace.get("monitor", "")}
+        for workspace in workspaces()
+        if workspace.get("monitor")
+    ]
     state.write_text(json.dumps({
-        "created": time.time(), "monitors": values, "rules": persist_rules
+        "created": time.time(),
+        "monitors": values,
+        "rules": persist_rules,
+        "focused": focused,
+        "defaultMonitor": option("cursor:default_monitor") or "",
+        "workspaces": assignments,
+        "target": target,
     }), encoding="utf-8")
     try:
+        if target:
+            # Move live workspaces while both outputs still exist. If Hyprland
+            # disables their monitor first it can select an arbitrary remaining
+            # workspace, leaving keyboard focus feeling lost.
+            sources = set(migrate_from or [])
+            for assignment in assignments:
+                if assignment["monitor"] in sources:
+                    move_workspace_to(assignment["workspace"], target)
+            centre_pointer(target)
         for rule in apply_rules:
             apply_rule(rule)
+        if target:
+            centre_pointer(target)
+            run(["hyprctl", "keyword", "cursor:default_monitor", target])
     except Exception:
         rollback(token)
         raise
@@ -239,6 +297,18 @@ def start_change(values: list[dict], apply_rules: list[str], persist_rules: list
 def apply_profile(profile: str) -> int:
     values = monitors()
     rules = profile_rules(profile, values)
+    internal = internal_name(values)
+    externals = external_names(values)
+    if profile == "external":
+        return start_change(
+            values, rules, rules, profile,
+            target=externals[0], migrate_from=[internal],
+        )
+    if profile == "laptop":
+        return start_change(
+            values, rules, rules, profile,
+            target=internal, migrate_from=externals,
+        )
     return start_change(values, rules, rules, profile)
 
 
@@ -267,6 +337,8 @@ def apply_custom(name: str, resolution: str, position: str, scale_text: str, tra
         if transform not in range(8):
             raise ValueError("Invalid display orientation")
         rule = f"{name},{resolution},{position},{scale:g},transform,{transform}"
+        if not name.startswith(("eDP-", "LVDS-", "DSI-")):
+            rule += ",cm,srgb"
 
     persist_rules = [rule if monitor["name"] == name else rule_for(monitor) for monitor in values]
     return start_change(values, [rule], persist_rules, "custom")
@@ -281,6 +353,16 @@ def rollback(token: str) -> int:
     payload = json.loads(state.read_text(encoding="utf-8"))
     for monitor in payload.get("monitors", []):
         apply_rule(rule_for(monitor))
+    for assignment in payload.get("workspaces", []):
+        if assignment.get("monitor"):
+            move_workspace_to(assignment.get("workspace"), assignment["monitor"])
+    previous_default = payload.get("defaultMonitor", "")
+    run([
+        "hyprctl", "keyword", "cursor:default_monitor",
+        previous_default if previous_default and previous_default != "[[EMPTY]]" else "[[EMPTY]]"
+    ], check=False)
+    if payload.get("focused"):
+        centre_pointer(payload["focused"])
     state.unlink(missing_ok=True)
     return 0
 
@@ -297,6 +379,10 @@ def confirm(token: str) -> int:
         raise ValueError("Display confirmation expired")
     payload = json.loads(state.read_text(encoding="utf-8"))
     save_rules(payload.get("rules", []))
+    if payload.get("target"):
+        pointer = bool(option("misc:mouse_move_focuses_monitor"))
+        warp = int(option("cursor:warp_on_change_workspace") or 0) > 0
+        write_policies(pointer, warp, payload["target"])
     state.unlink()
     print("Display layout saved")
     return 0

@@ -71,5 +71,17 @@ case "${1:-}/${2:-}" in
             log "post-resume: lock state IPC failed, trying Caelestia lock again"
             lock_session >> "$LOG" 2>&1 || true
         fi
+        log "post-resume: restoring automatic single-display layout"
+        hypr_signature="$(
+            /usr/bin/find "${RUNTIME_DIR}/hypr" -mindepth 1 -maxdepth 1 -type d \
+                -printf '%f\n' 2>/dev/null | /usr/bin/head -n 1
+        )"
+        if [ -n "$hypr_signature" ]; then
+            run_user /usr/bin/env HYPRLAND_INSTANCE_SIGNATURE="$hypr_signature" \
+                /home/yash/.local/bin/caelestia-display auto >> "$LOG" 2>&1 || \
+                log "post-resume: display layout restore failed"
+        else
+            log "post-resume: no running Hyprland instance found"
+        fi
         ;;
 esac

@@ -9,6 +9,7 @@ Type=simple
 ExecStartPre=/usr/bin/sleep 3
 ExecStartPre=/home/yash/.local/bin/caelestia-qs-clean-runtime
 ExecStart=/usr/sbin/qs -c caelestia -n --log-rules *.debug=false
+ExecStartPost=/home/yash/.local/bin/caelestia-lock-recover
 ExecStop=/usr/sbin/qs kill -c caelestia
 Restart=on-failure
 RestartSec=2

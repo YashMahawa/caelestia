@@ -1,4 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+IPC="${HOME}/.local/bin/caelestia-qs-ipc"
+
+if ! timeout 4 "$IPC" lock safeLock >/dev/null 2>&1; then
+    notify-send -u critical "Suspend cancelled" "Caelestia could not confirm the lock screen."
+    exit 1
+fi
+
+if ! timeout 4 "$IPC" lock isLocked 2>/dev/null | grep -q true; then
+    notify-send -u critical "Suspend cancelled" "The session did not lock safely."
+    exit 1
+fi
+
 exec systemctl suspend

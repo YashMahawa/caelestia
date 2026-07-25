@@ -24,7 +24,22 @@ VALID_RESOLUTION = re.compile(r"^\d+x\d+@[\d.]+$")
 VALID_POSITION = re.compile(r"^-?\d+x-?\d+$")
 
 
+def ensure_hypr_environment() -> None:
+    if os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
+        return
+    runtime = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
+    sockets = sorted(
+        (runtime / "hypr").glob("*/.socket.sock"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    if sockets:
+        os.environ["HYPRLAND_INSTANCE_SIGNATURE"] = sockets[0].parent.name
+
+
 def run(args: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
+    if args and args[0] == "hyprctl":
+        ensure_hypr_environment()
     return subprocess.run(args, text=True, capture_output=True, check=check, timeout=10)
 
 

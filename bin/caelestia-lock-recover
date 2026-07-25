@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+set -u
+
+STATE_FILE="${XDG_STATE_HOME:-$HOME/.local/state}/caelestia/session-lock"
+IPC="${HOME}/.local/bin/caelestia-qs-ipc"
+
+[ -r "$STATE_FILE" ] || exit 0
+signature="$(head -n 1 "$STATE_FILE" 2>/dev/null)"
+
+# A marker from an older compositor session is stale and must never lock a
+# fresh login. A Quickshell-only restart keeps the same Hyprland socket.
+if [ -z "$signature" ] || [ ! -S "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/hypr/${signature}/.socket.sock" ]; then
+    rm -f "$STATE_FILE"
+    exit 0
+fi
+
+for _ in $(seq 1 20); do
+    if timeout 2 "$IPC" lock safeLock >/dev/null 2>&1; then
+        exit 0
+    fi
+    sleep 0.5
+done
+
+exit 1

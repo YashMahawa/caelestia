@@ -55,7 +55,7 @@
         "idle": {
             "inhibitWhenAudio": true,
             "lockAfterSleep": false,
-            "lockBeforeSleep": false,
+            "lockBeforeSleep": true,
             "timeouts": [
                 {
                     "idleAction": "lock",
@@ -71,8 +71,7 @@
                 },
                 {
                     "idleAction": [
-                        "systemctl",
-                        "suspend"
+                        "/home/yash/.local/bin/caelestia-safe-suspend"
                     ],
                     "respectInhibitors": true,
                     "returnAction": null,

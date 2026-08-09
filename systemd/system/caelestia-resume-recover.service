@@ -1,0 +1,13 @@
+[Unit]
+Description=Schedule Caelestia lock recovery after system resume
+Before=sleep.target
+StopWhenUnneeded=yes
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/true
+ExecStop=/usr/local/bin/caelestia-schedule-resume-recover
+
+[Install]
+WantedBy=sleep.target

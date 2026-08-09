@@ -1,0 +1,11 @@
+[Unit]
+Description=Securely lock Caelestia before system sleep
+Before=sleep.target
+StopWhenUnneeded=yes
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/caelestia-pre-sleep-lock
+
+[Install]
+RequiredBy=sleep.target

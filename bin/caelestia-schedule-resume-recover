@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -u
+
+LOG="/var/log/caelestia-sleep-guard.log"
+log() {
+    printf '%s %s\n' "$(date --iso-8601=seconds)" "$*" >> "$LOG" 2>/dev/null || true
+}
+
+log "post-resume: scheduling Caelestia recovery after compositor stabilization"
+/usr/bin/systemd-run --quiet --on-active=3s /usr/local/bin/caelestia-resume-recover >> "$LOG" 2>&1 || \
+    log "post-resume: failed to schedule delayed recovery"

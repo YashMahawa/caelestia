@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+LOG="/var/log/caelestia-sleep-guard.log"
+
+log() {
+    printf '%s %s\n' "$(date --iso-8601=seconds)" "$*" >> "$LOG" 2>/dev/null || true
+}
+
+session_id=""
+user_id=""
+user_name=""
+
+while read -r candidate _; do
+    [[ -n "$candidate" ]] || continue
+    active="$(loginctl show-session "$candidate" -p Active --value 2>/dev/null || true)"
+    remote="$(loginctl show-session "$candidate" -p Remote --value 2>/dev/null || true)"
+    type="$(loginctl show-session "$candidate" -p Type --value 2>/dev/null || true)"
+    if [[ "$active" == "yes" && "$remote" == "no" && ( "$type" == "wayland" || "$type" == "x11" ) ]]; then
+        session_id="$candidate"
+        user_id="$(loginctl show-session "$candidate" -p User --value)"
+        user_name="$(loginctl show-session "$candidate" -p Name --value)"
+        break
+    fi
+done < <(loginctl list-sessions --no-legend 2>/dev/null || true)
+
+if [[ -z "$session_id" || -z "$user_id" || -z "$user_name" ]]; then
+    log "pre-sleep: no active local graphical session; nothing to lock"
+    exit 0
+fi
+
+user_home="$(getent passwd "$user_id" | cut -d: -f6)"
+runtime_dir="/run/user/${user_id}"
+bus="unix:path=${runtime_dir}/bus"
+ipc="${user_home}/.local/bin/caelestia-qs-ipc"
+
+run_user() {
+    /usr/bin/setpriv --reuid="$user_id" --regid="$user_id" --init-groups \
+        /usr/bin/env \
+        HOME="$user_home" \
+        USER="$user_name" \
+        LOGNAME="$user_name" \
+        XDG_RUNTIME_DIR="$runtime_dir" \
+        DBUS_SESSION_BUS_ADDRESS="$bus" \
+        "$@"
+}
+
+if [[ "${CAELESTIA_LOCK_GUARD_DRY_RUN:-0}" == "1" ]]; then
+    printf 'session=%s user=%s uid=%s runtime=%s ipc=%s\n' \
+        "$session_id" "$user_name" "$user_id" "$runtime_dir" "$ipc"
+    exit 0
+fi
+
+if [[ ! -x "$ipc" ]]; then
+    log "pre-sleep: Caelestia IPC helper is unavailable for ${user_name}; refusing unsafe sleep"
+    exit 1
+fi
+
+log "pre-sleep: requesting Caelestia lock for ${user_name} (session ${session_id})"
+if ! run_user /usr/bin/timeout 4 "$ipc" lock safeLock >> "$LOG" 2>&1; then
+    log "pre-sleep: lock request failed; refusing unsafe sleep"
+    exit 1
+fi
+
+locked=false
+for _ in $(/usr/bin/seq 1 20); do
+    if run_user /usr/bin/timeout 1 "$ipc" lock isLocked 2>/dev/null | /usr/bin/grep -qx true; then
+        locked=true
+        break
+    fi
+    /usr/bin/sleep 0.15
+done
+
+if [[ "$locked" != true ]]; then
+    log "pre-sleep: secure lock confirmation timed out; refusing unsafe sleep"
+    exit 1
+fi
+
+log "pre-sleep: secure lock confirmed; kernel will manage output power"

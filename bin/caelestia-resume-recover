@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+set -u
+
+LOG="/var/log/caelestia-resume-recover.log"
+
+log() {
+    printf '%s %s\n' "$(date --iso-8601=seconds)" "$*" >> "$LOG" 2>/dev/null || true
+}
+
+session_id=""
+user_id=""
+user_name=""
+
+while read -r candidate _; do
+    [[ -n "$candidate" ]] || continue
+    active="$(loginctl show-session "$candidate" -p Active --value 2>/dev/null || true)"
+    remote="$(loginctl show-session "$candidate" -p Remote --value 2>/dev/null || true)"
+    type="$(loginctl show-session "$candidate" -p Type --value 2>/dev/null || true)"
+    if [[ "$active" == "yes" && "$remote" == "no" && ( "$type" == "wayland" || "$type" == "x11" ) ]]; then
+        session_id="$candidate"
+        user_id="$(loginctl show-session "$candidate" -p User --value)"
+        user_name="$(loginctl show-session "$candidate" -p Name --value)"
+        break
+    fi
+done < <(loginctl list-sessions --no-legend 2>/dev/null || true)
+
+if [[ -z "$session_id" || -z "$user_id" || -z "$user_name" ]]; then
+    log "resume recovery: no active local graphical session"
+    exit 0
+fi
+
+user_home="$(getent passwd "$user_id" | cut -d: -f6)"
+runtime_dir="/run/user/${user_id}"
+bus="unix:path=${runtime_dir}/bus"
+ipc="${user_home}/.local/bin/caelestia-qs-ipc"
+
+run_user() {
+    /usr/bin/setpriv --reuid="$user_id" --regid="$user_id" --init-groups \
+        /usr/bin/env \
+        HOME="$user_home" \
+        USER="$user_name" \
+        LOGNAME="$user_name" \
+        XDG_RUNTIME_DIR="$runtime_dir" \
+        DBUS_SESSION_BUS_ADDRESS="$bus" \
+        "$@"
+}
+
+qs_ipc() {
+    run_user /usr/bin/timeout 2 "$ipc" "$@"
+}
+
+if [[ "${CAELESTIA_RESUME_RECOVER_DRY_RUN:-0}" == "1" ]]; then
+    printf 'session=%s user=%s uid=%s runtime=%s ipc=%s\n' \
+        "$session_id" "$user_name" "$user_id" "$runtime_dir" "$ipc"
+    exit 0
+fi
+
+log "resume recovery: preserving compositor topology and waiting for the existing shell"
+
+# A monitor and Wayland compositor can need several seconds to settle after
+# resume. Do not mistake that transient for a dead shell or rewrite outputs.
+for _ in $(/usr/bin/seq 1 20); do
+    lock_state="$(qs_ipc lock isLocked 2>/dev/null || true)"
+    if [[ "$lock_state" == "true" ]]; then
+        log "resume recovery: existing shell is healthy and already locked"
+        exit 0
+    fi
+    if [[ "$lock_state" == "false" ]]; then
+        if qs_ipc lock safeLock >> "$LOG" 2>&1; then
+            log "resume recovery: existing shell is healthy; lock restored"
+        else
+            log "resume recovery: existing shell responded but lock request failed"
+        fi
+        exit 0
+    fi
+    /usr/bin/sleep 0.5
+done
+
+# Restart only after the complete grace period. This is a last-resort recovery,
+# not a normal part of resume.
+log "resume recovery: IPC unavailable after grace period; restarting Caelestia once"
+if ! run_user /usr/bin/systemctl --user restart caelestia-quickshell.service >> "$LOG" 2>&1; then
+    log "resume recovery: restart failed"
+    exit 0
+fi
+
+for _ in $(/usr/bin/seq 1 30); do
+    if qs_ipc lock safeLock >> "$LOG" 2>&1; then
+        log "resume recovery: replacement shell is ready and locked"
+        exit 0
+    fi
+    /usr/bin/sleep 0.5
+done
+
+log "resume recovery: replacement shell did not become ready"

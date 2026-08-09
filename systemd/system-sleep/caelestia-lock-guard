@@ -1,21 +1,47 @@
 #!/usr/bin/env bash
 set -u
 
-USER_NAME="yash"
-USER_ID="1000"
-RUNTIME_DIR="/run/user/${USER_ID}"
-BUS="unix:path=${RUNTIME_DIR}/bus"
-IPC="/home/yash/.local/bin/caelestia-qs-ipc"
-LOG="${RUNTIME_DIR}/caelestia-sleep-guard.log"
 IPC_TIMEOUT=4
 LOCK_RETRIES=2
+
+SESSION_ID=""
+USER_NAME=""
+USER_ID=""
+
+while read -r candidate _; do
+    [ -n "$candidate" ] || continue
+    active="$(/usr/bin/loginctl show-session "$candidate" -p Active --value 2>/dev/null || true)"
+    remote="$(/usr/bin/loginctl show-session "$candidate" -p Remote --value 2>/dev/null || true)"
+    type="$(/usr/bin/loginctl show-session "$candidate" -p Type --value 2>/dev/null || true)"
+    if [ "$active" = yes ] && [ "$remote" = no ] && { [ "$type" = wayland ] || [ "$type" = x11 ]; }; then
+        SESSION_ID="$candidate"
+        USER_ID="$(/usr/bin/loginctl show-session "$candidate" -p User --value)"
+        USER_NAME="$(/usr/bin/loginctl show-session "$candidate" -p Name --value)"
+        break
+    fi
+done <<EOF
+$(/usr/bin/loginctl list-sessions --no-legend 2>/dev/null || true)
+EOF
+
+# Sleep can be requested while only the display manager is running.
+[ -n "$SESSION_ID" ] && [ -n "$USER_ID" ] && [ -n "$USER_NAME" ] || exit 0
+
+USER_HOME="$(/usr/bin/getent passwd "$USER_ID" | /usr/bin/cut -d: -f6)"
+RUNTIME_DIR="/run/user/${USER_ID}"
+BUS="unix:path=${RUNTIME_DIR}/bus"
+IPC="${USER_HOME}/.local/bin/caelestia-qs-ipc"
+LOG="${RUNTIME_DIR}/caelestia-sleep-guard.log"
 
 log() {
     printf '%s %s\n' "$(date --iso-8601=seconds)" "$*" >> "$LOG" 2>/dev/null || true
 }
 
 run_user() {
-    /usr/bin/runuser -u "$USER_NAME" -- env \
+    /usr/bin/setpriv --reuid="$USER_ID" --regid="$USER_ID" --init-groups \
+        /usr/bin/env \
+        HOME="$USER_HOME" \
+        USER="$USER_NAME" \
+        LOGNAME="$USER_NAME" \
         XDG_RUNTIME_DIR="$RUNTIME_DIR" \
         DBUS_SESSION_BUS_ADDRESS="$BUS" \
         "$@"
@@ -25,63 +51,49 @@ qs_call() {
     run_user /usr/bin/timeout "$IPC_TIMEOUT" "$IPC" "$@"
 }
 
-restart_qs() {
-    run_user /usr/bin/systemctl --user restart caelestia-quickshell.service
-}
-
 lock_session() {
-    local attempt
+    local attempt check
     for attempt in $(seq 1 "$LOCK_RETRIES"); do
         if qs_call lock safeLock >> "$LOG" 2>&1; then
-            log "lock: Caelestia session lock accepted on attempt ${attempt}"
-            return 0
+            for check in $(seq 1 10); do
+                if qs_call lock isLocked 2>/dev/null | /usr/bin/grep -qx true; then
+                    log "lock: Caelestia session locked on attempt ${attempt}"
+                    return 0
+                fi
+                /usr/bin/sleep 0.2
+            done
         fi
         log "lock: Caelestia session lock failed on attempt ${attempt}"
-        if [ "$attempt" -lt "$LOCK_RETRIES" ]; then
-            restart_qs >> "$LOG" 2>&1 || true
-            /usr/bin/sleep 1
-        fi
+        /usr/bin/sleep 0.25
     done
     return 1
 }
 
 ensure_ipc() {
-    if qs_call drawers list >> "$LOG" 2>&1; then
-        return 0
-    fi
-    log "ipc: unhealthy or timed out, restarting Quickshell"
-    restart_qs >> "$LOG" 2>&1 || true
-    /usr/bin/sleep 1
     qs_call drawers list >> "$LOG" 2>&1
 }
 
 case "${1:-}/${2:-}" in
     pre/*)
         log "pre-sleep: locking with Caelestia before suspend"
-        ensure_ipc >> "$LOG" 2>&1 || true
-        if ! lock_session; then
+        if ! ensure_ipc; then
+            log "pre-sleep: Quickshell IPC unavailable; not restarting it during suspend"
+        elif ! lock_session; then
             log "pre-sleep: Caelestia lock did not confirm before suspend"
         fi
         ;;
     post/*)
         log "post-resume: checking Caelestia Quickshell IPC and lock state"
-        /usr/bin/sleep 1
-        ensure_ipc >> "$LOG" 2>&1 || true
-        if ! qs_call lock isLocked >> "$LOG" 2>&1; then
-            log "post-resume: lock state IPC failed, trying Caelestia lock again"
+        /usr/bin/sleep 2
+        if ! ensure_ipc; then
+            log "post-resume: Quickshell IPC unavailable; restarting once after display stabilization"
+            run_user /usr/bin/systemctl --user restart caelestia-quickshell.service >> "$LOG" 2>&1 || true
+            /usr/bin/sleep 2
+        fi
+        if ! qs_call lock isLocked 2>/dev/null | /usr/bin/grep -qx true; then
+            log "post-resume: lock not active; requesting it again"
             lock_session >> "$LOG" 2>&1 || true
         fi
-        log "post-resume: restoring automatic single-display layout"
-        hypr_signature="$(
-            /usr/bin/find "${RUNTIME_DIR}/hypr" -mindepth 1 -maxdepth 1 -type d \
-                -printf '%f\n' 2>/dev/null | /usr/bin/head -n 1
-        )"
-        if [ -n "$hypr_signature" ]; then
-            run_user /usr/bin/env HYPRLAND_INSTANCE_SIGNATURE="$hypr_signature" \
-                /home/yash/.local/bin/caelestia-display auto >> "$LOG" 2>&1 || \
-                log "post-resume: display layout restore failed"
-        else
-            log "post-resume: no running Hyprland instance found"
-        fi
+        log "post-resume: preserving compositor monitor layout to avoid output teardown races"
         ;;
 esac

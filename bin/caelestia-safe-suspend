@@ -8,9 +8,20 @@ if ! timeout 4 "$IPC" lock safeLock >/dev/null 2>&1; then
     exit 1
 fi
 
-if ! timeout 4 "$IPC" lock isLocked 2>/dev/null | grep -q true; then
+locked=false
+for _ in {1..15}; do
+    if timeout 2 "$IPC" lock isLocked 2>/dev/null | grep -qx true; then
+        locked=true
+        break
+    fi
+    sleep 0.2
+done
+
+if [[ "$locked" != true ]]; then
     notify-send -u critical "Suspend cancelled" "The session did not lock safely."
     exit 1
 fi
 
+# Let the lock surface finish one frame before outputs enter low-power state.
+sleep 0.5
 exec systemctl suspend

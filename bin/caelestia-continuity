@@ -10,6 +10,7 @@ import socket
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 
 CONFIG = Path.home() / ".config/caelestia/continuity.json"
@@ -19,6 +20,20 @@ DEFAULTS = {
     "deviceName": "Phone",
     "autoClipboardSync": False,
     "notificationsEnabled": False,
+}
+
+PLUGIN_OPTIONS = {
+    "kdeconnect_battery": ("Battery status", "Show the phone battery and charging state", "battery_full"),
+    "kdeconnect_mprisremote": ("Control laptop media", "Use the phone as a media remote", "media_output"),
+    "kdeconnect_mpriscontrol": ("Control phone media", "Control phone playback from Caelestia", "play_circle"),
+    "kdeconnect_mousepad": ("Remote input", "Use the phone as a touchpad and keyboard", "touch_app"),
+    "kdeconnect_presenter": ("Presentation remote", "Control slides and the presentation pointer", "present_to_all"),
+    "kdeconnect_share": ("Files and links", "Send and receive files, URLs and text", "folder_shared"),
+    "kdeconnect_ping": ("Ping", "Send a quick connection notification", "notifications_active"),
+    "kdeconnect_findmyphone": ("Find phone", "Ring the paired phone on demand", "phone_in_talk"),
+    "kdeconnect_runcommand": ("Remote commands", "Run explicitly configured laptop commands", "terminal"),
+    "kdeconnect_systemvolume": ("System volume", "Expose laptop application volumes to the phone", "volume_up"),
+    "kdeconnect_screensaver_inhibit": ("Keep awake for media", "Let phone playback inhibit laptop sleep", "screen_lock_portrait"),
 }
 
 
@@ -68,6 +83,14 @@ def device_value(device_id: str, name: str) -> subprocess.CompletedProcess[str]:
 
 def known_device() -> str | None:
     preferred = str(config().get("deviceId", ""))
+    paired_result = run(
+        "qdbus6", "org.kde.kdeconnect", "/modules/kdeconnect",
+        "org.kde.kdeconnect.daemon.devices", "false", "true",
+    )
+    paired = paired_result.stdout.split() if paired_result.returncode == 0 else []
+    # Respect an explicit selection even while that device is offline.
+    if preferred in paired:
+        return preferred
     reachable_result = run(
         "qdbus6", "org.kde.kdeconnect", "/modules/kdeconnect",
         "org.kde.kdeconnect.daemon.devices", "true", "true",
@@ -77,12 +100,7 @@ def known_device() -> str | None:
         return preferred
     if reachable:
         return reachable[0]
-    paired_result = run(
-        "qdbus6", "org.kde.kdeconnect", "/modules/kdeconnect",
-        "org.kde.kdeconnect.daemon.devices", "false", "true",
-    )
-    paired = paired_result.stdout.split() if paired_result.returncode == 0 else []
-    return preferred if preferred in paired else (paired[0] if paired else None)
+    return paired[0] if paired else None
 
 
 def dbus_reachable(device_id: str) -> bool:
@@ -249,6 +267,131 @@ def set_plugin(setting: str, plugin: str, mode: str) -> int:
     return 0
 
 
+def list_plugins() -> int:
+    current = known_device()
+    if current is None:
+        print("[]")
+        return 0
+    supported_result = device_value(current, "supportedPlugins")
+    supported = set(supported_result.stdout.split()) if supported_result.returncode == 0 else set()
+    items = []
+    for plugin, (name, detail, icon) in PLUGIN_OPTIONS.items():
+        if plugin not in supported:
+            continue
+        enabled_result = run(
+            "qdbus6", "org.kde.kdeconnect", device_path(current),
+            "org.kde.kdeconnect.device.isPluginEnabled", plugin,
+        )
+        items.append({
+            "id": plugin,
+            "name": name,
+            "detail": detail,
+            "icon": icon,
+            "enabled": enabled_result.returncode == 0 and enabled_result.stdout.strip().lower() == "true",
+        })
+    print(json.dumps(items, ensure_ascii=False))
+    return 0
+
+
+def set_named_plugin(plugin: str, mode: str) -> int:
+    if plugin not in PLUGIN_OPTIONS:
+        print("Unsupported Caelestia Link feature", file=sys.stderr)
+        return 2
+    current = known_device()
+    if current is None:
+        print("No paired Caelestia Link device", file=sys.stderr)
+        return 2
+    enabled_result = run(
+        "qdbus6", "org.kde.kdeconnect", device_path(current),
+        "org.kde.kdeconnect.device.isPluginEnabled", plugin,
+    )
+    enabled = enabled_result.returncode == 0 and enabled_result.stdout.strip().lower() == "true"
+    enabled = not enabled if mode == "toggle" else mode == "on"
+    result = run(
+        "qdbus6", "org.kde.kdeconnect", device_path(current),
+        "org.kde.kdeconnect.device.setPluginEnabled", plugin, "true" if enabled else "false",
+    )
+    if result.returncode != 0:
+        print(result.stderr.strip(), file=sys.stderr)
+        return result.returncode
+    print("on" if enabled else "off")
+    return 0
+
+
+def list_devices() -> int:
+    result = run(
+        "qdbus6", "org.kde.kdeconnect", "/modules/kdeconnect",
+        "org.kde.kdeconnect.daemon.devices", "false", "false",
+    )
+    ids = result.stdout.split() if result.returncode == 0 else []
+    selected = str(config().get("deviceId", ""))
+    items = []
+    for device_id in ids:
+        def value(name: str) -> str:
+            response = device_value(device_id, name)
+            return response.stdout.strip() if response.returncode == 0 else ""
+        items.append({
+            "id": device_id,
+            "name": value("name") or "Unknown device",
+            "type": value("type") or "device",
+            "paired": value("isPaired").lower() == "true",
+            "reachable": value("isReachable").lower() == "true",
+            "addresses": value("reachableAddresses").split(),
+            "selected": device_id == selected,
+        })
+    items.sort(key=lambda item: (not item["selected"], not item["reachable"], item["name"].casefold()))
+    print(json.dumps(items, ensure_ascii=False))
+    return 0
+
+
+def select_device(device_id: str) -> int:
+    result = run(
+        "qdbus6", "org.kde.kdeconnect", "/modules/kdeconnect",
+        "org.kde.kdeconnect.daemon.devices", "false", "false",
+    )
+    if result.returncode != 0 or device_id not in result.stdout.split():
+        print("Unknown Caelestia Link device", file=sys.stderr)
+        return 2
+    paired = device_value(device_id, "isPaired")
+    if paired.returncode != 0 or paired.stdout.strip().lower() != "true":
+        print("Pair this device before selecting it", file=sys.stderr)
+        return 2
+    settings = config()
+    settings["deviceId"] = device_id
+    name = device_value(device_id, "name")
+    if name.returncode == 0 and name.stdout.strip():
+        settings["deviceName"] = name.stdout.strip()
+    save_config(settings)
+    status()
+    return 0
+
+
+def unpair_device(device_id: str) -> int:
+    result = run(
+        "qdbus6", "org.kde.kdeconnect", device_path(device_id),
+        "org.kde.kdeconnect.device.unpair",
+    )
+    if result.returncode != 0:
+        print(result.stderr.strip(), file=sys.stderr)
+        return result.returncode
+    settings = config()
+    if settings.get("deviceId") == device_id:
+        settings["deviceId"] = ""
+        settings["deviceName"] = "Phone"
+        save_config(settings)
+    return 0
+
+
+def pair_device(device_id: str) -> int:
+    result = run(
+        "qdbus6", "org.kde.kdeconnect", device_path(device_id),
+        "org.kde.kdeconnect.device.requestPairing",
+    )
+    if result.returncode != 0:
+        print(result.stderr.strip(), file=sys.stderr)
+    return result.returncode
+
+
 def set_clipboard_sync(mode: str) -> int:
     """Keep manual receive/send available while gating automatic sharing."""
     settings = config()
@@ -309,6 +452,82 @@ def reconcile() -> int:
     return 0
 
 
+def command_config_path(device_id: str) -> Path:
+    return Path.home() / ".config/kdeconnect" / device_id / "kdeconnect_runcommand" / "config"
+
+
+def read_commands(device_id: str) -> dict:
+    path = command_config_path(device_id)
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.startswith("commands="):
+                continue
+            encoded = line.split("=", 1)[1].strip()
+            value = json.loads(encoded) if encoded.startswith('"') else encoded
+            if value.startswith("@ByteArray(") and value.endswith(")"):
+                value = value[len("@ByteArray("):-1]
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, dict) else {}
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        pass
+    return {}
+
+
+def write_commands(device_id: str, value: dict) -> None:
+    path = command_config_path(device_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = "@ByteArray(" + json.dumps(value, ensure_ascii=False, separators=(",", ":")) + ")"
+    encoded = json.dumps(payload, ensure_ascii=False)
+    lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else ["[General]"]
+    replaced = False
+    for index, line in enumerate(lines):
+        if line.startswith("commands="):
+            lines[index] = f"commands={encoded}"
+            replaced = True
+            break
+    if not replaced:
+        if not lines or lines[0] != "[General]":
+            lines.insert(0, "[General]")
+        lines.append(f"commands={encoded}")
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    temporary.replace(path)
+    run(
+        "qdbus6", "org.kde.kdeconnect", f"/modules/kdeconnect/devices/{device_id}",
+        "org.kde.kdeconnect.device.reloadPlugins",
+    )
+
+
+def list_commands() -> int:
+    device_id = str(config().get("deviceId", ""))
+    items = [
+        {"id": key, "name": str(entry.get("name", "")), "command": str(entry.get("command", ""))}
+        for key, entry in read_commands(device_id).items()
+        if isinstance(entry, dict)
+    ] if device_id else []
+    items.sort(key=lambda item: item["name"].casefold())
+    print(json.dumps(items, ensure_ascii=False))
+    return 0
+
+
+def change_command(action: str, command_id: str, name: str, command_text: str) -> int:
+    device_id = str(config().get("deviceId", ""))
+    if not device_id:
+        print("No Caelestia Link device is configured", file=sys.stderr)
+        return 2
+    values = read_commands(device_id)
+    if action == "remove":
+        values.pop(command_id, None)
+    else:
+        if not command_text.strip():
+            print("Command cannot be empty", file=sys.stderr)
+            return 2
+        key = command_id or str(uuid.uuid4()).replace("-", "_")
+        values[key] = {"name": name.strip() or "Command", "command": command_text.strip()}
+    write_commands(device_id, values)
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -323,6 +542,27 @@ def main() -> int:
     clipboard.add_argument("mode", choices=("on", "off", "toggle"))
     notifications = commands.add_parser("notifications")
     notifications.add_argument("mode", choices=("on", "off", "toggle"))
+    commands.add_parser("plugins")
+    plugin = commands.add_parser("plugin")
+    plugin.add_argument("id")
+    plugin.add_argument("mode", choices=("on", "off", "toggle"))
+    commands.add_parser("devices")
+    select_device_parser = commands.add_parser("select-device")
+    select_device_parser.add_argument("id")
+    unpair_device_parser = commands.add_parser("unpair-device")
+    unpair_device_parser.add_argument("id")
+    pair_device_parser = commands.add_parser("pair-device")
+    pair_device_parser.add_argument("id")
+    commands.add_parser("commands")
+    add_command = commands.add_parser("command-add")
+    add_command.add_argument("name")
+    add_command.add_argument("shell_command")
+    update_command = commands.add_parser("command-update")
+    update_command.add_argument("id")
+    update_command.add_argument("name")
+    update_command.add_argument("shell_command")
+    remove_command = commands.add_parser("command-remove")
+    remove_command.add_argument("id")
     args = parser.parse_args()
 
     if args.command == "status":
@@ -339,6 +579,26 @@ def main() -> int:
         return set_clipboard_sync(args.mode)
     if args.command == "notifications":
         return set_plugin("notificationsEnabled", "kdeconnect_notifications", args.mode)
+    if args.command == "plugins":
+        return list_plugins()
+    if args.command == "plugin":
+        return set_named_plugin(args.id, args.mode)
+    if args.command == "devices":
+        return list_devices()
+    if args.command == "select-device":
+        return select_device(args.id)
+    if args.command == "unpair-device":
+        return unpair_device(args.id)
+    if args.command == "pair-device":
+        return pair_device(args.id)
+    if args.command == "commands":
+        return list_commands()
+    if args.command == "command-add":
+        return change_command("add", "", args.name, args.shell_command)
+    if args.command == "command-update":
+        return change_command("update", args.id, args.name, args.shell_command)
+    if args.command == "command-remove":
+        return change_command("remove", args.id, "", "")
     current = device()
     return subprocess.call(["kdeconnect-cli", "-d", current, "--ring"]) if current else 2
 

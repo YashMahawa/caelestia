@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+page=open
+previous=
+for argument in "$@"; do
+    if [[ "$previous" == "--plugin-config" && "$argument" == "kdeconnect_runcommand" ]]; then
+        page=openCommands
+        break
+    fi
+    previous="$argument"
+done
+
+exec /home/yash/.local/bin/caelestia-qs-ipc continuity "$page"

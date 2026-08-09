@@ -32,8 +32,6 @@ if [[ -d "$fork_src/.git" ]]; then
             cp -a "$fork_src/$entry" "$stage/caelestia/"
         fi
     done
-elif [[ -d "$user_home/CaelestiaUpdateCenter/caelestia-overrides" ]]; then
-    cp -a "$user_home/CaelestiaUpdateCenter/caelestia-overrides/." "$stage/caelestia/"
 fi
 
 # Removed custom surfaces must not be resurrected by an older package tree.

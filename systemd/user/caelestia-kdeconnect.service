@@ -2,12 +2,17 @@
 Description=Caelestia Link LAN transport
 After=graphical-session.target network.target
 PartOf=graphical-session.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
+Environment=QT_QPA_PLATFORM=wayland
+Environment=PATH=/home/yash/.local/bin:/usr/local/bin:/usr/bin
 ExecStart=/usr/bin/kdeconnectd --replace
+ExecStartPost=/home/yash/.local/bin/caelestia-continuity reconcile
 Restart=on-failure
-RestartSec=2
+RestartSec=5
 NoNewPrivileges=true
 
 [Install]

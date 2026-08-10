@@ -76,20 +76,22 @@ for _ in $(/usr/bin/seq 1 20); do
     /usr/bin/sleep 0.5
 done
 
-# Restart only after the complete grace period. This is a last-resort recovery,
-# not a normal part of resume.
-log "resume recovery: IPC unavailable after grace period; restarting Caelestia once"
-if ! run_user /usr/bin/systemctl --user restart caelestia-quickshell.service >> "$LOG" 2>&1; then
-    log "resume recovery: restart failed"
-    exit 0
-fi
-
-for _ in $(/usr/bin/seq 1 30); do
-    if qs_ipc lock safeLock >> "$LOG" 2>&1; then
-        log "resume recovery: replacement shell is ready and locked"
+# Never restart the shell from resume recovery. The user service already has
+# Restart=on-failure, so a genuine crash will be replaced by systemd while a
+# merely slow monitor handshake is left alone. Wait for either the original or
+# replacement process and restore the lock as soon as its IPC becomes ready.
+log "resume recovery: IPC unavailable after initial grace period; waiting for service recovery"
+for _ in $(/usr/bin/seq 1 40); do
+    lock_state="$(qs_ipc lock isLocked 2>/dev/null || true)"
+    if [[ "$lock_state" == "true" ]]; then
+        log "resume recovery: shell recovered and is already locked"
+        exit 0
+    fi
+    if [[ "$lock_state" == "false" ]] && qs_ipc lock safeLock >> "$LOG" 2>&1; then
+        log "resume recovery: shell recovered and lock restored"
         exit 0
     fi
     /usr/bin/sleep 0.5
 done
 
-log "resume recovery: replacement shell did not become ready"
+log "resume recovery: shell IPC did not recover; leaving service lifecycle untouched"

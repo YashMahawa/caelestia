@@ -1,27 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-IPC="${HOME}/.local/bin/caelestia-qs-ipc"
-
-if ! timeout 4 "$IPC" lock safeLock >/dev/null 2>&1; then
-    notify-send -u critical "Suspend cancelled" "Caelestia could not confirm the lock screen."
+# Locking belongs to caelestia-pre-sleep-lock.service so lid-close, idle and
+# manual requests all follow the same fail-closed path without racing QML.
+if ! systemctl is-enabled --quiet caelestia-pre-sleep-lock.service; then
+    notify-send -u critical "Suspend cancelled" "The Caelestia pre-sleep lock service is not installed."
     exit 1
 fi
-
-locked=false
-for _ in {1..15}; do
-    if timeout 2 "$IPC" lock isLocked 2>/dev/null | grep -qx true; then
-        locked=true
-        break
-    fi
-    sleep 0.2
-done
-
-if [[ "$locked" != true ]]; then
-    notify-send -u critical "Suspend cancelled" "The session did not lock safely."
-    exit 1
-fi
-
-# Let the lock surface finish one frame before outputs enter low-power state.
-sleep 0.5
 exec systemctl suspend

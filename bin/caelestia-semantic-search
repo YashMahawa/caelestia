@@ -1,2 +1,12 @@
 #!/bin/sh
-exec /home/yash/.local/share/caelestia-search/semantic_search.py "$@"
+data_home="${XDG_DATA_HOME:-$HOME/.local/share}"
+search_script="$data_home/caelestia-search/semantic_search.py"
+python_bin="${CAELESTIA_SEARCH_PYTHON:-}"
+if [ -z "$python_bin" ]; then
+    if [ -x "$HOME/ML/.venv/bin/python" ]; then
+        python_bin="$HOME/ML/.venv/bin/python"
+    else
+        python_bin="$(command -v python3)"
+    fi
+fi
+exec "$python_bin" "$search_script" "$@"

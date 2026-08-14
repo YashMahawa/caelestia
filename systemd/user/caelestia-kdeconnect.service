@@ -8,9 +8,9 @@ StartLimitBurst=5
 [Service]
 Type=simple
 Environment=QT_QPA_PLATFORM=wayland
-Environment=PATH=/home/yash/.local/bin:/usr/local/bin:/usr/bin
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin
 ExecStart=/usr/bin/kdeconnectd --replace
-ExecStartPost=/home/yash/.local/bin/caelestia-continuity reconcile
+ExecStartPost=%h/.local/bin/caelestia-continuity reconcile
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=true

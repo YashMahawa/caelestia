@@ -6,10 +6,10 @@ PartOf=graphical-session.target
 
 [Service]
 Type=simple
-ExecStartPre=/home/yash/.local/bin/caelestia-display auto
-ExecStartPre=/home/yash/.local/bin/caelestia-qs-clean-runtime
-ExecStart=/home/yash/.local/bin/caelestia-qs-launch
-ExecStartPost=/home/yash/.local/bin/caelestia-lock-recover
+ExecStartPre=%h/.local/bin/caelestia-display auto
+ExecStartPre=%h/.local/bin/caelestia-qs-clean-runtime
+ExecStart=%h/.local/bin/caelestia-qs-launch
+ExecStartPost=%h/.local/bin/caelestia-lock-recover
 ExecStop=/usr/sbin/qs kill -c caelestia
 Restart=on-failure
 RestartSec=2

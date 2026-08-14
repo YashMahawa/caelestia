@@ -1,4 +1,4 @@
-#!/home/yash/ML/.venv/bin/python
+#!/usr/bin/env python3
 """Selective, local, event-driven semantic file search for Caelestia."""
 
 from __future__ import annotations
@@ -139,7 +139,7 @@ def supported(path: Path, cfg: dict) -> bool:
 
 
 def roots(cfg: dict) -> list[Path]:
-    found = [Path(p) for p in cfg["roots"] if Path(p).is_dir()]
+    found = [Path(p).expanduser() for p in cfg["roots"] if Path(p).expanduser().is_dir()]
     if cfg.get("discover_top_level_projects", True):
         # Deliberately only an ls-like one-level probe of $HOME.
         try:

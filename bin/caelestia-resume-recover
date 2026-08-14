@@ -1,10 +1,8 @@
 #!/usr/bin/env bash
 set -u
 
-LOG="/var/log/caelestia-resume-recover.log"
-
 log() {
-    printf '%s %s\n' "$(date --iso-8601=seconds)" "$*" >> "$LOG" 2>/dev/null || true
+    printf '%s\n' "$*" >&2
 }
 
 session_id=""
@@ -66,7 +64,7 @@ for _ in $(/usr/bin/seq 1 20); do
         exit 0
     fi
     if [[ "$lock_state" == "false" ]]; then
-        if qs_ipc lock safeLock >> "$LOG" 2>&1; then
+        if qs_ipc lock safeLock >&2; then
             log "resume recovery: existing shell is healthy; lock restored"
         else
             log "resume recovery: existing shell responded but lock request failed"
@@ -87,7 +85,7 @@ for _ in $(/usr/bin/seq 1 40); do
         log "resume recovery: shell recovered and is already locked"
         exit 0
     fi
-    if [[ "$lock_state" == "false" ]] && qs_ipc lock safeLock >> "$LOG" 2>&1; then
+    if [[ "$lock_state" == "false" ]] && qs_ipc lock safeLock >&2; then
         log "resume recovery: shell recovered and lock restored"
         exit 0
     fi

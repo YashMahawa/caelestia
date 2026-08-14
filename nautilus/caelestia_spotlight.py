@@ -1,6 +1,7 @@
 """Expose Caelestia Spotlight from Nautilus context menus."""
 
 import subprocess
+from pathlib import Path
 
 from gi.repository import GObject, Nautilus
 
@@ -8,7 +9,7 @@ from gi.repository import GObject, Nautilus
 class CaelestiaSpotlight(GObject.GObject, Nautilus.MenuProvider):
     def _open(self, _item, *_args):
         subprocess.Popen(
-            ["/home/yash/.local/bin/caelestia-launcher"],
+            [str(Path.home() / ".local/bin/caelestia-launcher")],
             start_new_session=True,
         )
 

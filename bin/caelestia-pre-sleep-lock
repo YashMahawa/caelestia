@@ -1,10 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-LOG="/var/log/caelestia-sleep-guard.log"
-
 log() {
-    printf '%s %s\n' "$(date --iso-8601=seconds)" "$*" >> "$LOG" 2>/dev/null || true
+    printf '%s\n' "$*" >&2
 }
 
 session_id=""
@@ -57,7 +55,7 @@ if [[ ! -x "$ipc" ]]; then
 fi
 
 log "pre-sleep: requesting Caelestia lock for ${user_name} (session ${session_id})"
-if ! run_user /usr/bin/timeout 4 "$ipc" lock safeLock >> "$LOG" 2>&1; then
+if ! run_user /usr/bin/timeout 4 "$ipc" lock safeLock >&2; then
     log "pre-sleep: lock request failed; refusing unsafe sleep"
     exit 1
 fi

@@ -1,4 +1,4 @@
-#!/home/yash/ML/.venv/bin/python
+#!/usr/bin/env python3
 """Bounded SigLIP2 visual labelling for Caelestia semantic image search."""
 
 from __future__ import annotations

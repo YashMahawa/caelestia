@@ -17,7 +17,7 @@ CONFIG = HOME / ".config/caelestia/semantic-search.json"
 DB = HOME / ".local/share/caelestia-search/index.sqlite3"
 CFG = json.loads(CONFIG.read_text())
 EXCLUDED_DIRECTORIES = set(CFG["exclude_directories"])
-WATCH_ROOTS = {Path(raw) for raw in CFG["roots"]}
+WATCH_ROOTS = {Path(raw).expanduser() for raw in CFG["roots"]}
 CONTENT_EXTENSIONS = {
     ".txt", ".md", ".markdown", ".rst", ".org", ".tex", ".csv", ".tsv",
     ".json", ".jsonl", ".yaml", ".yml", ".toml", ".ini", ".conf", ".log",

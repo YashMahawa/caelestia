@@ -9,7 +9,7 @@ import psutil
 import json
 
 DB_MEM_PATH = "/dev/shm/caelestia-blackbox.db"
-DB_PERSIST_DIR = "/home/yash/.local/share/caelestia"
+DB_PERSIST_DIR = os.path.join(os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share")), "caelestia")
 DB_PERSIST_PATH = os.path.join(DB_PERSIST_DIR, "blackbox_archive.db")
 POLL_INTERVAL = 2.0  # seconds
 KEEP_WINDOW = 900.0  # 15 minutes in seconds

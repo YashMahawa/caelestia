@@ -5,7 +5,7 @@ PartOf=graphical-session.target
 
 [Service]
 Type=simple
-ExecStart=/home/yash/.local/bin/caelestia-clipboard serve
+ExecStart=%h/.local/bin/caelestia-clipboard serve
 Restart=on-failure
 RestartSec=2
 Environment=PYTHONUNBUFFERED=1

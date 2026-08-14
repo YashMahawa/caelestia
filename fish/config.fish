@@ -52,4 +52,4 @@ end
 
 
 # Added by Antigravity CLI installer
-set -gx PATH "/home/yash/.local/bin" $PATH
+fish_add_path --prepend "$HOME/.local/bin"

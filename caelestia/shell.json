@@ -71,7 +71,7 @@
                 },
                 {
                     "idleAction": [
-                        "/home/yash/.local/bin/caelestia-safe-suspend"
+                        "caelestia-safe-suspend"
                     ],
                     "respectInhibitors": true,
                     "returnAction": null,

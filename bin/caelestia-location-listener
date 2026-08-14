@@ -3,6 +3,9 @@ import socket
 import subprocess
 import sys
 import json
+from pathlib import Path
+
+LOCAL_BIN = Path.home() / ".local/bin"
 
 SPECIAL_KEYS = {
     1: "BackSpace",
@@ -120,7 +123,7 @@ def main():
                         lon = float(parts[1])
                         coords = f"{lat},{lon}"
                         print(f"Coordinates received from {addr}: {coords}. Updating Caelestia...")
-                        subprocess.run(["/home/yash/.local/bin/caelestia-update-location", coords], check=True)
+                        subprocess.run([str(LOCAL_BIN / "caelestia-update-location"), coords], check=True)
                     except ValueError:
                         print("Invalid numeric coordinates received.")
         except KeyboardInterrupt:

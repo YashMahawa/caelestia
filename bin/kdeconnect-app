@@ -11,4 +11,4 @@ for argument in "$@"; do
     previous="$argument"
 done
 
-exec /home/yash/.local/bin/caelestia-qs-ipc continuity "$page"
+exec "$HOME/.local/bin/caelestia-qs-ipc" continuity "$page"

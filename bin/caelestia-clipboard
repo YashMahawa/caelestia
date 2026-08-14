@@ -4,27 +4,76 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import mimetypes
 import os
 import sqlite3
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.parse
-import stat
 from pathlib import Path
 
 HOME = Path.home()
-DATA = HOME / ".local/share/caelestia-clipboard"
+DATA_HOME = Path(os.environ.get("XDG_DATA_HOME", HOME / ".local/share"))
+STATE_HOME = Path(os.environ.get("XDG_STATE_HOME", HOME / ".local/state"))
+CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config"))
+DATA = DATA_HOME / "caelestia-clipboard"
 FILES = DATA / "items"
 DB = DATA / "history.sqlite3"
-STATE = HOME / ".local/state/caelestia/clipboard-history.json"
-CONFIG = HOME / ".config/caelestia/clipboard.json"
+STATE = STATE_HOME / "caelestia/clipboard-history.json"
+STATE_LOCK = STATE_HOME / "caelestia/clipboard-history.lock"
+CONFIG = CONFIG_HOME / "caelestia/clipboard.json"
+OCR_LOCKS = DATA / "ocr-locks"
 MAX_ITEMS = 100
 MAX_TEXT = 2 * 1024 * 1024
 MAX_IMAGE = 30 * 1024 * 1024
+
+
+def atomic_write(path: Path, data: bytes, mode: int = 0o600) -> None:
+    """Durably replace *path* without shared .tmp names or partial files."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        os.fchmod(descriptor, mode)
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(path)
+    except BaseException:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def atomic_write_text(path: Path, value: str) -> None:
+    atomic_write(path, value.encode("utf-8"))
+
+
+def store_blob(path: Path, data: bytes) -> None:
+    if not path.exists():
+        atomic_write(path, data)
+
+
+def schedule_worker(command: str, *args: object) -> None:
+    """Run expensive maintenance outside wl-paste's event callback."""
+    subprocess.Popen(
+        [sys.executable, str(Path(__file__).resolve()), command, *(str(arg) for arg in args)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+    )
 
 
 def retention_days() -> int:
@@ -38,14 +87,12 @@ def retention_days() -> int:
 def set_retention(days: int) -> int:
     if days not in {1, 2, 7}:
         return 2
-    CONFIG.parent.mkdir(parents=True, exist_ok=True)
-    temporary = CONFIG.with_suffix(".tmp")
-    temporary.write_text(json.dumps({"retentionDays": days}, indent=2) + "\n", encoding="utf-8")
-    temporary.replace(CONFIG)
+    atomic_write_text(CONFIG, json.dumps({"retentionDays": days}, indent=2) + "\n")
     connection = setup()
     prune(connection)
     connection.commit()
     export_state(connection)
+    connection.close()
     print(days)
     return 0
 
@@ -73,6 +120,8 @@ def run(*args: str, input_data: bytes | None = None, timeout: int = 20) -> subpr
         return subprocess.run(args, input=input_data, capture_output=True, check=False, timeout=timeout)
     except subprocess.TimeoutExpired:
         return subprocess.CompletedProcess(args, 124, b"", b"timed out")
+    except OSError as error:
+        return subprocess.CompletedProcess(args, 127, b"", str(error).encode())
 
 
 def ocr_image(path: str | Path) -> str:
@@ -98,8 +147,9 @@ def ocr_image(path: str | Path) -> str:
     return text
 
 
-def backfill_ocr(connection: sqlite3.Connection, limit: int = 8) -> None:
+def backfill_ocr(limit: int = 8) -> None:
     """Fill OCR text for recent images still labeled as placeholders."""
+    connection = setup()
     rows = connection.execute(
         """SELECT id, path, text FROM items
            WHERE kind='image' AND path != ''
@@ -107,29 +157,25 @@ def backfill_ocr(connection: sqlite3.Connection, limit: int = 8) -> None:
            ORDER BY created DESC LIMIT ?""",
         (limit,),
     ).fetchall()
-    changed = False
-    for item_id, path, _text in rows:
-        ocr = ocr_image(path)
-        if not ocr:
-            continue
-        connection.execute("UPDATE items SET text=? WHERE id=?", (ocr, item_id))
-        changed = True
-    if changed:
-        connection.commit()
+    connection.close()
+    for item_id, _path, _text in rows:
+        ensure_ocr(item_id)
 
 
 def export_state(connection: sqlite3.Connection) -> None:
-    rows = connection.execute(
-        "SELECT id,kind,mime,text,path,created,pinned FROM items ORDER BY pinned DESC,created DESC LIMIT ?", (MAX_ITEMS,)
-    ).fetchall()
-    payload = [
-        {"id": row[0], "kind": row[1], "mime": row[2], "text": row[3],
-         "path": row[4], "created": row[5], "pinned": bool(row[6])}
-        for row in rows
-    ]
-    temporary = STATE.with_suffix(".tmp")
-    temporary.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-    temporary.replace(STATE)
+    STATE_LOCK.parent.mkdir(parents=True, exist_ok=True)
+    with STATE_LOCK.open("a+b") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        rows = connection.execute(
+            "SELECT id,kind,mime,text,path,created,pinned FROM items ORDER BY pinned DESC,created DESC LIMIT ?",
+            (MAX_ITEMS,),
+        ).fetchall()
+        payload = [
+            {"id": row[0], "kind": row[1], "mime": row[2], "text": row[3],
+             "path": row[4], "created": row[5], "pinned": bool(row[6])}
+            for row in rows
+        ]
+        atomic_write_text(STATE, json.dumps(payload, ensure_ascii=False))
 
 
 def offered_types() -> list[str]:
@@ -186,10 +232,9 @@ def capture() -> int:
     if kind == "image":
         extension = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp", "image/bmp": ".bmp"}.get(mime, ".img")
         target = FILES / f"{digest}{extension}"
-        if not target.exists():
-            target.write_bytes(data)
+        store_blob(target, data)
         path = str(target)
-        text = ocr_image(target)
+        text = "Scanning…"
     else:
         text = data.decode("utf-8", "replace").replace("\x00", "").strip()
         if not text:
@@ -206,6 +251,11 @@ def capture() -> int:
     prune(connection)
     connection.commit()
     export_state(connection)
+    if kind == "image":
+        item_id = connection.execute("SELECT id FROM items WHERE digest=?", (digest,)).fetchone()
+        if item_id:
+            schedule_worker("ocr", item_id[0])
+    connection.close()
     return 0
 
 
@@ -225,13 +275,14 @@ def capture_stdin() -> int:
     if image:
         mime, extension = image
         target = FILES / f"{digest}{extension}"
-        if not target.exists():
-            target.write_bytes(data)
-        label = ocr_image(target)
+        store_blob(target, data)
+        label = "Scanning…"
         connection.execute(
             """INSERT INTO items(digest,kind,mime,text,path,created) VALUES(?,?,?,?,?,?)
             ON CONFLICT(digest) DO UPDATE SET created=excluded.created,
-              text=CASE WHEN excluded.text != '' THEN excluded.text ELSE items.text END""",
+              text=CASE
+                WHEN items.text='' OR items.text='Copied image' OR items.text='Image' OR items.text='Scanning…'
+                THEN excluded.text ELSE items.text END""",
             (digest, "image", mime, label, str(target), now),
         )
     else:
@@ -250,6 +301,11 @@ def capture_stdin() -> int:
     prune(connection)
     connection.commit()
     export_state(connection)
+    if image:
+        item_id = connection.execute("SELECT id FROM items WHERE digest=?", (digest,)).fetchone()
+        if item_id:
+            schedule_worker("ocr", item_id[0])
+    connection.close()
     return 0
 
 
@@ -276,14 +332,18 @@ def copy_text(item_id: int) -> int:
     connection = setup()
     row = item(connection, item_id)
     if row is None:
+        connection.close()
         return 1
     _, kind, _mime, text, path = row
+    connection.close()
     if kind == "image" and (not text or text in {"Copied image", "Image", "Scanning…"}):
         text = ocr_image(path)
         if text:
+            connection = setup()
             connection.execute("UPDATE items SET text=? WHERE id=?", (text, item_id))
             connection.commit()
             export_state(connection)
+            connection.close()
     if not text or text in {"Copied image", "Image", "Scanning…"}:
         return 2
     process = subprocess.Popen(
@@ -296,28 +356,39 @@ def copy_text(item_id: int) -> int:
 
 def ensure_ocr(item_id: int) -> int:
     """OCR an image item and write text into history (idempotent)."""
-    connection = setup()
-    row = item(connection, item_id)
-    if row is None or row[1] != "image" or not row[4]:
-        return 1
-    if row[3] and row[3] not in {"Copied image", "Image", "Scanning…"}:
-        print(row[3])
+    OCR_LOCKS.mkdir(parents=True, exist_ok=True)
+    with (OCR_LOCKS / f"{item_id}.lock").open("a+b") as worker_lock:
+        try:
+            fcntl.flock(worker_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return 0
+
+        connection = setup()
+        row = item(connection, item_id)
+        connection.close()
+        if row is None or row[1] != "image" or not row[4]:
+            return 1
+        if row[3] and row[3] not in {"Copied image", "Image", "Scanning…"}:
+            print(row[3])
+            return 0
+
+        text = ocr_image(row[4])
+        if not text:
+            return 2
+        connection = setup()
+        connection.execute("UPDATE items SET text=? WHERE id=?", (text, item_id))
+        connection.commit()
+        export_state(connection)
+        connection.close()
+        print(text)
         return 0
-    text = ocr_image(row[4])
-    if not text:
-        return 2
-    connection.execute("UPDATE items SET text=? WHERE id=?", (text, item_id))
-    connection.commit()
-    export_state(connection)
-    print(text)
-    return 0
 
 
 def reachable_device() -> str | None:
     result = run("kdeconnect-cli", "--list-available", "--id-only")
     devices = result.stdout.decode().split()
     preferred = ""
-    continuity_config = Path.home() / ".config/caelestia/continuity.json"
+    continuity_config = CONFIG_HOME / "caelestia/continuity.json"
     if continuity_config.exists():
         try:
             preferred = str(json.loads(continuity_config.read_text(encoding="utf-8")).get("deviceId", ""))
@@ -358,9 +429,17 @@ def send_clipboard_item(item_id: int) -> int:
     # image in its Download folder.
     if row[1] == "image":
         return send_item(item_id)
-    if copy_item(item_id) != 0:
-        return 1
-    return subprocess.call(["kdeconnect-cli", "-d", device, "--send-clipboard"])
+    if row[1] == "text":
+        # Send the selected history text as packet data.  The old path first
+        # replaced the Wayland clipboard and immediately asked KDE Connect's
+        # Qt clipboard listener to read it.  That listener updates
+        # asynchronously, so it could send the previous value (especially for
+        # larger or unusual Unicode payloads).  Caelestia Link's share-text
+        # receiver writes the received text directly to Android's clipboard,
+        # avoiding both the clipboard-owner race and an unnecessary local
+        # clipboard mutation.
+        return subprocess.call(["kdeconnect-cli", "-d", device, "--share-text", row[3]])
+    return send_item(item_id)
 
 
 def send_latest() -> int:
@@ -378,11 +457,7 @@ def send_text(text: str) -> int:
     device = reachable_device()
     if device is None or not text:
         return 2
-    process = subprocess.Popen(["wl-copy", "--type", "text/plain;charset=utf-8"], stdin=subprocess.PIPE)
-    process.communicate(text.encode("utf-8"))
-    if process.returncode not in (0, None):
-        return process.returncode
-    return subprocess.call(["kdeconnect-cli", "-d", device, "--send-clipboard"])
+    return subprocess.call(["kdeconnect-cli", "-d", device, "--share-text", text])
 
 
 def send_paths(values: list[str]) -> int:
@@ -454,13 +529,14 @@ def add_path(value: str) -> int:
         data = source.read_bytes()
         digest = hashlib.sha256(data).hexdigest()
         target = FILES / f"{digest}{source.suffix.lower()}"
-        if not target.exists():
-            target.write_bytes(data)
-        label = ocr_image(target) or source.name
+        store_blob(target, data)
+        label = "Scanning…"
         connection.execute(
             """INSERT INTO items(digest,kind,mime,text,path,created) VALUES(?,?,?,?,?,?)
             ON CONFLICT(digest) DO UPDATE SET created=excluded.created,
-              text=CASE WHEN excluded.text != '' THEN excluded.text ELSE items.text END""",
+              text=CASE
+                WHEN items.text='' OR items.text='Copied image' OR items.text='Image' OR items.text='Scanning…'
+                THEN excluded.text ELSE items.text END""",
             (digest, "image", mime, label, str(target), now),
         )
     else:
@@ -474,6 +550,11 @@ def add_path(value: str) -> int:
     prune(connection)
     connection.commit()
     export_state(connection)
+    if source.is_file() and mime.startswith("image/") and source.stat().st_size <= MAX_IMAGE:
+        item_id = connection.execute("SELECT id FROM items WHERE digest=?", (digest,)).fetchone()
+        if item_id:
+            schedule_worker("ocr", item_id[0])
+    connection.close()
     return 0
 
 
@@ -504,11 +585,9 @@ def serve() -> int:
             if not os.environ.get("WAYLAND_DISPLAY"):
                 time.sleep(1)
     connection = setup()
-    try:
-        backfill_ocr(connection, limit=12)
-    except Exception:
-        pass
     export_state(connection)
+    connection.close()
+    schedule_worker("backfill-ocr", 12)
     command = ["wl-paste", "--watch", str(Path(__file__).resolve()), "capture-stdin"]
     while True:
         process = subprocess.Popen(command)
@@ -524,6 +603,8 @@ def main() -> int:
     sub.add_parser("serve")
     sub.add_parser("capture")
     sub.add_parser("capture-stdin")
+    backfill = sub.add_parser("backfill-ocr")
+    backfill.add_argument("limit", type=int, nargs="?", default=12)
     sub.add_parser("clear")
     sub.add_parser("send-latest")
     sub.add_parser("retention-status")
@@ -545,6 +626,12 @@ def main() -> int:
     if args.command == "serve": return serve()
     if args.command == "capture": return capture()
     if args.command == "capture-stdin": return capture_stdin()
+    if args.command == "backfill-ocr":
+        backfill_ocr(limit=max(1, min(args.limit, 50)))
+        connection = setup()
+        export_state(connection)
+        connection.close()
+        return 0
     if args.command == "clear": return clear()
     if args.command == "send-latest": return send_latest()
     if args.command == "retention-status":

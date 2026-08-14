@@ -7,7 +7,7 @@ Before=caelestia-quickshell.service
 
 [Service]
 Type=simple
-ExecStart=/home/yash/.local/bin/caelestia-display watch
+ExecStart=%h/.local/bin/caelestia-display watch
 Restart=on-failure
 RestartSec=1
 

@@ -13,7 +13,7 @@ service_active() {
 }
 
 shell_toast() {
-    /home/yash/.local/bin/caelestia-qs-ipc toaster info "$1" "$2" "$3" >/dev/null 2>&1 || true
+    "$HOME/.local/bin/caelestia-qs-ipc" toaster info "$1" "$2" "$3" >/dev/null 2>&1 || true
 }
 
 signal_power_daemon() {

@@ -44,7 +44,7 @@ case "$action" in
             timing=(--on-calendar="$when")
         fi
         systemd-run --user --unit="$unit" --collect "${timing[@]}" \
-            /home/yash/.local/bin/caelestia-run "$profile" "$@"
+            "$HOME/.local/bin/caelestia-run" "$profile" "$@"
         ;;
     *)
         usage

@@ -73,6 +73,14 @@ function confirm-overwrite -a path
     return 0
 end
 
+function install-copy -a source destination
+    # Keep the installed desktop independent from the location of this clone.
+    # cp -a preserves executable bits and directory structure without leaving
+    # absolute repository symlinks behind.
+    mkdir -p (path dirname $destination)
+    cp -a $source $destination
+end
+
 
 # Variables
 set -q _flag_noconfirm && set noconfirm '--noconfirm'
@@ -164,7 +172,7 @@ fish -c 'rm -f caelestia-meta-*.pkg.tar.zst' 2> /dev/null
 # Install hypr* configs
 if confirm-overwrite $config/hypr
     log 'Installing hypr* configs...'
-    ln -s (realpath hypr) $config/hypr
+    install-copy hypr $config/hypr
     chmod u+x $config/hypr/scripts/wsaction.fish $config/hypr/scripts/screenshot.fish
     hyprctl reload
 end
@@ -172,37 +180,37 @@ end
 # Starship
 if confirm-overwrite $config/starship.toml
     log 'Installing starship config...'
-    ln -s (realpath starship.toml) $config/starship.toml
+    install-copy starship.toml $config/starship.toml
 end
 
 # Foot
 if confirm-overwrite $config/foot
     log 'Installing foot config...'
-    ln -s (realpath foot) $config/foot
+    install-copy foot $config/foot
 end
 
 # Fish
 if confirm-overwrite $config/fish
     log 'Installing fish config...'
-    ln -s (realpath fish) $config/fish
+    install-copy fish $config/fish
 end
 
 # Fastfetch
 if confirm-overwrite $config/fastfetch
     log 'Installing fastfetch config...'
-    ln -s (realpath fastfetch) $config/fastfetch
+    install-copy fastfetch $config/fastfetch
 end
 
 # Uwsm
 if confirm-overwrite $config/uwsm
     log 'Installing uwsm config...'
-    ln -s (realpath uwsm) $config/uwsm
+    install-copy uwsm $config/uwsm
 end
 
 # Btop
 if confirm-overwrite $config/btop
     log 'Installing btop config...'
-    ln -s (realpath btop) $config/btop
+    install-copy btop $config/btop
 end
 
 # Install spicetify
@@ -222,7 +230,7 @@ if set -q _flag_spotify
     # Install configs
     if confirm-overwrite $config/spicetify
         log 'Installing spicetify config...'
-        ln -s (realpath spicetify) $config/spicetify
+        install-copy spicetify $config/spicetify
 
         # Set spicetify configs
         spicetify config current_theme caelestia color_scheme caelestia custom_apps marketplace 2> /dev/null
@@ -243,9 +251,9 @@ if set -q _flag_vscode
     # Install configs
     if confirm-overwrite $folder/settings.json && confirm-overwrite $folder/keybindings.json && confirm-overwrite $config/$prog-flags.conf
         log "Installing vs$prog config..."
-        ln -s (realpath vscode/settings.json) $folder/settings.json
-        ln -s (realpath vscode/keybindings.json) $folder/keybindings.json
-        ln -s (realpath vscode/flags.conf) $config/$prog-flags.conf
+        install-copy vscode/settings.json $folder/settings.json
+        install-copy vscode/keybindings.json $folder/keybindings.json
+        install-copy vscode/flags.conf $config/$prog-flags.conf
 
         # Install extension
         $prog --install-extension vscode/caelestia-vscode-integration/caelestia-vscode-integration-*.vsix
@@ -271,10 +279,19 @@ if set -q _flag_zen
     $aur_helper -S --needed zen-browser-bin $noconfirm
 
     # Install userChrome css
-    set -l chrome $HOME/.zen/*/chrome
-    if confirm-overwrite $chrome/userChrome.css
-        log 'Installing zen userChrome...'
-        ln -s (realpath zen/userChrome.css) $chrome/userChrome.css
+    set -l chrome_dirs
+    if test -d $HOME/.zen
+        set chrome_dirs (find $HOME/.zen -mindepth 2 -maxdepth 2 -type d -name chrome -print 2>/dev/null)
+    end
+    if test (count $chrome_dirs) -eq 0
+        log 'Zen has no profile yet; skipping userChrome.css until Zen has been launched once.'
+    else
+        for chrome in $chrome_dirs
+            if confirm-overwrite $chrome/userChrome.css
+                log "Installing Zen userChrome for $chrome..."
+                install-copy zen/userChrome.css $chrome/userChrome.css
+            end
+        end
     end
 
     # Install native app
@@ -291,7 +308,7 @@ if set -q _flag_zen
     if confirm-overwrite $lib/caelestiafox
         log 'Installing zen native app...'
         mkdir -p $lib
-        ln -s (realpath zen/native_app/app.fish) $lib/caelestiafox
+        install-copy zen/native_app/app.fish $lib/caelestiafox
     end
 
     # Prompt user to install extension

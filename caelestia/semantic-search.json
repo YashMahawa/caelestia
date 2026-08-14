@@ -1,17 +1,11 @@
 {
   "roots": [
-    "/home/yash/Desktop",
-    "/home/yash/Documents",
-    "/home/yash/Downloads",
-    "/home/yash/Pictures",
-    "/home/yash/Videos",
-    "/home/yash/Music",
-    "/home/yash/Projects",
-    "/home/yash/Ob",
-    "/home/yash/Obsidian",
-    "/home/yash/Acads",
-    "/home/yash/ML",
-    "/home/yash/caelestia-repo-work"
+    "~/Desktop",
+    "~/Documents",
+    "~/Downloads",
+    "~/Pictures",
+    "~/Videos",
+    "~/Music"
   ],
   "discover_top_level_projects": false,
   "exclude_directories": [

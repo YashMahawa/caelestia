@@ -34,8 +34,16 @@ find "$HOME/.cache/pip/http-v2" -type f -atime +60 -delete 2>/dev/null || true
 find "$HOME/.cache/pip/http-v2" -depth -type d -empty -delete 2>/dev/null || true
 
 # Avoid unlimited package/build cache growth while retaining normal hot caches.
+python_bin="${CAELESTIA_PYTHON:-}"
+if [[ -z "$python_bin" ]]; then
+    if [[ -x "$HOME/ML/.venv/bin/python" ]]; then
+        python_bin="$HOME/ML/.venv/bin/python"
+    else
+        python_bin="$(command -v python3 || true)"
+    fi
+fi
 clean_if_oversize "$HOME/.cache/pip" 5120 \
-    /home/yash/ML/.venv/bin/python -m pip cache purge
+    "${python_bin:-/usr/bin/false}" -m pip cache purge
 clean_if_oversize "$HOME/.npm" 8192 npm cache clean --force
 clean_if_oversize "$HOME/.cache/yarn" 3072 yarn cache clean
 clean_if_oversize "$HOME/.cache/go-build" 4096 go clean -cache -testcache

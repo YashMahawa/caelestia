@@ -21,11 +21,32 @@ CONTROL_CONF = Path.home() / ".config/hypr/caelestia-display.conf"
 RUNTIME_MONITORS_CONF = Path.home() / ".config/hypr/caelestia-monitors-runtime.conf"
 MONITORS_CONF = Path.home() / ".config/hypr/monitors.conf"
 HYPR_CONF = Path.home() / ".config/hypr/hyprland.conf"
+HYPR_SET = Path.home() / ".local/bin/caelestia-hypr-set"
 VALID_NAME = re.compile(r"^[A-Za-z0-9_.:-]+$")
 VALID_RESOLUTION = re.compile(r"^\d+x\d+@[\d.]+$")
 VALID_POSITION = re.compile(r"^-?\d+x-?\d+$")
 FALLBACK_WORKSPACE = "__caelestia_fallback"
 APPLY_LOCK = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / "caelestia-display.lock"
+BACKLIGHT_DIR = Path("/sys/class/backlight/intel_backlight")
+BACKLIGHT_STATE = STATE_DIR / "internal-backlight"
+EXTERNAL_WORKSPACE_STATE = STATE_DIR / "external-workspace"
+DISPLAY_MODE_STATE = STATE_DIR / "display-mode"
+WORKSPACE_LAYOUT_STATE = STATE_DIR / "display-workspace-layout.json"
+POWER_LOSS_STATE = STATE_DIR / "display-power-loss.json"
+DISPLAY_MODES = {"extend", "mirror", "laptop", "external"}
+MONITOR_HEALTH_INTERVAL = 1.0
+MONITOR_FAILURE_THRESHOLD = 2
+MONITOR_RECOVERY_THRESHOLD = 2
+RESUME_GRACE_SECONDS = 10.0
+SUSPEND_OFFSET_THRESHOLD = 0.5
+
+
+def suspend_clock_offset() -> float:
+    """Return time spent suspended since boot, using kernel clock semantics."""
+    try:
+        return time.clock_gettime(time.CLOCK_BOOTTIME) - time.monotonic()
+    except (AttributeError, OSError):
+        return 0.0
 
 
 def ensure_hypr_environment() -> None:
@@ -59,6 +80,142 @@ def monitors() -> list[dict]:
 def workspaces() -> list[dict]:
     value = hypr_json("workspaces")
     return value if isinstance(value, list) else []
+
+
+def remember_external_workspace(name: str) -> None:
+    if not name or len(name) > 128:
+        return
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        if EXTERNAL_WORKSPACE_STATE.exists() and EXTERNAL_WORKSPACE_STATE.read_text(
+            encoding="utf-8"
+        ).strip() == name:
+            return
+        EXTERNAL_WORKSPACE_STATE.write_text(f"{name}\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
+def remembered_external_workspace() -> str:
+    try:
+        return EXTERNAL_WORKSPACE_STATE.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def save_workspace_layout(values: list[dict] | None = None) -> None:
+    """Persist workspace ownership while at least two physical outputs exist."""
+    values = values if values is not None else monitors()
+    physical = [
+        monitor for monitor in values
+        if not monitor.get("disabled")
+        and not monitor.get("name", "").startswith("HEADLESS-")
+    ]
+    if len(physical) < 2:
+        return
+    names = {str(monitor.get("name", "")) for monitor in physical}
+    assignments = [
+        {"workspace": workspace.get("name", workspace.get("id")), "monitor": workspace.get("monitor", "")}
+        for workspace in workspaces()
+        if workspace.get("monitor") in names and workspace.get("name") != FALLBACK_WORKSPACE
+    ]
+    payload = {
+        "saved": time.time(),
+        "workspaces": assignments,
+        "active": {
+            str(monitor.get("name", "")): monitor.get("activeWorkspace", {}).get("name", "")
+            for monitor in physical
+        },
+        "focused": next((str(monitor.get("name", "")) for monitor in physical if monitor.get("focused")), ""),
+    }
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    temporary = WORKSPACE_LAYOUT_STATE.with_suffix(".new")
+    temporary.write_text(json.dumps(payload), encoding="utf-8")
+    temporary.replace(WORKSPACE_LAYOUT_STATE)
+
+
+def restore_workspace_layout() -> None:
+    try:
+        payload = json.loads(WORKSPACE_LAYOUT_STATE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    live = {
+        str(monitor.get("name", "")): monitor
+        for monitor in monitors()
+        if not monitor.get("disabled") and not monitor.get("name", "").startswith("HEADLESS-")
+    }
+    existing = {
+        str(workspace.get("name", workspace.get("id", "")))
+        for workspace in workspaces()
+    }
+    for assignment in payload.get("workspaces", []):
+        workspace = str(assignment.get("workspace", ""))
+        monitor = str(assignment.get("monitor", ""))
+        if not workspace or workspace not in existing or monitor not in live:
+            continue
+        try:
+            move_workspace_to(workspace, monitor)
+        except (RuntimeError, subprocess.SubprocessError, ValueError):
+            continue
+    for monitor, workspace in payload.get("active", {}).items():
+        workspace = str(workspace)
+        if monitor not in live or not workspace or workspace not in existing:
+            continue
+        try:
+            dispatch("focusmonitor", monitor)
+            dispatch("workspace", workspace)
+        except (RuntimeError, subprocess.SubprocessError, ValueError):
+            continue
+    cursor_monitor = monitor_under_pointer(list(live.values()))
+    if cursor_monitor is not None:
+        dispatch("focusmonitor", cursor_monitor["name"])
+
+
+def selected_display_mode() -> str:
+    try:
+        mode = DISPLAY_MODE_STATE.read_text(encoding="utf-8").strip()
+        return mode if mode in DISPLAY_MODES else "external"
+    except OSError:
+        return "external"
+
+
+def configured_default_monitor() -> str:
+    try:
+        match = re.search(
+            r"^\s*default_monitor\s*=\s*(\S+)\s*$",
+            CONTROL_CONF.read_text(encoding="utf-8"),
+            re.MULTILINE,
+        )
+        if match and match.group(1) != "[[EMPTY]]":
+            return match.group(1)
+    except OSError:
+        pass
+    return ""
+
+
+def save_display_mode(mode: str) -> None:
+    if mode not in DISPLAY_MODES:
+        return
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    DISPLAY_MODE_STATE.write_text(f"{mode}\n", encoding="utf-8")
+
+
+def display_change_pending() -> bool:
+    pending = False
+    now = time.time()
+    for state in STATE_DIR.glob("display-revert-*.json"):
+        try:
+            payload = json.loads(state.read_text(encoding="utf-8"))
+            # Rollback timers are 20 seconds. A token older than one minute is
+            # stale (for example after a service restart) and must not suppress
+            # hotplug handling forever.
+            if now - float(payload.get("created", 0)) <= 60:
+                pending = True
+            else:
+                state.unlink(missing_ok=True)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            state.unlink(missing_ok=True)
+    return pending
 
 
 def connected_output_names() -> list[str]:
@@ -107,6 +264,93 @@ def external_names(values: list[dict]) -> list[str]:
     return [name for name in names if name != internal]
 
 
+def monitor_control_cache() -> dict:
+    cache = Path(os.environ.get(
+        "XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"
+    )) / "caelestia-monitor-control.json"
+    try:
+        value = json.loads(cache.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def external_ddc_healthy(connector: str = "") -> bool | None:
+    """Probe real monitor power without trusting HDMI hot-plug state.
+
+    Some monitors keep HPD/EDID logically connected from the source-side HDMI
+    supply during a mains failure. A short DDC power-mode query distinguishes
+    that state from a working panel. None means that no safe probe is available.
+    """
+    cached = monitor_control_cache()
+    if connector and cached.get("connector") != connector:
+        return None
+    bus = str(cached.get("bus", ""))
+    cached_connector = str(cached.get("connector", ""))
+    if not bus.isdigit() or not cached_connector:
+        return None
+    try:
+        result = subprocess.run([
+            "ddcutil", "getvcp", "D6", "--bus", bus, "--terse",
+            "--sleep-multiplier", ".1",
+        ], text=True, capture_output=True, timeout=1.2, check=False)
+        return result.returncode == 0 and "VCP D6" in result.stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def power_loss_payload() -> dict:
+    try:
+        value = json.loads(POWER_LOSS_STATE.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def activate_power_loss_fallback(connector: str) -> None:
+    """Move to the laptop without changing the user's saved display mode."""
+    values = monitors()
+    internal = internal_name(values)
+    if not internal:
+        return
+    save_workspace_layout(values)
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    POWER_LOSS_STATE.write_text(json.dumps({
+        "connector": connector,
+        "mode": selected_display_mode(),
+        "failedAt": time.time(),
+    }), encoding="utf-8")
+
+    # Light the laptop before touching the failed output, so there is never a
+    # zero-display interval and Qt keeps a valid wl_output throughout.
+    panel_rule = f"{internal},preferred,0x0,1"
+    run([str(HYPR_SET), "monitor", panel_rule])
+    set_dpms(internal, True)
+    set_internal_panel_visible(True)
+    time.sleep(0.15)
+    for workspace in workspaces():
+        if workspace.get("monitor") != internal and workspace.get("windows", 0) > 0:
+            move_workspace_to(workspace.get("name", workspace.get("id")), internal)
+    rules = profile_rules("extend", values) if external_names(values) else [panel_rule]
+    write_runtime_monitor_rules(rules)
+    for name in external_names(values):
+        set_dpms(name, False)
+    run([str(HYPR_SET), "cursor:default_monitor", internal], check=False)
+    dispatch("focusmonitor", internal)
+    recover_pointer_if_hidden(internal)
+    print(f"external monitor power lost; using {internal}", file=sys.stderr)
+
+
+def recover_from_power_loss() -> None:
+    payload = power_loss_payload()
+    if not payload:
+        return
+    POWER_LOSS_STATE.unlink(missing_ok=True)
+    apply_automatic()
+    sync_shell_to_external_state()
+    print("external monitor power restored; previous display mode reapplied", file=sys.stderr)
+
+
 def option(name: str):
     try:
         value = hypr_json("getoption", name)
@@ -131,13 +375,37 @@ def status() -> int:
         "pointerFollowsMonitor": bool(option("misc:mouse_move_focuses_monitor")),
         "warpPointerWithWorkspace": int(option("cursor:warp_on_change_workspace") or 0) > 0,
         "defaultMonitor": default_monitor,
-        "automaticSingleDisplay": True,
+        "automaticSingleDisplay": selected_display_mode() in ("external", "laptop"),
+        "mode": selected_display_mode(),
     }))
     return 0
 
 
 def dispatch(command: str, value: str) -> None:
-    result = run(["hyprctl", "dispatch", command, value])
+    quoted = json.dumps(value)
+    if command == "focusmonitor":
+        expression = f"hl.dispatch(hl.dsp.focus({{ monitor = {quoted} }}))"
+    elif command == "workspace":
+        expression = f"hl.dispatch(hl.dsp.focus({{ workspace = {quoted} }}))"
+    elif command == "movecursor":
+        x_value, y_value = (int(part) for part in value.split())
+        expression = f"hl.dispatch(hl.dsp.cursor.move({{ x = {x_value}, y = {y_value} }}))"
+    elif command == "movecurrentworkspacetomonitor":
+        expression = f"hl.dispatch(hl.dsp.workspace.move({{ monitor = {quoted} }}))"
+    elif command == "movewindow" and value.startswith("mon:"):
+        expression = (
+            "hl.dispatch(hl.dsp.window.move({ monitor = "
+            f"{json.dumps(value.removeprefix('mon:'))} }}))"
+        )
+    elif command == "moveworkspacetomonitor":
+        workspace, monitor = value.rsplit(maxsplit=1)
+        expression = (
+            "hl.dispatch(hl.dsp.workspace.move({ workspace = "
+            f"{json.dumps(workspace)}, monitor = {json.dumps(monitor)} }}))"
+        )
+    else:
+        raise ValueError(f"Unsupported native Hyprland action: {command}")
+    result = run(["hyprctl", "eval", expression])
     if "ok" not in result.stdout.lower():
         raise RuntimeError(result.stdout.strip() or result.stderr.strip())
 
@@ -198,13 +466,18 @@ def runtime_monitor_rules() -> list[str]:
     return rules
 
 
-def write_runtime_monitor_rules(rules: list[str], *, force_reload: bool = False) -> None:
-    """Atomically apply monitor rules on Hyprland 0.56 legacy configs.
+def persistent_monitor_rules() -> list[str]:
+    if not MONITORS_CONF.exists():
+        return []
+    rules: list[str] = []
+    for line in MONITORS_CONF.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("monitor = "):
+            rules.append(stripped[len("monitor = "):])
+    return rules
 
-    `hyprctl keyword monitor ...` currently returns success without changing
-    layout geometry in this configuration mode. A sourced file plus one reload
-    is deterministic and lets a whole one-screen transition apply together.
-    """
+
+def write_runtime_monitor_rules(rules: list[str], *, force_reload: bool = False) -> None:
     RUNTIME_MONITORS_CONF.parent.mkdir(parents=True, exist_ok=True)
     unique: dict[str, str] = {}
     for rule in rules:
@@ -217,7 +490,6 @@ def write_runtime_monitor_rules(rules: list[str], *, force_reload: bool = False)
         temporary = RUNTIME_MONITORS_CONF.with_suffix(".conf.tmp")
         temporary.write_text(content, encoding="utf-8")
         temporary.replace(RUNTIME_MONITORS_CONF)
-
     source = f"source = {RUNTIME_MONITORS_CONF}"
     source_missing = not HYPR_CONF.exists() or source not in HYPR_CONF.read_text(encoding="utf-8")
     ensure_source(RUNTIME_MONITORS_CONF)
@@ -227,10 +499,7 @@ def write_runtime_monitor_rules(rules: list[str], *, force_reload: bool = False)
 
 
 def apply_rule(rule: str) -> None:
-    rules = {
-        existing.split(",", 1)[0]: existing
-        for existing in runtime_monitor_rules()
-    }
+    rules = {existing.split(",", 1)[0]: existing for existing in runtime_monitor_rules()}
     rules[rule.split(",", 1)[0]] = rule
     write_runtime_monitor_rules(list(rules.values()))
 
@@ -286,12 +555,14 @@ def profile_rules(profile: str, values: list[dict]) -> list[str]:
             rules.append(f"{monitor},preferred,0x0,1,mirror,{internal}")
     elif profile == "laptop":
         rules.append(f"{internal},preferred,0x0,1")
-        rules.extend(f"{monitor},disable" for monitor in externals)
+        # Keep Qt's wl_output objects stable and switch unused panels off with
+        # DPMS. Removing a screen beneath Qt Quick layer surfaces can segfault.
+        rules.extend(f"{monitor},preferred,auto-right,1,cm,srgb" for monitor in externals)
     elif profile == "external":
         primary = externals[0]
-        rules.append(f"{primary},preferred,0x0,1,cm,srgb")
+        rules.append(f"{internal},preferred,0x0,1")
+        rules.append(f"{primary},preferred,auto-right,1,cm,srgb")
         rules.extend(f"{monitor},preferred,auto-right,1,cm,srgb" for monitor in externals[1:])
-        rules.append(f"{internal},disable")
     else:
         raise ValueError("Unknown display profile")
     return rules
@@ -315,7 +586,53 @@ def centre_pointer(name: str) -> None:
 def set_dpms(name: str, enabled: bool) -> None:
     """Power an output without destroying its compositor screen object."""
     name = validate_name(name)
-    run(["hyprctl", "dispatch", "dpms", "on" if enabled else "off", name])
+    expression = (
+        "hl.dispatch(hl.dsp.dpms({ action = "
+        f"{json.dumps('on' if enabled else 'off')}, monitor = {json.dumps(name)} }}))"
+    )
+    result = run(["hyprctl", "eval", expression])
+    if "ok" not in result.stdout.lower():
+        raise RuntimeError(result.stdout.strip() or result.stderr.strip())
+
+
+def set_internal_panel_visible(visible: bool) -> None:
+    """Darken the panel without removing its wl_output fallback from Qt."""
+    brightness = BACKLIGHT_DIR / "brightness"
+    maximum = BACKLIGHT_DIR / "max_brightness"
+    if not brightness.exists() or not maximum.exists():
+        return
+    try:
+        current = int(brightness.read_text(encoding="utf-8").strip())
+        max_value = int(maximum.read_text(encoding="utf-8").strip())
+        # Intel backlights commonly clamp a request for zero to their hardware
+        # minimum.  Treat the bottom 2% as "panel hidden", not as a useful
+        # brightness setting worth remembering.
+        visible_floor = max(1, round(max_value * 0.02))
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        if visible:
+            # Applying/reloading a display profile must not overwrite a panel
+            # that is already lit.  This also preserves changes made through
+            # the brightness keys or dashboard across Caelestia restarts.
+            if current > visible_floor:
+                BACKLIGHT_STATE.write_text(f"{current}\n", encoding="utf-8")
+                return
+            try:
+                saved = int(BACKLIGHT_STATE.read_text(encoding="utf-8").strip())
+            except (OSError, ValueError):
+                saved = round(max_value * 0.4)
+            if saved <= visible_floor:
+                saved = round(max_value * 0.4)
+            value = min(max(saved, visible_floor + 1), max_value)
+        else:
+            if current > visible_floor:
+                BACKLIGHT_STATE.write_text(f"{current}\n", encoding="utf-8")
+            value = 0
+        run([
+            "brightnessctl", "-q", "-d", BACKLIGHT_DIR.name,
+            "set", str(value),
+        ], check=False)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
 
 
 def ensure_headless_fallback(values: list[dict]) -> tuple[list[dict], str]:
@@ -346,22 +663,16 @@ def park_headless_workspace(fallback: str, restore_monitor: str) -> None:
         dispatch("focusmonitor", fallback)
         dispatch("workspace", f"name:{FALLBACK_WORKSPACE}")
     finally:
-        # Never strand keyboard focus on the invisible guard if assigning its
-        # private workspace fails halfway through a hotplug transition.
         dispatch("focusmonitor", restore_monitor)
 
 
 def remove_extra_headless_outputs(keep: str, target: str) -> None:
-    """Remove guards accidentally duplicated by concurrent session startup."""
     for monitor in monitors():
         name = monitor.get("name", "")
         if not name.startswith("HEADLESS-") or name == keep:
             continue
         for workspace in workspaces():
-            if (
-                workspace.get("monitor") == name
-                and workspace.get("name") != FALLBACK_WORKSPACE
-            ):
+            if workspace.get("monitor") == name and workspace.get("name") != FALLBACK_WORKSPACE:
                 move_workspace_to(workspace.get("name", workspace.get("id")), target)
         dispatch("focusmonitor", target)
         run(["hyprctl", "output", "remove", validate_name(name)], check=False)
@@ -383,6 +694,28 @@ def pointer_is_on_monitor(monitor: dict) -> bool:
         return False
 
 
+def monitor_under_pointer(values: list[dict]) -> dict | None:
+    """Return the enabled output containing the pointer in logical coordinates."""
+    try:
+        position = hypr_json("cursorpos")
+        x = float(position.get("x", 0))
+        y = float(position.get("y", 0))
+        for monitor in values:
+            if monitor.get("disabled") or monitor.get("name", "").startswith("HEADLESS-"):
+                continue
+            scale = max(float(monitor.get("scale", 1)), 0.25)
+            width = float(monitor.get("width", 0)) / scale
+            height = float(monitor.get("height", 0)) / scale
+            if (
+                float(monitor.get("x", 0)) <= x < float(monitor.get("x", 0)) + width
+                and float(monitor.get("y", 0)) <= y < float(monitor.get("y", 0)) + height
+            ):
+                return monitor
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError, TypeError, ValueError):
+        pass
+    return next((monitor for monitor in values if monitor.get("focused")), None)
+
+
 def recover_pointer_if_hidden(target: str) -> None:
     monitor = next((m for m in monitors() if m.get("name") == target), None)
     if monitor is not None and not pointer_is_on_monitor(monitor):
@@ -402,55 +735,138 @@ def saved_monitor_rule(name: str) -> str:
 
 
 def apply_automatic() -> int:
-    """Use exactly one screen: an external monitor when present, else the panel."""
+    """Reapply the user's selected display mode after a physical hot-plug."""
     APPLY_LOCK.parent.mkdir(parents=True, exist_ok=True)
     with APPLY_LOCK.open("w", encoding="utf-8") as lock_file:
-        # The watcher and Quickshell ExecStartPre can begin together. Serialise
-        # output creation so they can never create two fallback monitors.
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-
         values = monitors()
-        values, fallback = ensure_headless_fallback(values)
         internal = internal_name(values)
         externals = external_names(values)
+        mode = selected_display_mode()
         if not internal:
             raise ValueError("No laptop display was found")
 
-        target = externals[0] if externals else internal
+        if not externals:
+            panel_rule = f"{internal},preferred,0x0,1"
+            occupied = [w for w in workspaces() if w.get("windows", 0) > 0]
+            focused_workspace = next((
+                m.get("activeWorkspace", {}).get("name", "")
+                for m in values if m.get("focused")
+            ), "")
+            occupied_names = {
+                str(w.get("name", w.get("id", ""))) for w in occupied
+            }
+            if focused_workspace in occupied_names:
+                remember_external_workspace(focused_workspace)
+            elif occupied:
+                remember_external_workspace(str(
+                    occupied[0].get("name", occupied[0].get("id", ""))
+                ))
+            run([str(HYPR_SET), "monitor", panel_rule])
+            for workspace in workspaces():
+                if workspace.get("monitor") != internal and workspace.get("windows", 0) > 0:
+                    move_workspace_to(workspace.get("name", workspace.get("id")), internal)
+            write_runtime_monitor_rules([panel_rule])
+            # External-only is a preference while HDMI exists, not permission
+            # to leave the user with a black laptop after unplug/hotplug loss.
+            # Keep the saved mode so it is restored automatically on reconnect.
+            laptop_visible = True
+            set_dpms(internal, laptop_visible)
+            set_internal_panel_visible(laptop_visible)
+            run([str(HYPR_SET), "cursor:default_monitor", internal], check=False)
+            if laptop_visible:
+                dispatch("focusmonitor", internal)
+            print(json.dumps({
+                "mode": "laptop-fallback",
+                "target": internal,
+            }))
+            return 0
+
+        if mode in ("extend", "mirror", "laptop"):
+            rules = profile_rules(mode, values)
+            focused = next((m for m in values if m.get("focused")), {})
+            focused_name = focused.get("name", "")
+            focused_workspace = focused.get("activeWorkspace", {}).get("name", "")
+            target = internal if mode == "laptop" else (
+                focused_name if focused_name and not (
+                    mode == "laptop" and focused_name != internal
+                ) else externals[0]
+            )
+            if mode == "laptop":
+                for workspace in workspaces():
+                    if workspace.get("monitor") != internal and workspace.get("windows", 0) > 0:
+                        move_workspace_to(workspace.get("name", workspace.get("id")), internal)
+            write_runtime_monitor_rules(rules)
+            internal_visible = mode in ("extend", "mirror", "laptop")
+            set_dpms(internal, internal_visible)
+            set_internal_panel_visible(internal_visible)
+            for external in externals:
+                set_dpms(external, mode != "laptop")
+            enabled_names = {internal} if mode == "laptop" else {internal, *externals}
+            configured_primary = configured_default_monitor()
+            primary = configured_primary if configured_primary in enabled_names else target
+            run([str(HYPR_SET), "cursor:default_monitor", primary], check=False)
+            dispatch("focusmonitor", target)
+            if focused_workspace:
+                current_names = {
+                    str(w.get("name", w.get("id", ""))) for w in workspaces()
+                }
+                if focused_workspace in current_names:
+                    dispatch("workspace", focused_workspace)
+            if mode == "extend":
+                restore_workspace_layout()
+                save_workspace_layout(monitors())
+            print(json.dumps({"mode": mode, "target": target}))
+            return 0
+
+        target = externals[0]
+        target_state = next((m for m in values if m.get("name") == target), {})
+        workspace_values = workspaces()
+        occupied_names = {
+            str(w.get("name", w.get("id", "")))
+            for w in workspace_values if w.get("windows", 0) > 0
+        }
+        remembered_workspace = remembered_external_workspace()
+        active_target_workspace = target_state.get("activeWorkspace", {}).get("name", "")
+        target_workspace = (
+            remembered_workspace if remembered_workspace in occupied_names
+            else active_target_workspace if active_target_workspace in occupied_names
+            else next(iter(occupied_names), "")
+        )
         target_rule = saved_monitor_rule(target)
         if not target_rule:
             target_rule = f"{target},preferred,0x0,1"
             if target != internal:
                 target_rule += ",cm,srgb"
 
-        physical_rules = [
-            target_rule,
-            *(f"{output},disable" for output in [internal, *externals] if output != target),
-        ]
-        if fallback:
-            # Headless outputs in 0.56 expose only their preferred mode, but
-            # they can still be placed far outside pointer reach.
-            physical_rules.append(f"{fallback},preferred,10000x10000,1")
-        write_runtime_monitor_rules(physical_rules)
+        # Keep compositor screen objects registered and use DPMS for the
+        # single-display illusion. This avoids Qt Quick use-after-free crashes.
+        physical_rules = profile_rules("external", values)
+
+        # Bring the destination fully online before moving workspaces or
+        # disabling another output. This prevents a zero-real-output interval
+        # and keeps Qt/Quickshell from receiving a dangling screen object.
+        run([str(HYPR_SET), "monitor", target_rule])
+        time.sleep(0.35)
         set_dpms(target, True)
 
-        park_headless_workspace(fallback, target)
-        current_workspaces = workspaces()
-        for workspace in current_workspaces:
-            if (
-                workspace.get("name") != FALLBACK_WORKSPACE
-                and workspace.get("monitor") != target
-            ):
+        for workspace in workspaces():
+            if workspace.get("monitor") != target and workspace.get("windows", 0) > 0:
                 move_workspace_to(workspace.get("name", workspace.get("id")), target)
         dispatch("focusmonitor", target)
-        remove_extra_headless_outputs(fallback, target)
-        if len([m for m in values if m.get("name", "").startswith("HEADLESS-")]) > 1:
-            write_runtime_monitor_rules(physical_rules, force_reload=True)
+        # Every workspace and the pointer now have a valid HDMI destination.
+        write_runtime_monitor_rules(physical_rules)
+        set_dpms(internal, False)
+        set_internal_panel_visible(False)
+        for output in externals:
+            if output != target:
+                set_dpms(output, False)
 
-        # DPMS-off is not enough: a lid event can wake eDP and make Qt create a
-        # second shell. Keep exactly one physical output in the desktop instead.
-        run(["hyprctl", "keyword", "cursor:default_monitor", target], check=False)
+        run([str(HYPR_SET), "cursor:default_monitor", target], check=False)
         dispatch("focusmonitor", target)
+        if target_workspace:
+            dispatch("workspace", target_workspace)
+            remember_external_workspace(target_workspace)
         recover_pointer_if_hidden(target)
         print(json.dumps({
             "mode": "external-only" if externals else "laptop-only",
@@ -460,24 +876,43 @@ def apply_automatic() -> int:
 
 
 def cycle_workspace(direction: str) -> int:
-    """Switch workspaces only on the visible physical output."""
     if direction not in ("next", "previous"):
         raise ValueError("Workspace direction must be next or previous")
-    apply_automatic()
     values = monitors()
-    internal = internal_name(values)
-    externals = external_names(values)
-    target = externals[0] if externals else internal
+    monitor = monitor_under_pointer(values)
+    if monitor is None:
+        return 0
+
+    target = validate_name(monitor["name"])
+    current = str(monitor.get("activeWorkspace", {}).get("name", ""))
+    local = [
+        workspace for workspace in workspaces()
+        if workspace.get("monitor") == target
+        and workspace.get("name") != FALLBACK_WORKSPACE
+    ]
+
+    # Match the gesture's per-output semantics: cycle only through workspaces
+    # already owned by the display beneath the cursor. Numeric workspaces retain
+    # their natural order; named workspaces follow them deterministically.
+    def workspace_order(workspace: dict) -> tuple[int, int | str]:
+        name = str(workspace.get("name", ""))
+        try:
+            return (0, int(name))
+        except ValueError:
+            return (1, name)
+
+    local.sort(key=workspace_order)
+    names = [str(workspace.get("name", workspace.get("id", ""))) for workspace in local]
+    if len(names) < 2:
+        return 0
+    try:
+        index = names.index(current)
+    except ValueError:
+        index = 0
+    step = 1 if direction == "next" else -1
+    destination = names[(index + step) % len(names)]
     dispatch("focusmonitor", target)
-    dispatch("workspace", "+1" if direction == "next" else "-1")
-    for workspace in workspaces():
-        if (
-            workspace.get("name") != FALLBACK_WORKSPACE
-            and workspace.get("monitor", "").startswith("HEADLESS-")
-        ):
-            move_workspace_to(workspace.get("name", workspace.get("id")), target)
-    dispatch("focusmonitor", target)
-    recover_pointer_if_hidden(target)
+    dispatch("workspace", destination)
     return 0
 
 
@@ -498,6 +933,13 @@ def event_socket_path() -> Path:
     return candidates[0]
 
 
+def sync_shell_to_external_state() -> None:
+    """Keep the shell available on the active display, including unplug fallback."""
+    run([
+        "systemctl", "--user", "start", "caelestia-quickshell.service",
+    ], check=False)
+
+
 def watch() -> int:
     """Follow monitor hotplug/config events without polling."""
     while True:
@@ -507,26 +949,128 @@ def watch() -> int:
             for _ in range(20):
                 try:
                     apply_automatic()
+                    sync_shell_to_external_state()
                     break
                 except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
                     time.sleep(0.5)
 
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
                 client.connect(str(event_socket_path()))
+                client.settimeout(1.0)
                 buffer = ""
+                next_health_check = time.monotonic() + MONITOR_HEALTH_INTERVAL
+                last_suspend_offset = suspend_clock_offset()
+                resume_grace_until = 0.0
+                resume_reconcile_pending = False
+                health_failures = 0
+                health_successes = 0
                 while True:
-                    chunk = client.recv(8192)
-                    if not chunk:
-                        break
-                    buffer += chunk.decode("utf-8", errors="replace")
-                    lines = buffer.split("\n")
-                    buffer = lines.pop()
+                    try:
+                        chunk = client.recv(8192)
+                        if not chunk:
+                            break
+                        buffer += chunk.decode("utf-8", errors="replace")
+                        lines = buffer.split("\n")
+                        buffer = lines.pop()
+                    except socket.timeout:
+                        lines = []
+
+                    now = time.monotonic()
+                    suspend_offset = suspend_clock_offset()
+                    if suspend_offset - last_suspend_offset >= SUSPEND_OFFSET_THRESHOLD:
+                        # HDMI, DDC and Qt's wl_output objects recover at
+                        # different rates. Reconfiguring during that interval
+                        # can destroy QuickshellScreenInfo while Qt Quick still
+                        # evaluates geometry bindings, causing a SIGSEGV.
+                        resume_grace_until = now + RESUME_GRACE_SECONDS
+                        resume_reconcile_pending = True
+                        health_failures = 0
+                        health_successes = 0
+                        print(
+                            f"resume detected; deferring display changes for {RESUME_GRACE_SECONDS:.0f}s",
+                            file=sys.stderr,
+                        )
+                    last_suspend_offset = max(last_suspend_offset, suspend_offset)
+
+                    in_resume_grace = now < resume_grace_until
+                    if resume_reconcile_pending and not in_resume_grace:
+                        try:
+                            apply_automatic()
+                            sync_shell_to_external_state()
+                            resume_reconcile_pending = False
+                        except Exception as error:
+                            print(f"post-resume display reconciliation failed: {error}", file=sys.stderr)
+                            resume_grace_until = now + 2.0
+                            in_resume_grace = True
+
+                    if now >= next_health_check and not in_resume_grace:
+                        next_health_check = now + MONITOR_HEALTH_INTERVAL
+                        loss = power_loss_payload()
+                        values = monitors()
+                        mode = selected_display_mode()
+                        probe_connector = str(loss.get("connector", ""))
+                        live_external = next((
+                            monitor for monitor in values
+                            if not monitor.get("disabled")
+                            and not monitor.get("name", "").startswith((
+                                "HEADLESS-", "eDP-", "LVDS-", "DSI-"
+                            ))
+                        ), None)
+                        should_probe = bool(loss) or (
+                            mode != "laptop"
+                            and live_external is not None
+                            and live_external.get("dpmsStatus", True)
+                            and not display_change_pending()
+                        )
+                        if should_probe:
+                            if not probe_connector and live_external is not None:
+                                probe_connector = str(live_external.get("name", ""))
+                            healthy = external_ddc_healthy(probe_connector)
+                            if healthy is True:
+                                health_failures = 0
+                                health_successes += 1
+                                if loss and health_successes >= MONITOR_RECOVERY_THRESHOLD:
+                                    health_successes = 0
+                                    recover_from_power_loss()
+                            elif healthy is False:
+                                health_successes = 0
+                                health_failures += 1
+                                if not loss and health_failures >= MONITOR_FAILURE_THRESHOLD:
+                                    health_failures = 0
+                                    activate_power_loss_fallback(probe_connector)
+                            else:
+                                # No cached DDC bus: remain purely event-driven
+                                # instead of treating unsupported hardware as off.
+                                health_failures = 0
+                                health_successes = 0
+                        else:
+                            health_failures = 0
+                            health_successes = 0
+
                     display_events = [
                         line for line in lines if line.startswith((
                             "monitoradded", "monitorremoved", "configreloaded"
                         ))
                     ]
+                    if in_resume_grace:
+                        # Ignore all transient monitor/workspace/focus events;
+                        # the stable topology is reconciled once after grace.
+                        if display_events:
+                            resume_reconcile_pending = True
+                        continue
                     if display_events:
+                        if display_change_pending():
+                            continue
+                        # Disabling a dead-but-logically-connected HDMI output
+                        # emits monitorremoved. Keep the laptop fallback until
+                        # DDC confirms that the physical panel has returned.
+                        if power_loss_payload():
+                            continue
+                        # Configuration reloads are generated by our own atomic
+                        # profile writes. Only physical connector changes need
+                        # the automatic mode policy to run again.
+                        if not any(line.startswith(("monitoradded", "monitorremoved")) for line in display_events):
+                            continue
                         # Wake the retained laptop fallback almost immediately
                         # after a removal; additions need a little EDID settling.
                         delay = 0.12 if any(
@@ -536,25 +1080,64 @@ def watch() -> int:
                         time.sleep(delay)
                         try:
                             apply_automatic()
+                            sync_shell_to_external_state()
                         except Exception as error:  # keep watcher alive
                             print(f"automatic display update failed: {error}", file=sys.stderr)
                     elif any(line.startswith(("workspace", "focusedmon")) for line in lines):
-                        # A stale/duplicate guard must never retain a normal
-                        # workspace or keyboard focus.
                         try:
+                            stranded = [
+                                workspace for workspace in workspaces()
+                                if (
+                                    workspace.get("name") != FALLBACK_WORKSPACE
+                                    and workspace.get("monitor", "").startswith("HEADLESS-")
+                                )
+                            ]
+                            # Normal workspace/focus events require no display
+                            # intervention. Re-focusing on every such event can
+                            # warp the pointer, especially while the registered
+                            # DPMS-off laptop fallback overlaps the HDMI output.
+                            if not stranded:
+                                values = monitors()
+                                active_external = next((
+                                    m for m in values
+                                    if (
+                                        m.get("focused")
+                                        and not m.get("disabled")
+                                        and not m.get("name", "").startswith((
+                                            "HEADLESS-", "eDP-", "LVDS-", "DSI-"
+                                        ))
+                                    )
+                                ), None)
+                                if active_external:
+                                    remember_external_workspace(
+                                        active_external.get("activeWorkspace", {}).get("name", "")
+                                    )
+                                if selected_display_mode() == "extend":
+                                    save_workspace_layout(values)
+                                continue
                             values = monitors()
-                            physical = [
+                            external = [
                                 m for m in values
-                                if not m.get("disabled") and not m.get("name", "").startswith("HEADLESS-")
+                                if (
+                                    not m.get("disabled")
+                                    and m.get("dpmsStatus", True)
+                                    and not m.get("name", "").startswith((
+                                        "HEADLESS-", "eDP-", "LVDS-", "DSI-"
+                                    ))
+                                )
+                            ]
+                            physical = external or [
+                                m for m in values
+                                if (
+                                    not m.get("disabled")
+                                    and m.get("dpmsStatus", True)
+                                    and not m.get("name", "").startswith("HEADLESS-")
+                                )
                             ]
                             if physical:
                                 target = physical[0]["name"]
-                                for workspace in workspaces():
-                                    if (
-                                        workspace.get("name") != FALLBACK_WORKSPACE
-                                        and workspace.get("monitor", "").startswith("HEADLESS-")
-                                    ):
-                                        move_workspace_to(workspace.get("name", workspace.get("id")), target)
+                                for workspace in stranded:
+                                    move_workspace_to(workspace.get("name", workspace.get("id")), target)
                                 dispatch("focusmonitor", target)
                                 recover_pointer_if_hidden(target)
                         except Exception as error:
@@ -574,6 +1157,7 @@ def start_change(
     *,
     target: str = "",
     migrate_from: list[str] | None = None,
+    persist_immediately: bool = False,
 ) -> int:
     token = uuid.uuid4().hex[:12]
     STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -584,6 +1168,8 @@ def start_change(
         for workspace in workspaces()
         if workspace.get("monitor")
     ]
+    previous_mode = selected_display_mode()
+    previous_persistent_rules = persistent_monitor_rules()
     state.write_text(json.dumps({
         "created": time.time(),
         "monitors": values,
@@ -592,8 +1178,39 @@ def start_change(
         "defaultMonitor": option("cursor:default_monitor") or "",
         "workspaces": assignments,
         "target": target,
+        "profile": label if label in DISPLAY_MODES else "",
+        "previousMode": previous_mode,
+        "previousPersistentRules": previous_persistent_rules,
     }), encoding="utf-8")
     try:
+        # Named display modes must survive the Quickshell restart that can be
+        # caused by removing a wl_output. Persist the user's intent before the
+        # compositor transition; startup recovery can then finish that mode
+        # instead of falling back to Join/extend.
+        if persist_immediately:
+            save_rules(persist_rules)
+            save_display_mode(label)
+        if target and not any(
+            monitor.get("name") == target and not monitor.get("disabled")
+            for monitor in monitors()
+        ):
+            # A direct Laptop-only -> External-only (or the reverse) starts
+            # with the destination output absent from Hyprland's active monitor
+            # list. Bring it up beside the current output before moving focus
+            # or workspaces, then apply its final position below. This avoids
+            # both "Monitor not found" and a transient overlapping layout.
+            target_rule = next((
+                rule for rule in apply_rules
+                if rule.split(",", 1)[0] == target and not rule.endswith(",disable")
+            ), "")
+            if not target_rule:
+                raise ValueError("The destination display has no enabled rule")
+            staged_rule = f"{target},preferred,auto-right,1"
+            if not target.startswith(("eDP-", "LVDS-", "DSI-")):
+                staged_rule += ",cm,srgb"
+            run([str(HYPR_SET), "monitor", staged_rule])
+            time.sleep(0.35)
+            set_dpms(target, True)
         if target:
             # Move live workspaces while both outputs still exist. If Hyprland
             # disables their monitor first it can select an arbitrary remaining
@@ -602,15 +1219,55 @@ def start_change(
             for assignment in assignments:
                 if assignment["monitor"] in sources:
                     move_workspace_to(assignment["workspace"], target)
-            centre_pointer(target)
+            recover_pointer_if_hidden(target)
+        live_rules = {
+            rule.split(",", 1)[0]: rule for rule in runtime_monitor_rules()
+        }
         for rule in apply_rules:
-            apply_rule(rule)
+            live_rules[rule.split(",", 1)[0]] = rule
+        write_runtime_monitor_rules(list(live_rules.values()), force_reload=True)
+        # Enabling an output rule does not necessarily clear a DPMS-off state
+        # inherited from a previous profile. Explicitly power every enabled
+        # destination before focusing or moving workspaces to it.
+        for rule in apply_rules:
+            if not rule.endswith(",disable"):
+                set_dpms(rule.split(",", 1)[0], True)
+        internal = internal_name(values)
+        if internal and label in DISPLAY_MODES:
+            internal_visible = label in ("extend", "mirror", "laptop")
+            set_dpms(internal, internal_visible)
+            set_internal_panel_visible(internal_visible)
+            externals = external_names(values)
+            if label == "laptop":
+                for external in externals:
+                    set_dpms(external, False)
+            elif label in ("extend", "mirror"):
+                for external in externals:
+                    set_dpms(external, True)
+            elif label == "external":
+                for external in externals:
+                    set_dpms(external, external == target)
         if target:
-            centre_pointer(target)
-            run(["hyprctl", "keyword", "cursor:default_monitor", target])
+            recover_pointer_if_hidden(target)
+            set_dpms(target, True)
+            run([str(HYPR_SET), "cursor:default_monitor", target])
     except Exception:
         rollback(token)
+        if persist_immediately:
+            if previous_persistent_rules:
+                save_rules(previous_persistent_rules)
+            save_display_mode(previous_mode)
         raise
+
+    if persist_immediately:
+        if target:
+            pointer = True
+            warp = int(option("cursor:warp_on_change_workspace") or 0) > 0
+            write_policies(pointer, warp, target)
+        state.unlink(missing_ok=True)
+        print(json.dumps({"profile": label, "saved": True}))
+        return 0
+
     executable = str(Path(__file__).resolve())
     subprocess.run([
         "systemd-run", "--user", "--quiet", f"--unit=caelestia-display-revert-{token}",
@@ -622,20 +1279,35 @@ def start_change(
 
 def apply_profile(profile: str) -> int:
     values = monitors()
+    # Preserve the last real joined arrangement. Cycling through one-display
+    # modes must not overwrite it with the temporary collapsed assignment.
+    if selected_display_mode() == "extend" and profile != "extend":
+        save_workspace_layout(values)
     rules = profile_rules(profile, values)
     internal = internal_name(values)
     externals = external_names(values)
+    focused = next((m.get("name", "") for m in values if m.get("focused")), "")
     if profile == "external":
         return start_change(
             values, rules, rules, profile,
             target=externals[0], migrate_from=[internal],
+            persist_immediately=True,
         )
     if profile == "laptop":
         return start_change(
             values, rules, rules, profile,
             target=internal, migrate_from=externals,
+            persist_immediately=True,
         )
-    return start_change(values, rules, rules, profile)
+    result = start_change(
+        values, rules, rules, profile,
+        target=focused or externals[0], migrate_from=[],
+        persist_immediately=True,
+    )
+    if profile == "extend":
+        restore_workspace_layout()
+        save_workspace_layout(monitors())
+    return result
 
 
 def apply_custom(name: str, resolution: str, position: str, scale_text: str, transform_text: str) -> int:
@@ -677,14 +1349,32 @@ def rollback(token: str) -> int:
     if not state.exists():
         return 0
     payload = json.loads(state.read_text(encoding="utf-8"))
+    previous_rules = [rule_for(monitor) for monitor in payload.get("monitors", [])]
+    if previous_rules:
+        write_runtime_monitor_rules(previous_rules, force_reload=True)
     for monitor in payload.get("monitors", []):
-        apply_rule(rule_for(monitor))
+        if not monitor.get("disabled"):
+            set_dpms(monitor["name"], monitor.get("dpmsStatus", True))
     for assignment in payload.get("workspaces", []):
         if assignment.get("monitor"):
-            move_workspace_to(assignment.get("workspace"), assignment["monitor"])
+            try:
+                move_workspace_to(assignment.get("workspace"), assignment["monitor"])
+            except (RuntimeError, subprocess.SubprocessError):
+                # Empty temporary workspaces can disappear during a profile
+                # change. Their absence must not abort the rest of rollback.
+                continue
+    for monitor in payload.get("monitors", []):
+        workspace = monitor.get("activeWorkspace", {}).get("name", "")
+        if monitor.get("disabled") or not workspace:
+            continue
+        try:
+            dispatch("focusmonitor", monitor["name"])
+            dispatch("workspace", workspace)
+        except (RuntimeError, subprocess.SubprocessError):
+            continue
     previous_default = payload.get("defaultMonitor", "")
     run([
-        "hyprctl", "keyword", "cursor:default_monitor",
+        str(HYPR_SET), "cursor:default_monitor",
         previous_default if previous_default and previous_default != "[[EMPTY]]" else "[[EMPTY]]"
     ], check=False)
     if payload.get("focused"):
@@ -705,8 +1395,11 @@ def confirm(token: str) -> int:
         raise ValueError("Display confirmation expired")
     payload = json.loads(state.read_text(encoding="utf-8"))
     save_rules(payload.get("rules", []))
+    if payload.get("profile") in DISPLAY_MODES:
+        save_display_mode(payload["profile"])
     if payload.get("target"):
-        pointer = bool(option("misc:mouse_move_focuses_monitor"))
+        # Keep focus-follows-mouse enabled after a confirmed layout change.
+        pointer = True
         warp = int(option("cursor:warp_on_change_workspace") or 0) > 0
         write_policies(pointer, warp, payload["target"])
     state.unlink()
@@ -719,6 +1412,10 @@ def write_policies(pointer_follows: bool, warp: bool, default_monitor: str) -> N
         validate_name(default_monitor)
     CONTROL_CONF.parent.mkdir(parents=True, exist_ok=True)
     CONTROL_CONF.write_text(
+        "input {\n"
+        "    follow_mouse = 1\n"
+        "    mouse_refocus = true\n"
+        "}\n\n"
         "misc {\n"
         f"    mouse_move_focuses_monitor = {'true' if pointer_follows else 'false'}\n"
         "}\n\n"
@@ -729,9 +1426,11 @@ def write_policies(pointer_follows: bool, warp: bool, default_monitor: str) -> N
         encoding="utf-8",
     )
     ensure_source(CONTROL_CONF)
-    run(["hyprctl", "keyword", "misc:mouse_move_focuses_monitor", "1" if pointer_follows else "0"])
-    run(["hyprctl", "keyword", "cursor:warp_on_change_workspace", "1" if warp else "0"])
-    run(["hyprctl", "keyword", "cursor:default_monitor", default_monitor or "[[EMPTY]]"])
+    run([str(HYPR_SET), "input:follow_mouse", "1"])
+    run([str(HYPR_SET), "input:mouse_refocus", "1"])
+    run([str(HYPR_SET), "misc:mouse_move_focuses_monitor", "1" if pointer_follows else "0"])
+    run([str(HYPR_SET), "cursor:warp_on_change_workspace", "1" if warp else "0"])
+    run([str(HYPR_SET), "cursor:default_monitor", default_monitor or "[[EMPTY]]"])
 
 
 def set_policy(name: str, value: str) -> int:

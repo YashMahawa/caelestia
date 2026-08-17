@@ -77,6 +77,24 @@ def monitors() -> list[dict]:
     return value if isinstance(value, list) else []
 
 
+def logical_monitor_size(monitor: dict) -> tuple[float, float]:
+    """Return compositor-coordinate dimensions for a Hyprland monitor."""
+    # Hyprland 0.56 reports mode pixels in width/height while x/y are logical
+    # compositor coordinates. Prefer explicit logical fields if a future IPC
+    # version provides them, otherwise normalize the mode by its scale once.
+    logical_width = monitor.get("logicalWidth")
+    logical_height = monitor.get("logicalHeight")
+    if logical_width is not None and logical_height is not None:
+        return float(logical_width), float(logical_height)
+    scale = max(float(monitor.get("scale", 1) or 1), 0.25)
+    return float(monitor.get("width", 0)) / scale, float(monitor.get("height", 0)) / scale
+
+
+def logical_monitor_center(monitor: dict) -> tuple[int, int]:
+    width, height = logical_monitor_size(monitor)
+    return int(float(monitor.get("x", 0)) + width / 2), int(float(monitor.get("y", 0)) + height / 2)
+
+
 def workspaces() -> list[dict]:
     value = hypr_json("workspaces")
     return value if isinstance(value, list) else []
@@ -216,6 +234,45 @@ def display_change_pending() -> bool:
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             state.unlink(missing_ok=True)
     return pending
+
+
+def consume_pending_display_checkpoint() -> dict | None:
+    """Cancel stale rollback jobs and retain the oldest stable checkpoint."""
+    checkpoints: list[tuple[float, Path, str, dict]] = []
+    for state in STATE_DIR.glob("display-revert-*.json"):
+        token = state.stem.removeprefix("display-revert-")
+        if not re.fullmatch(r"[0-9a-f]{12}", token):
+            continue
+        try:
+            payload = json.loads(state.read_text(encoding="utf-8"))
+            created = float(payload.get("created", state.stat().st_mtime))
+            checkpoints.append((created, state, token, payload))
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            state.unlink(missing_ok=True)
+
+    if not checkpoints:
+        return None
+
+    units = [
+        unit
+        for _created, _state, token, _payload in checkpoints
+        for unit in (
+            f"caelestia-display-revert-{token}.timer",
+            f"caelestia-display-revert-{token}.service",
+        )
+    ]
+    subprocess.run(
+        ["systemctl", "--user", "stop", *units],
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=10,
+    )
+    checkpoints.sort(key=lambda item: item[0])
+    baseline = checkpoints[0][3]
+    for _created, state, _token, _payload in checkpoints:
+        state.unlink(missing_ok=True)
+    return baseline
 
 
 def connected_output_names() -> list[str]:
@@ -416,8 +473,7 @@ def focus(name: str) -> int:
     if monitor is None:
         raise ValueError("Display is not connected")
     dispatch("focusmonitor", name)
-    x = int(monitor["x"] + monitor["width"] / max(float(monitor.get("scale", 1)), 0.25) / 2)
-    y = int(monitor["y"] + monitor["height"] / max(float(monitor.get("scale", 1)), 0.25) / 2)
+    x, y = logical_monitor_center(monitor)
     dispatch("movecursor", f"{x} {y}")
     print(f"Focused {name}")
     return 0
@@ -578,8 +634,7 @@ def centre_pointer(name: str) -> None:
     if monitor is None:
         return
     dispatch("focusmonitor", name)
-    x = int(monitor["x"] + monitor["width"] / max(float(monitor.get("scale", 1)), 0.25) / 2)
-    y = int(monitor["y"] + monitor["height"] / max(float(monitor.get("scale", 1)), 0.25) / 2)
+    x, y = logical_monitor_center(monitor)
     dispatch("movecursor", f"{x} {y}")
 
 
@@ -683,9 +738,7 @@ def pointer_is_on_monitor(monitor: dict) -> bool:
         position = hypr_json("cursorpos")
         x = float(position.get("x", 0))
         y = float(position.get("y", 0))
-        scale = max(float(monitor.get("scale", 1)), 0.25)
-        width = float(monitor.get("width", 0)) / scale
-        height = float(monitor.get("height", 0)) / scale
+        width, height = logical_monitor_size(monitor)
         return (
             float(monitor.get("x", 0)) <= x < float(monitor.get("x", 0)) + width
             and float(monitor.get("y", 0)) <= y < float(monitor.get("y", 0)) + height
@@ -703,9 +756,7 @@ def monitor_under_pointer(values: list[dict]) -> dict | None:
         for monitor in values:
             if monitor.get("disabled") or monitor.get("name", "").startswith("HEADLESS-"):
                 continue
-            scale = max(float(monitor.get("scale", 1)), 0.25)
-            width = float(monitor.get("width", 0)) / scale
-            height = float(monitor.get("height", 0)) / scale
+            width, height = logical_monitor_size(monitor)
             if (
                 float(monitor.get("x", 0)) <= x < float(monitor.get("x", 0)) + width
                 and float(monitor.get("y", 0)) <= y < float(monitor.get("y", 0)) + height
@@ -1170,13 +1221,32 @@ def start_change(
     ]
     previous_mode = selected_display_mode()
     previous_persistent_rules = persistent_monitor_rules()
+    previous_default_monitor = option("cursor:default_monitor") or ""
+
+    # Rapid edits form one transaction. Preserve the oldest pre-edit snapshot
+    # while replacing every previous timer with one timer for the newest state.
+    checkpoint = consume_pending_display_checkpoint()
+    checkpoint_monitors = values
+    checkpoint_focused = focused
+    checkpoint_assignments = assignments
+    if checkpoint:
+        checkpoint_monitors = checkpoint.get("monitors", values)
+        checkpoint_focused = checkpoint.get("focused", focused)
+        checkpoint_assignments = checkpoint.get("workspaces", assignments)
+        previous_mode = checkpoint.get("previousMode", previous_mode)
+        previous_persistent_rules = checkpoint.get(
+            "previousPersistentRules", previous_persistent_rules
+        )
+        previous_default_monitor = checkpoint.get(
+            "defaultMonitor", previous_default_monitor
+        )
     state.write_text(json.dumps({
         "created": time.time(),
-        "monitors": values,
+        "monitors": checkpoint_monitors,
         "rules": persist_rules,
-        "focused": focused,
-        "defaultMonitor": option("cursor:default_monitor") or "",
-        "workspaces": assignments,
+        "focused": checkpoint_focused,
+        "defaultMonitor": previous_default_monitor,
+        "workspaces": checkpoint_assignments,
         "target": target,
         "profile": label if label in DISPLAY_MODES else "",
         "previousMode": previous_mode,

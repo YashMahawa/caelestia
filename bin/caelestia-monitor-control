@@ -4,10 +4,16 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
+import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
+import time
+from contextlib import contextmanager
+from pathlib import Path
 
 
 RANGE_CONTROLS = {
@@ -39,6 +45,20 @@ ENUM_CONTROLS = {
 }
 INPUT_NAMES = {0x0F: "displayport", 0x11: "hdmi1", 0x12: "hdmi2"}
 TEMPERATURE_NAMES = {0x05: "6500", 0x06: "7500", 0x08: "9300", 0x0B: "user"}
+CACHE_PATH = Path(
+    os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+) / "caelestia-monitor-control.json"
+LOCK_PATH = CACHE_PATH.with_suffix(".lock")
+IO_LOCK_PATH = CACHE_PATH.with_suffix(".io.lock")
+
+
+@contextmanager
+def monitor_io():
+    """Serialize DDC transactions from the dashboard, OSD and health poll."""
+    IO_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with IO_LOCK_PATH.open("w", encoding="utf-8") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
 
 
 def run(args: list[str], timeout: int = 15) -> str:
@@ -48,7 +68,104 @@ def run(args: list[str], timeout: int = 15) -> str:
     return result.stdout
 
 
-def detect() -> dict:
+def active_external_connector() -> str:
+    try:
+        active = json.loads(run(["hyprctl", "monitors", "all", "-j"], timeout=5))
+        return next((
+            item["name"] for item in active
+            if not item.get("disabled")
+            and not item["name"].startswith(("eDP-", "LVDS-", "DSI-"))
+        ), "")
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+        return ""
+
+
+def connector_fingerprint(connector: str) -> str:
+    for edid in Path("/sys/class/drm").glob(f"card*-{connector}/edid"):
+        try:
+            data = edid.read_bytes()
+            if data:
+                return hashlib.sha256(data).hexdigest()
+        except OSError:
+            pass
+    return ""
+
+
+def cached_monitor(connector: str) -> dict | None:
+    if not connector:
+        return None
+    try:
+        cached = json.loads(CACHE_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if cached.get("connector") != connector:
+        return None
+    if cached.get("fingerprint", "") != connector_fingerprint(connector):
+        return None
+    if not Path(f"/dev/i2c-{cached.get('bus', '')}").exists():
+        return None
+    return cached
+
+
+def cache_monitor(monitor: dict) -> None:
+    try:
+        previous = json.loads(CACHE_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        previous = {}
+    cached = {
+        **monitor,
+        "fingerprint": connector_fingerprint(monitor["connector"]),
+        "rangeMaxima": monitor.get("rangeMaxima", previous.get("rangeMaxima", {})),
+    }
+    temporary = CACHE_PATH.with_name(f"{CACHE_PATH.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_text(json.dumps(cached), encoding="utf-8")
+        os.replace(temporary, CACHE_PATH)
+    except OSError:
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
+
+
+def invalidate_cache() -> None:
+    try:
+        CACHE_PATH.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def cache_range_maximum(code: str, maximum: int) -> None:
+    try:
+        cached = json.loads(CACHE_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    maxima = cached.setdefault("rangeMaxima", {})
+    maxima[code.casefold()] = max(1, int(maximum))
+    cache_monitor(cached)
+
+
+def range_maximum(monitor: dict, code: str) -> int:
+    maxima = monitor.get("rangeMaxima", {})
+    cached = maxima.get(code.casefold()) if isinstance(maxima, dict) else None
+    if isinstance(cached, int) and cached > 0:
+        return cached
+    output = run([
+        "ddcutil", "-b", monitor["bus"], "getvcp", code, "--brief",
+        "--sleep-multiplier", ".1",
+    ], timeout=4)
+    terse = re.search(rf"VCP\s+{re.escape(code)}\s+C\s+(\d+)\s+(\d+)", output, re.I)
+    verbose = re.search(r"current value =\s*(\d+), max value =\s*(\d+)", output)
+    match = terse or verbose
+    if not match:
+        raise RuntimeError(f"Monitor did not return a valid maximum for VCP {code}")
+    maximum = max(1, int(match.group(2)))
+    cache_range_maximum(code, maximum)
+    monitor.setdefault("rangeMaxima", {})[code.casefold()] = maximum
+    return maximum
+
+
+def detect_uncached(active_external: str) -> dict:
     output = run(["ddcutil", "detect", "--brief"])
     blocks = re.split(r"\n\s*\n", output.strip())
     candidates: list[dict] = []
@@ -68,22 +185,31 @@ def detect() -> dict:
     if not candidates:
         raise RuntimeError("No DDC/CI monitor is available")
 
-    try:
-        active = json.loads(run(["hyprctl", "monitors", "all", "-j"], timeout=5))
-        active_external = next((
-            item["name"] for item in active
-            if not item.get("disabled")
-            and not item["name"].startswith(("eDP-", "LVDS-", "DSI-"))
-        ), "")
-        selected = next(
-            (item for item in candidates if item["connector"] == active_external),
-            None,
-        )
-        if selected:
-            return selected
-    except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
-        pass
-    return candidates[0]
+    selected = next(
+        (item for item in candidates if item["connector"] == active_external),
+        candidates[0],
+    )
+    cache_monitor(selected)
+    return selected
+
+
+def detect(force: bool = False) -> dict:
+    active_external = active_external_connector()
+    if not force:
+        cached = cached_monitor(active_external)
+        if cached:
+            return cached
+
+    # Brightness and the Display page are initialized independently. Serialize
+    # their first lookup so a cold shell launch performs one hardware scan.
+    LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with LOCK_PATH.open("w", encoding="utf-8") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if not force:
+            cached = cached_monitor(active_external)
+            if cached:
+                return cached
+        return detect_uncached(active_external)
 
 
 def parse_status(output: str, monitor: dict) -> dict:
@@ -101,6 +227,7 @@ def parse_status(output: str, monitor: dict) -> dict:
         "input": "hdmi1",
     }
     range_names = {int(code, 16): name for name, code in RANGE_CONTROLS.items()}
+    maxima: dict[str, int] = {}
     for line in output.splitlines():
         code_match = re.search(r"VCP code 0x([0-9a-fA-F]{2})", line)
         if not code_match:
@@ -111,6 +238,7 @@ def parse_status(output: str, monitor: dict) -> dict:
         )
         if code in range_names and value_match:
             maximum = max(1, int(value_match.group(2)))
+            maxima[f"{code:02x}"] = maximum
             state[range_names[code]] = round(int(value_match.group(1)) * 100 / maximum)
             continue
         enum_match = re.search(r"\(sl=0x([0-9a-fA-F]{2})\)", line)
@@ -123,25 +251,66 @@ def parse_status(output: str, monitor: dict) -> dict:
             state["input"] = INPUT_NAMES.get(value, f"0x{value:02x}")
         elif code == 0x8D:
             state["muted"] = value == 0x01
+    for code, maximum in maxima.items():
+        cache_range_maximum(code, maximum)
     return state
 
 
 def status() -> int:
-    monitor = detect()
-    output = run(["ddcutil", "-b", monitor["bus"], "getvcp", "known"])
+    with monitor_io():
+        monitor = detect()
+        try:
+            output = run(["ddcutil", "-b", monitor["bus"], "getvcp", "known"])
+        except (OSError, subprocess.SubprocessError):
+            invalidate_cache()
+            monitor = detect(force=True)
+            output = run(["ddcutil", "-b", monitor["bus"], "getvcp", "known"])
     print(json.dumps(parse_status(output, monitor)))
     return 0
 
 
+def brightness_status() -> int:
+    """Return a cheap, verified brightness reading for hotplug recovery."""
+    def read(current: dict) -> tuple[int, int]:
+        output = run([
+            "ddcutil", "-b", current["bus"], "getvcp", "10", "--brief",
+            "--sleep-multiplier", ".1",
+        ], timeout=4)
+        terse = re.search(r"VCP\s+10\s+C\s+(\d+)\s+(\d+)", output)
+        verbose = re.search(
+            r"current value =\s*(\d+), max value =\s*(\d+)", output
+        )
+        match = terse or verbose
+        if not match:
+            raise RuntimeError("Monitor did not return a valid brightness value")
+        return int(match.group(1)), max(1, int(match.group(2)))
+
+    with monitor_io():
+        monitor = detect()
+        try:
+            current, maximum = read(monitor)
+        except (OSError, subprocess.SubprocessError, RuntimeError):
+            invalidate_cache()
+            monitor = detect(force=True)
+            current, maximum = read(monitor)
+        cache_range_maximum("10", maximum)
+
+    print(json.dumps({
+        "available": True,
+        **monitor,
+        "brightness": round(current * 100 / maximum),
+    }))
+    return 0
+
+
 def set_control(name: str, value: str) -> int:
-    monitor = detect()
     if name in RANGE_CONTROLS:
         try:
             numeric = max(0, min(100, int(round(float(value)))))
         except ValueError as error:
             raise ValueError(f"{name} must be between 0 and 100") from error
         code = RANGE_CONTROLS[name]
-        encoded = str(numeric)
+        encoded = ""
         result_value: int | str | bool = numeric
     elif name in ENUM_CONTROLS:
         key = value.lower().replace("-", "")
@@ -154,7 +323,28 @@ def set_control(name: str, value: str) -> int:
     else:
         raise ValueError("Unsupported monitor control")
 
-    run(["ddcutil", "-b", monitor["bus"], "setvcp", code, encoded])
+    with monitor_io():
+        monitor = detect()
+        if name in RANGE_CONTROLS:
+            maximum = range_maximum(monitor, code)
+            encoded = str(round(numeric * maximum / 100))
+        last_error: Exception | None = None
+        for attempt in range(3):
+            try:
+                run([
+                    "ddcutil", "-b", monitor["bus"], "setvcp", code, encoded,
+                    "--sleep-multiplier", ".2",
+                ], timeout=6)
+                last_error = None
+                break
+            except (OSError, subprocess.SubprocessError) as error:
+                last_error = error
+                if attempt == 1:
+                    invalidate_cache()
+                    monitor = detect(force=True)
+                time.sleep(0.15)
+        if last_error is not None:
+            raise last_error
     print(json.dumps({
         "ok": True,
         "control": name,
@@ -168,6 +358,8 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("status")
+    sub.add_parser("detect")
+    sub.add_parser("brightness")
     setter = sub.add_parser("set")
     setter.add_argument("control", choices=(*RANGE_CONTROLS, *ENUM_CONTROLS))
     setter.add_argument("value")
@@ -175,6 +367,11 @@ def main() -> int:
     try:
         if args.command == "status":
             return status()
+        if args.command == "detect":
+            print(json.dumps(detect()))
+            return 0
+        if args.command == "brightness":
+            return brightness_status()
         return set_control(args.control, args.value)
     except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as error:
         print(str(error), file=sys.stderr)

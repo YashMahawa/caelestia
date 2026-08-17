@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import configparser
 import difflib
 import fnmatch
 import json
@@ -18,6 +19,7 @@ import tempfile
 import time
 import zipfile
 from pathlib import Path
+from urllib.parse import unquote
 from xml.etree import ElementTree
 
 import numpy as np
@@ -26,6 +28,8 @@ HOME = Path.home()
 APP = HOME / ".local/share/caelestia-search"
 CONFIG_PATH = HOME / ".config/caelestia/semantic-search.json"
 DB_PATH = APP / "index.sqlite3"
+TRASH_INFO_DIR = HOME / ".local/share/Trash/info"
+TRASH_FILES_DIR = HOME / ".local/share/Trash/files"
 MODEL_PATH = HOME / "ML/models/embeddinggemma-300m-int4-ov"
 CACHE_PATH = HOME / ".cache/caelestia-search/embeddinggemma-ov"
 MODEL_ID = "embeddinggemma-300m-int4-sym-g32-ov-v1"
@@ -95,6 +99,11 @@ def connect() -> sqlite3.Connection:
             mtime_ns INTEGER NOT NULL,
             tags TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS trash_index (
+            original_path TEXT PRIMARY KEY,
+            trash_path TEXT NOT NULL,
+            trashed_at INTEGER NOT NULL
+        );
         CREATE INDEX IF NOT EXISTS files_mtime ON files(mtime_ns);
         """
     )
@@ -113,6 +122,67 @@ def connect() -> sqlite3.Connection:
             (time.time_ns(),),
         )
     return db
+
+
+def active_trash_entries() -> dict[str, str]:
+    """Return valid freedesktop Trash moves as original -> retained path."""
+    entries: dict[str, str] = {}
+    try:
+        info_files = list(TRASH_INFO_DIR.glob("*.trashinfo"))
+    except OSError:
+        return entries
+    for info_path in info_files:
+        trashed_path = TRASH_FILES_DIR / info_path.name.removesuffix(".trashinfo")
+        if not trashed_path.exists():
+            continue
+        parser = configparser.ConfigParser(interpolation=None)
+        try:
+            parser.read(info_path, encoding="utf-8")
+            encoded = parser.get("Trash Info", "Path")
+            original = Path(unquote(encoded))
+            if not original.is_absolute():
+                original = HOME / original
+            original = original.absolute()
+            original.relative_to(HOME)
+        except (OSError, ValueError, configparser.Error, configparser.NoSectionError):
+            continue
+        entries[str(original)] = str(trashed_path)
+    return entries
+
+
+def sync_trash_index(db: sqlite3.Connection) -> set[str]:
+    """Mirror active Trash metadata without indexing the Trash contents."""
+    entries = active_trash_entries()
+    active = set(entries)
+    if active:
+        placeholders = ",".join("?" for _ in active)
+        db.execute(
+            f"DELETE FROM trash_index WHERE original_path NOT IN ({placeholders})",
+            tuple(active),
+        )
+    else:
+        db.execute("DELETE FROM trash_index")
+    now = time.time_ns()
+    for original, trashed in entries.items():
+        # Only retain data that was actually indexed before it entered Trash.
+        indexed = db.execute(
+            "SELECT 1 FROM files WHERE path=? OR path LIKE ? LIMIT 1",
+            (original, original.rstrip(os.sep) + os.sep + "%"),
+        ).fetchone()
+        if indexed:
+            db.execute(
+                "INSERT INTO trash_index(original_path,trash_path,trashed_at) VALUES(?,?,?) "
+                "ON CONFLICT(original_path) DO UPDATE SET trash_path=excluded.trash_path",
+                (original, trashed, now),
+            )
+    return active
+
+
+TRASH_EXCLUSION = (
+    "NOT EXISTS (SELECT 1 FROM trash_index AS trash "
+    "WHERE files.path=trash.original_path "
+    "OR files.path LIKE trash.original_path || '/' || '%')"
+)
 
 
 def excluded(path: Path, cfg: dict) -> bool:
@@ -448,6 +518,7 @@ def queue_name(db: sqlite3.Connection, path: Path):
 def discover(full: bool = False):
     cfg = config()
     db = connect()
+    sync_trash_index(db)
     if full:
         db.execute("CREATE TEMP TABLE seen_paths(path TEXT PRIMARY KEY)")
     seen: set[str] = set()
@@ -457,6 +528,10 @@ def discover(full: bool = False):
         seen.add(raw)
         if full:
             db.execute("INSERT OR IGNORE INTO seen_paths(path) VALUES(?)", (raw,))
+        db.execute(
+            "DELETE FROM trash_index WHERE original_path=?",
+            (raw,),
+        )
         stat = path.stat()
         row = db.execute("SELECT size, mtime_ns FROM files WHERE path=?", (raw,)).fetchone()
         kind = "folder" if path.is_dir() else "file"
@@ -473,17 +548,26 @@ def discover(full: bool = False):
             )
             queue_name(db, path)
         expected_size = 0 if kind == "folder" else stat.st_size
-        if full or row != (expected_size, stat.st_mtime_ns):
+        # A full scan means full deletion reconciliation, not re-embedding
+        # every unchanged document. New rows and changed metadata still queue.
+        if row != (expected_size, stat.st_mtime_ns):
             if content_supported(path, cfg):
                 queue_path(db, path)
                 queued += 1
             else:
                 db.execute("DELETE FROM pending WHERE path=?", (raw,))
     if full:
-        db.execute("DELETE FROM files WHERE path NOT IN (SELECT path FROM seen_paths)")
-        db.execute("DELETE FROM pending WHERE path NOT IN (SELECT path FROM seen_paths)")
-        db.execute("DELETE FROM name_pending WHERE path NOT IN (SELECT path FROM seen_paths)")
-        db.execute("DELETE FROM visual_tags WHERE path NOT IN (SELECT path FROM seen_paths)")
+        retained = (
+            "EXISTS (SELECT 1 FROM trash_index AS trash "
+            "WHERE files.path=trash.original_path "
+            "OR files.path LIKE trash.original_path || '/' || '%')"
+        )
+        db.execute(
+            f"DELETE FROM files WHERE path NOT IN (SELECT path FROM seen_paths) AND NOT {retained}"
+        )
+        db.execute("DELETE FROM pending WHERE path NOT IN (SELECT path FROM files)")
+        db.execute("DELETE FROM name_pending WHERE path NOT IN (SELECT path FROM files)")
+        db.execute("DELETE FROM visual_tags WHERE path NOT IN (SELECT path FROM files)")
         # FTS5 has no normal index on its unindexed path column. Rebuilding once
         # is dramatically cheaper than thousands of per-path virtual-table scans.
         db.execute("DELETE FROM files_fts")
@@ -667,7 +751,7 @@ def search(query: str, count: int = 20, json_output: bool = False):
     rows = db.execute(
         "SELECT path,name,parent,mime,size,mtime_ns,"
         "COALESCE(vector,name_vector),COALESCE(vector_dim,name_vector_dim),kind "
-        "FROM files WHERE vector IS NOT NULL OR name_vector IS NOT NULL"
+        f"FROM files WHERE (vector IS NOT NULL OR name_vector IS NOT NULL) AND {TRASH_EXCLUSION}"
     ).fetchall()
     if os.environ.get("CAELESTIA_LEXICAL_ONLY") == "1":
         rows = []
@@ -708,7 +792,9 @@ def search(query: str, count: int = 20, json_output: bool = False):
     try:
         terms = " OR ".join(f'"{word.replace(chr(34), "")}"' for word in query_terms)
         if terms:
-            document_count = max(1, int(db.execute("SELECT count(*) FROM files").fetchone()[0]))
+            document_count = max(1, int(db.execute(
+                f"SELECT count(*) FROM files WHERE {TRASH_EXCLUSION}"
+            ).fetchone()[0]))
             term_weights: dict[str, float] = {}
             for term in query_terms:
                 frequency = int(db.execute(
@@ -718,7 +804,10 @@ def search(query: str, count: int = 20, json_output: bool = False):
             total_weight = sum(term_weights.values()) or 1.0
             for position, (raw, name, parent, text, _rank) in enumerate(db.execute(
                 "SELECT path,name,parent,text,bm25(files_fts,1.0,3.0,1.5,0.5) FROM files_fts "
-                "WHERE files_fts MATCH ? ORDER BY rank LIMIT 100", (terms,)
+                "WHERE files_fts MATCH ? AND NOT EXISTS ("
+                "SELECT 1 FROM trash_index AS trash WHERE files_fts.path=trash.original_path "
+                "OR files_fts.path LIKE trash.original_path || '/' || '%') "
+                "ORDER BY rank LIMIT 100", (terms,)
             )):
                 name_folded = name.casefold()
                 haystack = f"{name}\n{parent}\n{text}".casefold()
@@ -752,7 +841,7 @@ def search(query: str, count: int = 20, json_output: bool = False):
         # handled by FTS; this bounded pool exists only for genuine typos.
         needle = query_folded[:2]
         fuzzy_rows = db.execute(
-            "SELECT path,name FROM files WHERE instr(lower(name),?)>0 "
+            f"SELECT path,name FROM files WHERE instr(lower(name),?)>0 AND {TRASH_EXCLUSION} "
             "ORDER BY abs(length(name)-?) LIMIT 2000",
             (needle, len(query_folded)),
         )
@@ -785,7 +874,8 @@ def search(query: str, count: int = 20, json_output: bool = False):
     if named_paths:
         placeholders = ",".join("?" for _ in named_paths)
         for row in db.execute(
-            f"SELECT path,name,parent,mime,size,mtime_ns,vector,vector_dim,kind FROM files WHERE path IN ({placeholders})",
+            f"SELECT path,name,parent,mime,size,mtime_ns,vector,vector_dim,kind FROM files "
+            f"WHERE path IN ({placeholders}) AND {TRASH_EXCLUSION}",
             tuple(named_paths),
         ):
             if row[0] in candidates:
@@ -859,9 +949,11 @@ def status():
     pending = db.execute("SELECT count(*) FROM pending").fetchone()[0]
     name_pending = db.execute("SELECT count(*) FROM name_pending").fetchone()[0]
     name_vectors = db.execute("SELECT count(*) FROM files WHERE name_vector IS NOT NULL").fetchone()[0]
+    trashed = db.execute("SELECT count(*) FROM trash_index").fetchone()[0]
     size = DB_PATH.stat().st_size if DB_PATH.exists() else 0
     print(json.dumps({"files": files, "pending": pending, "name_pending": name_pending,
-                      "name_vectors": name_vectors, "database_bytes": size}))
+                      "name_vectors": name_vectors, "trashed": trashed,
+                      "database_bytes": size}))
 
 
 def main():

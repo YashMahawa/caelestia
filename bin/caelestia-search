@@ -84,7 +84,7 @@ def main() -> int:
     if args.command == "status":
         return subprocess.call([str(ENGINE), "status"], env={**os.environ, "CAELESTIA_TORCH_AUTO_GPU": "0"})
     if args.command == "scan":
-        return subprocess.call([str(ENGINE), "scan"], env={**os.environ, "CAELESTIA_TORCH_AUTO_GPU": "0"})
+        return subprocess.call([str(ENGINE), "scan", "--full"], env={**os.environ, "CAELESTIA_TORCH_AUTO_GPU": "0"})
     parser.print_help()
     return 0
 

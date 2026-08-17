@@ -15,6 +15,7 @@ import pyinotify
 HOME = Path.home()
 CONFIG = HOME / ".config/caelestia/semantic-search.json"
 DB = HOME / ".local/share/caelestia-search/index.sqlite3"
+TRASH_INFO = HOME / ".local/share/Trash/info"
 CFG = json.loads(CONFIG.read_text())
 EXCLUDED_DIRECTORIES = set(CFG["exclude_directories"])
 WATCH_ROOTS = {Path(raw).expanduser() for raw in CFG["roots"]}
@@ -112,6 +113,7 @@ class Handler(pyinotify.ProcessEvent):
             "CREATE TABLE IF NOT EXISTS name_pending(path TEXT PRIMARY KEY, queued_at INTEGER NOT NULL)"
         )
         path = event.pathname
+        trash_event = Path(path).is_relative_to(TRASH_INFO)
         if event.mask & (pyinotify.IN_DELETE | pyinotify.IN_MOVED_FROM):
             escaped_path = path.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
             descendants = escaped_path + os.sep + "%"
@@ -123,39 +125,38 @@ class Handler(pyinotify.ProcessEvent):
                 "DELETE FROM name_pending WHERE path=? OR path LIKE ? ESCAPE '\\'",
                 (path, descendants),
             )
-            try:
-                db.execute(
-                    "DELETE FROM files WHERE path=? OR path LIKE ? ESCAPE '\\'",
-                    (path, descendants),
-                )
-                db.execute(
-                    "DELETE FROM files_fts WHERE path=? OR path LIKE ? ESCAPE '\\'",
-                    (path, descendants),
-                )
-            except sqlite3.OperationalError:
-                pass
+            # Do not destroy vectors here: a move to freedesktop Trash should
+            # hide the item but retain its index for an instant restore. The
+            # delayed full scan distinguishes Trash moves from true deletion.
         else:
             candidate = Path(path)
             if (
                 (not candidate.is_file() and not candidate.is_dir())
-                or excluded_watch_path(candidate)
+                or (excluded_watch_path(candidate) and not trash_event)
             ):
                 db.close()
                 return
-            if candidate.is_dir():
+            if candidate.is_dir() and not trash_event:
                 manager.add_watch(
                     str(candidate), MASK, rec=True, auto_add=True,
                     exclude_filter=excluded_watch_path,
                 )
-            try:
-                for discovered in candidate_tree(candidate):
-                    record_candidate(db, discovered)
-            except (OSError, sqlite3.OperationalError):
-                pass
+            if not trash_event:
+                try:
+                    for discovered in candidate_tree(candidate):
+                        record_candidate(db, discovered)
+                except (OSError, sqlite3.OperationalError):
+                    pass
         db.commit()
         db.close()
         now = time.monotonic()
-        if now - self.last_wake > 20:
+        if event.mask & (pyinotify.IN_DELETE | pyinotify.IN_MOVED_FROM) or trash_event:
+            subprocess.run(
+                ["systemd-run", "--user", "--collect", "--unit=caelestia-search-reconcile",
+                 "--on-active=1s", str(HOME / ".local/bin/caelestia-search"), "scan"],
+                check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        if not trash_event and now - self.last_wake > 20:
             subprocess.run(
                 ["systemctl", "--user", "start", "--no-block", "caelestia-semantic-index.service"],
                 check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -172,4 +173,6 @@ for root in WATCH_ROOTS:
             str(root), MASK, rec=True, auto_add=True,
             exclude_filter=excluded_watch_path,
         )
+if TRASH_INFO.is_dir():
+    manager.add_watch(str(TRASH_INFO), MASK, rec=False, auto_add=False)
 notifier.loop()

@@ -285,9 +285,30 @@ class Embedder:
         self.query = query
         self.batch_size = batch_size or (1 if query else 4)
         self.sequence_length = 128
-        # Long iGPU model workloads have stalled the compositor on this laptop.
-        # Query-time vector scoring remains iGPU accelerated where worthwhile.
-        self.device = os.environ.get("CAELESTIA_SEARCH_EMBED_DEVICE", "CPU")
+        override = os.environ.get("CAELESTIA_SEARCH_EMBED_DEVICE")
+        if override:
+            self.device = override
+        elif query:
+            # Query batches are tiny and benefit most from low-latency iGPU
+            # execution; vector scoring below is iGPU accelerated as well.
+            self.device = "GPU"
+        else:
+            # Use both processors only while the desktop is genuinely idle.
+            # A playing MPRIS source keeps the iGPU free for video decoding,
+            # while Nice/CPUWeight/IOWeight still make CPU work yield quickly.
+            try:
+                playing = subprocess.run(
+                    ["playerctl", "-a", "status"], capture_output=True,
+                    text=True, timeout=1, check=False,
+                ).stdout.splitlines()
+            except (OSError, subprocess.TimeoutExpired):
+                playing = []
+            load_per_cpu = os.getloadavg()[0] / max(1, os.cpu_count() or 1)
+            self.device = (
+                "MULTI:GPU,CPU"
+                if "Playing" not in playing and load_per_cpu < 0.35
+                else "CPU"
+            )
         device_cache = CACHE_PATH / self.device.casefold()
         device_cache.mkdir(parents=True, exist_ok=True)
         # The low-level Rust tokenizer produces byte-for-byte identical IDs for

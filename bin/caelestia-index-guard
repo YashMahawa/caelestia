@@ -58,9 +58,8 @@ def main() -> int:
     if command_succeeds(["systemctl", "is-active", "--quiet", "waydroid-container.service"]):
         return deny("Waydroid is running")
 
-    # Media playback is allowed.  Index workers are deliberately low priority,
-    # CPU-quota limited, and the visual/semantic services disable automatic GPU
-    # use, so decoding and audio remain responsive while indexing catches up.
+    # Media playback is allowed. The semantic worker detects active MPRIS
+    # playback and keeps embedding on CPU, leaving the iGPU to the decoder.
 
     try:
         load_1m = os.getloadavg()[0]

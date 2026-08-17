@@ -287,7 +287,7 @@ class Embedder:
         self.sequence_length = 128
         # Long iGPU model workloads have stalled the compositor on this laptop.
         # Query-time vector scoring remains iGPU accelerated where worthwhile.
-        self.device = "CPU"
+        self.device = os.environ.get("CAELESTIA_SEARCH_EMBED_DEVICE", "CPU")
         device_cache = CACHE_PATH / self.device.casefold()
         device_cache.mkdir(parents=True, exist_ok=True)
         # The low-level Rust tokenizer produces byte-for-byte identical IDs for

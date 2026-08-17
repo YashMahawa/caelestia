@@ -31,6 +31,71 @@ MASK = (
 )
 
 
+def excluded_watch_path(raw_path):
+    """Keep recursive watches out of caches, repositories and secret trees."""
+    candidate = Path(raw_path)
+    return (
+        bool(set(candidate.parts).intersection(EXCLUDED_DIRECTORIES))
+        or any(
+            fnmatch.fnmatch(candidate.name.casefold(), pattern.casefold())
+            for pattern in CFG["exclude_globs"]
+        )
+    )
+
+
+def candidate_tree(candidate):
+    """Yield a new directory and anything that arrived with it."""
+    yield candidate
+    if not candidate.is_dir():
+        return
+    for directory, child_dirs, files in os.walk(candidate):
+        directory = Path(directory)
+        child_dirs[:] = [
+            name for name in child_dirs
+            if not excluded_watch_path(directory / name)
+        ]
+        if directory != candidate:
+            yield directory
+        for name in files:
+            child = directory / name
+            if not excluded_watch_path(child):
+                yield child
+
+
+def record_candidate(db, candidate):
+    if not (candidate.is_file() or candidate.is_dir()):
+        return
+    stat = candidate.stat()
+    path = str(candidate)
+    content_worthy = candidate.is_file() and (
+        candidate.suffix.casefold() in CONTENT_EXTENSIONS
+        or (not candidate.suffix and stat.st_size <= 2 * 1024 * 1024)
+    ) and stat.st_size <= CFG["max_file_mb"] * 1024 * 1024
+    if content_worthy:
+        db.execute(
+            "INSERT INTO pending(path,queued_at) VALUES(?,?) "
+            "ON CONFLICT(path) DO UPDATE SET queued_at=excluded.queued_at",
+            (path, time.time_ns()),
+        )
+    kind = "folder" if candidate.is_dir() else "file"
+    parent = str(candidate.parent.relative_to(HOME)) if candidate.is_relative_to(HOME) else str(candidate.parent)
+    mime = "inode/directory" if kind == "folder" else (mimetypes.guess_type(candidate.name)[0] or "")
+    existed = db.execute("SELECT 1 FROM files WHERE path=?", (path,)).fetchone()
+    if not existed:
+        db.execute(
+            "INSERT INTO files(path,name,parent,mime,size,mtime_ns,indexed_at,kind) VALUES(?,?,?,?,?,?,0,?)",
+            (path, candidate.name, parent, mime, 0 if kind == "folder" else stat.st_size, stat.st_mtime_ns, kind),
+        )
+        db.execute(
+            "INSERT INTO files_fts(path,name,parent,text) VALUES(?,?,?,?)",
+            (path, candidate.name, parent, ""),
+        )
+        db.execute(
+            "INSERT OR REPLACE INTO name_pending(path,queued_at) VALUES(?,?)",
+            (path, time.time_ns()),
+        )
+
+
 class Handler(pyinotify.ProcessEvent):
     last_wake = 0.0
 
@@ -48,53 +113,43 @@ class Handler(pyinotify.ProcessEvent):
         )
         path = event.pathname
         if event.mask & (pyinotify.IN_DELETE | pyinotify.IN_MOVED_FROM):
-            db.execute("DELETE FROM pending WHERE path=?", (path,))
-            db.execute("DELETE FROM name_pending WHERE path=?", (path,))
+            escaped_path = path.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            descendants = escaped_path + os.sep + "%"
+            db.execute(
+                "DELETE FROM pending WHERE path=? OR path LIKE ? ESCAPE '\\'",
+                (path, descendants),
+            )
+            db.execute(
+                "DELETE FROM name_pending WHERE path=? OR path LIKE ? ESCAPE '\\'",
+                (path, descendants),
+            )
             try:
-                db.execute("DELETE FROM files WHERE path=?", (path,))
-                db.execute("DELETE FROM files_fts WHERE path=?", (path,))
+                db.execute(
+                    "DELETE FROM files WHERE path=? OR path LIKE ? ESCAPE '\\'",
+                    (path, descendants),
+                )
+                db.execute(
+                    "DELETE FROM files_fts WHERE path=? OR path LIKE ? ESCAPE '\\'",
+                    (path, descendants),
+                )
             except sqlite3.OperationalError:
                 pass
         else:
             candidate = Path(path)
             if (
                 (not candidate.is_file() and not candidate.is_dir())
-                or set(candidate.parts).intersection(EXCLUDED_DIRECTORIES)
-                or any(fnmatch.fnmatch(candidate.name.casefold(), pattern.casefold()) for pattern in CFG["exclude_globs"])
+                or excluded_watch_path(candidate)
             ):
                 db.close()
                 return
-            if candidate.is_dir() and candidate.parent in WATCH_ROOTS:
-                manager.add_watch(str(candidate), MASK, rec=False, auto_add=False)
-            content_worthy = candidate.is_file() and (
-                candidate.suffix.casefold() in CONTENT_EXTENSIONS
-                or (not candidate.suffix and candidate.stat().st_size <= 2 * 1024 * 1024)
-            ) and candidate.stat().st_size <= CFG["max_file_mb"] * 1024 * 1024
-            if content_worthy:
-                db.execute(
-                    "INSERT INTO pending(path,queued_at) VALUES(?,?) "
-                    "ON CONFLICT(path) DO UPDATE SET queued_at=excluded.queued_at",
-                    (path, time.time_ns()),
+            if candidate.is_dir():
+                manager.add_watch(
+                    str(candidate), MASK, rec=True, auto_add=True,
+                    exclude_filter=excluded_watch_path,
                 )
             try:
-                stat = candidate.stat()
-                kind = "folder" if candidate.is_dir() else "file"
-                parent = str(candidate.parent.relative_to(HOME)) if candidate.is_relative_to(HOME) else str(candidate.parent)
-                mime = "inode/directory" if kind == "folder" else (mimetypes.guess_type(candidate.name)[0] or "")
-                existed = db.execute("SELECT 1 FROM files WHERE path=?", (path,)).fetchone()
-                if not existed:
-                    db.execute(
-                        "INSERT INTO files(path,name,parent,mime,size,mtime_ns,indexed_at,kind) VALUES(?,?,?,?,?,?,0,?)",
-                        (path, candidate.name, parent, mime, 0 if kind == "folder" else stat.st_size, stat.st_mtime_ns, kind),
-                    )
-                    db.execute(
-                        "INSERT INTO files_fts(path,name,parent,text) VALUES(?,?,?,?)",
-                        (path, candidate.name, parent, ""),
-                    )
-                    db.execute(
-                        "INSERT OR REPLACE INTO name_pending(path,queued_at) VALUES(?,?)",
-                        (path, time.time_ns()),
-                    )
+                for discovered in candidate_tree(candidate):
+                    record_candidate(db, discovered)
             except (OSError, sqlite3.OperationalError):
                 pass
         db.commit()
@@ -113,11 +168,8 @@ handler = Handler()
 notifier = pyinotify.Notifier(manager, handler)
 for root in WATCH_ROOTS:
     if root.is_dir():
-        manager.add_watch(str(root), MASK, rec=False, auto_add=False)
-        try:
-            for child in root.iterdir():
-                if child.is_dir() and child.name not in EXCLUDED_DIRECTORIES:
-                    manager.add_watch(str(child), MASK, rec=False, auto_add=False)
-        except OSError:
-            pass
+        manager.add_watch(
+            str(root), MASK, rec=True, auto_add=True,
+            exclude_filter=excluded_watch_path,
+        )
 notifier.loop()

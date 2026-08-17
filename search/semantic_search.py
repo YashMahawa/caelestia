@@ -499,11 +499,42 @@ def remove_path(db: sqlite3.Connection, raw: str):
     db.execute("DELETE FROM name_pending WHERE path=?", (raw,))
 
 
+def cpu_temperature() -> float | None:
+    readings: list[float] = []
+    for zone in Path("/sys/class/thermal").glob("thermal_zone*"):
+        try:
+            kind = (zone / "type").read_text().strip()
+            if kind not in {"x86_pkg_temp", "cpu_thermal", "acpitz"}:
+                continue
+            value = float((zone / "temp").read_text().strip()) / 1000
+            if 0 < value < 130:
+                readings.append(value)
+        except (OSError, ValueError):
+            continue
+    return max(readings) if readings else None
+
+
+def wait_for_safe_temperature() -> None:
+    """Yield between embedding batches if sustained indexing gets too hot."""
+    temperature = cpu_temperature()
+    if temperature is None or temperature < 72:
+        return
+    print(
+        f"caelestia-search: pausing at {temperature:.1f} C until below 65 C",
+        file=sys.stderr,
+        flush=True,
+    )
+    while temperature is not None and temperature >= 65:
+        time.sleep(5)
+        temperature = cpu_temperature()
+
+
 def work_names(db: sqlite3.Connection, cfg: dict, limit: int = 384) -> int:
     """Give every path a semantic filename vector before costly content OCR."""
     embedder: Embedder | None = None
     processed = 0
     while processed < limit:
+        wait_for_safe_temperature()
         batch_rows = db.execute(
             "SELECT path FROM name_pending ORDER BY queued_at DESC LIMIT 16"
         ).fetchall()
@@ -543,6 +574,7 @@ def work(limit: int = 0):
     embedder: Embedder | None = None
     processed = failed = 0
     while True:
+        wait_for_safe_temperature()
         # User documents are the main semantic-search target.  Keep source trees
         # name-searchable, but do not let a large repository rebuild hold PDFs,
         # notes, downloads, and media metadata behind thousands of code files.

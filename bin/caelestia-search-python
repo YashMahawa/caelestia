@@ -1,0 +1,12 @@
+#!/bin/sh
+# Run semantic/visual ML workers in the configured environment while keeping
+# cheap lexical and watcher operations on the system interpreter.
+python_bin="${CAELESTIA_SEARCH_PYTHON:-}"
+if [ -z "$python_bin" ]; then
+    if [ -x "$HOME/ML/.venv/bin/python" ]; then
+        python_bin="$HOME/ML/.venv/bin/python"
+    else
+        python_bin="$(command -v python3)"
+    fi
+fi
+exec "$python_bin" "$@"

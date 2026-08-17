@@ -304,9 +304,18 @@ class Embedder:
             except (OSError, subprocess.TimeoutExpired):
                 playing = []
             load_per_cpu = os.getloadavg()[0] / max(1, os.cpu_count() or 1)
+            temperatures = []
+            for zone in Path("/sys/class/thermal").glob("thermal_zone*"):
+                try:
+                    value = float((zone / "temp").read_text().strip()) / 1000
+                    if 0 < value < 130:
+                        temperatures.append(value)
+                except (OSError, ValueError):
+                    continue
+            cool_enough = not temperatures or max(temperatures) < 55
             self.device = (
                 "MULTI:GPU,CPU"
-                if "Playing" not in playing and load_per_cpu < 0.35
+                if cool_enough and "Playing" not in playing and load_per_cpu < 0.25
                 else "CPU"
             )
         device_cache = CACHE_PATH / self.device.casefold()

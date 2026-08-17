@@ -4,6 +4,7 @@ ConditionACPower=true
 
 [Service]
 Environment=CAELESTIA_TORCH_AUTO_GPU=0
+Environment=TOKENIZERS_PARALLELISM=false
 Type=oneshot
 ExecCondition=%h/.local/bin/caelestia-index-guard
 ExecStart=/usr/bin/flock -n -E 0 %t/caelestia-index-writer.lock %h/.local/bin/caelestia-semantic-search work --limit 16

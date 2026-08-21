@@ -5,42 +5,101 @@ log() {
     printf '%s\n' "$*" >&2
 }
 
+LOGINCTL="${LOGINCTL:-loginctl}"
+SETPRIV="${SETPRIV:-/usr/bin/setpriv}"
+TIMEOUT="${TIMEOUT:-/usr/bin/timeout}"
+SLEEP="${SLEEP:-/usr/bin/sleep}"
+GETENT="${GETENT:-getent}"
+
+LOGIND_RETRIES="${CAELESTIA_LOGIND_RETRIES:-5}"
+LOGIND_DELAY="${CAELESTIA_LOGIND_DELAY:-0.1}"
+LOCK_ACK_TIMEOUT="${CAELESTIA_LOCK_ACK_TIMEOUT:-4}"
+LOCK_CONFIRM_RETRIES="${CAELESTIA_LOCK_CONFIRM_RETRIES:-20}"
+LOCK_CONFIRM_INTERVAL="${CAELESTIA_LOCK_CONFIRM_INTERVAL:-0.15}"
+
 session_id=""
 user_id=""
 user_name=""
 
-while read -r candidate _; do
-    [[ -n "$candidate" ]] || continue
-    active="$(loginctl show-session "$candidate" -p Active --value 2>/dev/null || true)"
-    remote="$(loginctl show-session "$candidate" -p Remote --value 2>/dev/null || true)"
-    type="$(loginctl show-session "$candidate" -p Type --value 2>/dev/null || true)"
-    if [[ "$active" == "yes" && "$remote" == "no" && ( "$type" == "wayland" || "$type" == "x11" ) ]]; then
-        session_id="$candidate"
-        user_id="$(loginctl show-session "$candidate" -p User --value)"
-        user_name="$(loginctl show-session "$candidate" -p Name --value)"
+find_active_session() {
+    local candidate active remote type class
+    session_id=""
+    user_id=""
+    user_name=""
+
+    while read -r candidate _; do
+        [[ -n "$candidate" ]] || continue
+        active="$("$LOGINCTL" show-session "$candidate" -p Active --value 2>/dev/null || true)"
+        remote="$("$LOGINCTL" show-session "$candidate" -p Remote --value 2>/dev/null || true)"
+        type="$("$LOGINCTL" show-session "$candidate" -p Type --value 2>/dev/null || true)"
+        class="$("$LOGINCTL" show-session "$candidate" -p Class --value 2>/dev/null || true)"
+
+        if [[ "$active" == "yes" && "$remote" == "no" && ( "$type" == "wayland" || "$type" == "x11" ) && "$class" != "greeter" ]]; then
+            session_id="$candidate"
+            user_id="$("$LOGINCTL" show-session "$candidate" -p User --value 2>/dev/null || true)"
+            user_name="$("$LOGINCTL" show-session "$candidate" -p Name --value 2>/dev/null || true)"
+            if [[ -n "$session_id" && -n "$user_id" && -n "$user_name" ]]; then
+                return 0
+            fi
+        fi
+    done < <("$LOGINCTL" list-sessions --no-legend 2>/dev/null || true)
+
+    return 1
+}
+
+is_session_active() {
+    local sid="$1"
+    [[ -n "$sid" ]] || return 1
+    local active remote type class
+    active="$("$LOGINCTL" show-session "$sid" -p Active --value 2>/dev/null || true)"
+    remote="$("$LOGINCTL" show-session "$sid" -p Remote --value 2>/dev/null || true)"
+    type="$("$LOGINCTL" show-session "$sid" -p Type --value 2>/dev/null || true)"
+    class="$("$LOGINCTL" show-session "$sid" -p Class --value 2>/dev/null || true)"
+
+    [[ "$active" == "yes" && "$remote" == "no" && ( "$type" == "wayland" || "$type" == "x11" ) && "$class" != "greeter" ]]
+}
+
+# Bounded retries for logind state settling
+for ((i=1; i<=LOGIND_RETRIES; i++)); do
+    if find_active_session; then
         break
     fi
-done < <(loginctl list-sessions --no-legend 2>/dev/null || true)
+    if (( i < LOGIND_RETRIES )); then
+        "$SLEEP" "$LOGIND_DELAY" 2>/dev/null || true
+    fi
+done
 
 if [[ -z "$session_id" || -z "$user_id" || -z "$user_name" ]]; then
-    log "pre-sleep: no active local graphical session; nothing to lock"
+    log "pre-sleep: no active graphical user session found; allowing sleep"
     exit 0
 fi
 
-user_home="$(getent passwd "$user_id" | cut -d: -f6)"
+user_home="$("$GETENT" passwd "$user_id" 2>/dev/null | cut -d: -f6 || true)"
+if [[ -z "$user_home" ]]; then
+    user_home="/home/${user_name}"
+fi
 runtime_dir="/run/user/${user_id}"
 bus="unix:path=${runtime_dir}/bus"
-ipc="${user_home}/.local/bin/caelestia-qs-ipc"
+ipc="${CAELESTIA_IPC_PATH:-${user_home}/.local/bin/caelestia-qs-ipc}"
 
 run_user() {
-    /usr/bin/setpriv --reuid="$user_id" --regid="$user_id" --init-groups \
-        /usr/bin/env \
+    if [[ -n "${CAELESTIA_TEST_NO_SETPRIV:-}" ]]; then
         HOME="$user_home" \
         USER="$user_name" \
         LOGNAME="$user_name" \
         XDG_RUNTIME_DIR="$runtime_dir" \
         DBUS_SESSION_BUS_ADDRESS="$bus" \
         "$@"
+    else
+        "$SETPRIV" --reuid="$user_id" --regid="$user_id" --init-groups \
+            /usr/bin/env \
+            HOME="$user_home" \
+            USER="$user_name" \
+            LOGNAME="$user_name" \
+            XDG_RUNTIME_DIR="$runtime_dir" \
+            DBUS_SESSION_BUS_ADDRESS="$bus" \
+            "$@"
+    fi
 }
 
 if [[ "${CAELESTIA_LOCK_GUARD_DRY_RUN:-0}" == "1" ]]; then
@@ -50,28 +109,48 @@ if [[ "${CAELESTIA_LOCK_GUARD_DRY_RUN:-0}" == "1" ]]; then
 fi
 
 if [[ ! -x "$ipc" ]]; then
-    log "pre-sleep: Caelestia IPC helper is unavailable for ${user_name}; refusing unsafe sleep"
-    exit 1
+    if is_session_active "$session_id"; then
+        log "pre-sleep: Caelestia IPC helper is unavailable for ${user_name}; refusing unsafe sleep"
+        exit 1
+    else
+        log "pre-sleep: session ${session_id} is no longer active; allowing sleep"
+        exit 0
+    fi
 fi
 
 log "pre-sleep: requesting Caelestia lock for ${user_name} (session ${session_id})"
-if ! run_user /usr/bin/timeout 4 "$ipc" lock safeLock >&2; then
-    log "pre-sleep: lock request failed; refusing unsafe sleep"
-    exit 1
+if ! run_user "$TIMEOUT" "$LOCK_ACK_TIMEOUT" "$ipc" lock safeLock >&2; then
+    if is_session_active "$session_id"; then
+        log "pre-sleep: lock request failed; refusing unsafe sleep"
+        exit 1
+    else
+        log "pre-sleep: session ${session_id} disappeared during lock request; allowing sleep"
+        exit 0
+    fi
 fi
 
 locked=false
-for _ in $(/usr/bin/seq 1 20); do
-    if run_user /usr/bin/timeout 1 "$ipc" lock isLocked 2>/dev/null | /usr/bin/grep -qx true; then
+for ((i=1; i<=LOCK_CONFIRM_RETRIES; i++)); do
+    if run_user "$TIMEOUT" 1 "$ipc" lock isLocked 2>/dev/null | grep -qx true; then
         locked=true
         break
     fi
-    /usr/bin/sleep 0.15
+    if ! is_session_active "$session_id"; then
+        log "pre-sleep: session ${session_id} disappeared during lock verification; allowing sleep"
+        exit 0
+    fi
+    "$SLEEP" "$LOCK_CONFIRM_INTERVAL" 2>/dev/null || true
 done
 
 if [[ "$locked" != true ]]; then
-    log "pre-sleep: secure lock confirmation timed out; refusing unsafe sleep"
-    exit 1
+    if is_session_active "$session_id"; then
+        log "pre-sleep: secure lock confirmation timed out; refusing unsafe sleep"
+        exit 1
+    else
+        log "pre-sleep: session ${session_id} disappeared; allowing sleep"
+        exit 0
+    fi
 fi
 
 log "pre-sleep: secure lock confirmed; kernel will manage output power"
+exit 0

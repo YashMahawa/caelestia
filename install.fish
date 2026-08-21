@@ -135,11 +135,11 @@ end
 
 
 # Install AUR helper if not already installed
-if ! pacman -Q $aur_helper &> /dev/null
+if command -qs pacman; and ! pacman -Q $aur_helper &> /dev/null
     log "$aur_helper not installed. Installing..."
 
     # Install
-    sudo pacman -S --needed git base-devel $noconfirm
+    pacman -S --needed git base-devel $noconfirm
     cd /tmp
     git clone https://aur.archlinux.org/$aur_helper.git
     cd $aur_helper
@@ -220,11 +220,9 @@ if set -q _flag_spotify
     set -l has_spicetify (pacman -Q spicetify-cli 2> /dev/null)
     $aur_helper -S --needed spotify spicetify-cli spicetify-marketplace-bin $noconfirm
 
-    # Set permissions and init if new install
+    # Init if new install
     if test -z "$has_spicetify"
-        sudo chmod a+wr /opt/spotify
-        sudo chmod a+wr /opt/spotify/Apps -R
-        spicetify backup apply
+        spicetify backup apply 2>/dev/null || true
     end
 
     # Install configs
@@ -265,9 +263,11 @@ if set -q _flag_discord
     log 'Installing discord...'
     $aur_helper -S --needed discord equicord-installer-bin $noconfirm
 
-    # Install OpenAsar and Equicord
-    sudo Equilotl -install -location /opt/discord
-    sudo Equilotl -install-openasar -location /opt/discord
+    # Install OpenAsar and Equicord in user directory
+    set -l discord_user_dir $HOME/.config/discord
+    mkdir -p $discord_user_dir
+    Equilotl -install -location $discord_user_dir 2>/dev/null || true
+    Equilotl -install-openasar -location $discord_user_dir 2>/dev/null || true
 
     # Remove installer
     $aur_helper -Rns equicord-installer-bin $noconfirm

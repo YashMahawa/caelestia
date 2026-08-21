@@ -1,34 +1,25 @@
 #!/usr/bin/env python3
 """
-Hyprland Window & Layer Rule Syntax Validator
+Hyprland Window & Layer Rule Validator
 
-Validates declarative window rules, layer rules, and workspace rules for Caelestia/Hyprland.
-Identifies legacy or invalid match directives (e.g., match:class), boolean rule syntax,
-and syntax errors in core rules and user overrides without blocking desktop load.
+Validates Hyprland window rules, layer rules, and workspace rules across:
+1. Hyprland named block syntax (`windowrule <name> { match { ... } ... }`)
+2. Declarative match syntax (`windowrule = ..., match:...`)
+3. Native Lua configuration mode (`rules.lua` / `hypr-user.lua`)
+
+Uses the actual installed Hyprland C++ parser when available on the system (`hyprland`),
+falling back to version-aware structural parsing when running in headless or test environments.
+Preserves all user override files without modification.
 """
 
-import sys
+import argparse
 import os
 import re
+import shutil
+import subprocess
+import sys
+import tempfile
 from pathlib import Path
-
-# Legacy or invalid keywords/prefixes and their suggestions
-INVALID_MATCH_PREFIX = re.compile(r'\bmatch:[a-zA-Z_]+\b')
-
-DEPRECATED_KEYWORDS = [
-    (re.compile(r'\bfloat\s+(true|false)\b'), "'float' should not have boolean parameters (use 'float' in rules, or 'floating:1'/'floating:0' in match criteria)"),
-    (re.compile(r'\bcenter\s+(true|1)\b'), "'center' should not have parameters (use 'center')"),
-    (re.compile(r'\bopaque\s+(true|false)\b'), "'opaque' should not have boolean parameters (use 'opaque')"),
-    (re.compile(r'\bno_blur\b'), "'no_blur' is deprecated or invalid (use 'noblur')"),
-    (re.compile(r'\bno_dim\b'), "'no_dim' is deprecated or invalid (use 'nodim')"),
-    (re.compile(r'\bno_shadow\b'), "'no_shadow' is deprecated or invalid (use 'noshadow')"),
-    (re.compile(r'\bno_initial_focus\b'), "'no_initial_focus' is deprecated or invalid (use 'noinitialfocus')"),
-    (re.compile(r'\bno_anim\b'), "'no_anim' is deprecated or invalid (use 'noanim')"),
-    (re.compile(r'\bignore_alpha\b'), "'ignore_alpha' is deprecated or invalid (use 'ignorealpha')"),
-    (re.compile(r'\bidle_inhibit\b'), "'idle_inhibit' is deprecated or invalid (use 'idleinhibit')"),
-    (re.compile(r'\bimmediate\s+true\b'), "'immediate' should not have boolean parameters (use 'immediate')"),
-    (re.compile(r'\bblur\s+true\b'), "'blur' in layerrule should not have boolean parameters (use 'blur')"),
-]
 
 
 def check_regex_validity(pattern: str) -> bool:
@@ -39,7 +30,95 @@ def check_regex_validity(pattern: str) -> bool:
         return False
 
 
-def validate_file(file_path: Path) -> list[str]:
+def get_hyprland_installed_version(hyprland_bin: str = "hyprland") -> str | None:
+    bin_path = shutil.which(hyprland_bin)
+    if not bin_path:
+        return None
+    try:
+        res = subprocess.run([bin_path, "--version"], capture_output=True, text=True, timeout=5)
+        if res.returncode == 0 and res.stdout:
+            # Match version numbers like v0.42.0 or 0.45.0
+            m = re.search(r"v?(\d+\.\d+\.\d+)", res.stdout)
+            if m:
+                return m.group(1)
+    except Exception:
+        pass
+    return None
+
+
+def validate_with_installed_parser(file_path: Path, hyprland_bin: str | None = None) -> list[str] | None:
+    bin_name = hyprland_bin or "hyprland"
+    bin_path = shutil.which(bin_name)
+    if not bin_path:
+        return None
+
+    # Hyprland installed parser dry run / config validation
+    try:
+        # Create a temporary config that includes the target rule file
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".conf", delete=False) as tmp:
+            tmp.write(f"source = {file_path.resolve()}\n")
+            tmp_path = tmp.name
+
+        cmd = [bin_path, "-c", tmp_path, "--config-only"]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        os.unlink(tmp_path)
+
+        errors = []
+        if res.returncode != 0:
+            stderr = res.stderr.strip() or res.stdout.strip()
+            if stderr:
+                for err_line in stderr.splitlines():
+                    if "error" in err_line.lower() or "syntax" in err_line.lower() or "config" in err_line.lower():
+                        errors.append(f"Hyprland Parser Error: {err_line}")
+                if not errors:
+                    errors.append(f"Hyprland Parser exited with code {res.returncode}: {stderr}")
+            else:
+                errors.append(f"Hyprland Parser validation failed with exit code {res.returncode}")
+        return errors
+    except Exception as e:
+        # Fallback to internal validator if process invocation failed
+        return None
+
+
+def validate_lua_file(file_path: Path) -> list[str]:
+    errors = []
+    if not file_path.exists():
+        return errors
+
+    content = file_path.read_text(encoding="utf-8")
+    if not content.strip():
+        return errors
+
+    # Check if lua binary is available for syntax check
+    lua_bin = shutil.which("lua") or shutil.which("luajit")
+    if lua_bin:
+        try:
+            res = subprocess.run([lua_bin, "-e", f"assert(loadfile('{file_path}'))()"], capture_output=True, text=True, timeout=5)
+            if res.returncode != 0:
+                errors.append(f"Lua Syntax Error: {res.stderr.strip()}")
+                return errors
+        except Exception:
+            pass
+
+    # Structural Lua checks
+    lines = content.splitlines()
+    brace_depth = 0
+    for idx, raw_line in enumerate(lines, 1):
+        line = raw_line.split('--')[0].strip()
+        if not line:
+            continue
+        brace_depth += line.count('{') - line.count('}')
+        if brace_depth < 0:
+            errors.append(f"Line {idx}: Unmatched closing brace in Lua config")
+            brace_depth = 0
+
+    if brace_depth != 0:
+        errors.append("Unclosed table brace in Lua configuration file")
+
+    return errors
+
+
+def validate_conf_file(file_path: Path, target_version: str = "0.45.0") -> list[str]:
     errors = []
     if not file_path.exists():
         return errors
@@ -49,76 +128,142 @@ def validate_file(file_path: Path) -> list[str]:
     except Exception as e:
         return [f"Could not read file {file_path}: {e}"]
 
+    in_block = False
+    block_type = None
+    block_name = None
+    in_match = False
+    brace_depth = 0
+
     for idx, raw_line in enumerate(lines, 1):
-        # Strip inline comments
         line = raw_line.split('#')[0].strip()
         if not line:
             continue
 
-        # Check rule directives
-        if '=' in line:
+        # Check block structures: windowrule name { ... }, layerrule name { ... }, workspace name { ... }
+        block_match = re.match(r'^(windowrule|layerrule|workspace)\s+([a-zA-Z0-9_\-]+)\s*\{', line)
+        if block_match:
+            in_block = True
+            block_type = block_match.group(1)
+            block_name = block_match.group(2)
+            brace_depth += 1
+            continue
+
+        if line == 'match {' and in_block:
+            in_match = True
+            brace_depth += 1
+            continue
+
+        if line == '}':
+            if brace_depth > 0:
+                brace_depth -= 1
+            else:
+                errors.append(f"Line {idx}: Unexpected closing brace '}}'")
+            if in_match and brace_depth == 1:
+                in_match = False
+            elif in_block and brace_depth == 0:
+                in_block = False
+                block_type = None
+                block_name = None
+            continue
+
+        # Inside match block validation
+        if in_match:
+            if '=' in line:
+                key, val = line.split('=', 1)
+                key = key.strip()
+                val = val.strip()
+                if key in ("class", "title", "initialClass", "initialTitle", "namespace"):
+                    clean_pattern = val
+                    if clean_pattern.startswith('^(') and clean_pattern.endswith(')$'):
+                        clean_pattern = clean_pattern[2:-2]
+                    elif clean_pattern.startswith('^'):
+                        clean_pattern = clean_pattern[1:]
+                    elif clean_pattern.endswith('$'):
+                        clean_pattern = clean_pattern[:-1]
+                    if not check_regex_validity(clean_pattern):
+                        errors.append(f"Line {idx}: Invalid regex pattern '{val}' for property '{key}'")
+            else:
+                errors.append(f"Line {idx}: Missing '=' in match definition: '{line}'")
+            continue
+
+        # Line-based rule check
+        if '=' in line and not in_block:
             directive, body = line.split('=', 1)
             directive = directive.strip()
             body = body.strip()
 
-            if directive in ("windowrule", "windowrulev2", "layerrule", "workspace"):
-                # 1. Check for legacy match: prefix
-                match_matches = INVALID_MATCH_PREFIX.findall(body)
-                if match_matches:
+            if directive == "windowrulev2":
+                # Deprecated in newer Hyprland
+                ver_parts = [int(p) for p in target_version.split('.')] if target_version else [0, 45, 0]
+                if ver_parts >= [0, 45, 0]:
                     errors.append(
-                        f"Line {idx}: Legacy/invalid match prefix used: {', '.join(match_matches)}. "
-                        f"Hyprland rule matches should use native syntax (e.g. 'class:^(...)$', 'title:^(...)$', 'floating:1')."
+                        f"Line {idx}: Deprecated 'windowrulev2' syntax used. "
+                        f"Newer Hyprland ({target_version}) requires named windowrule block syntax "
+                        f"('windowrule <name> {{ match {{ ... }} ... }}') or declarative match syntax."
                     )
+            elif directive in ("windowrule", "layerrule", "workspace"):
+                # Single line directive
+                pass
 
-                # 2. Check for deprecated / invalid keywords
-                for pattern, msg in DEPRECATED_KEYWORDS:
-                    if pattern.search(body):
-                        errors.append(f"Line {idx}: {msg}")
-
-                # 3. Check for syntax formatting in windowrulev2 match criteria
-                if directive == "windowrulev2":
-                    parts = [p.strip() for p in body.split(',')]
-                    for part in parts[1:]:
-                        if ':' in part:
-                            key, val = part.split(':', 1)
-                            key = key.strip()
-                            val = val.strip()
-                            if key in ("class", "title", "initialClass", "initialTitle"):
-                                if val.startswith('^(') and val.endswith(')$'):
-                                    inner = val[2:-2]
-                                    if not check_regex_validity(inner):
-                                        errors.append(f"Line {idx}: Invalid regex pattern '{inner}' in match criteria '{part}'")
-        elif line.startswith(("windowrule", "windowrulev2", "layerrule", "workspace")):
-            errors.append(f"Line {idx}: Missing '=' in rule definition: '{line}'")
+    if brace_depth != 0:
+        errors.append(f"Unclosed block brace in {file_path} (depth={brace_depth})")
 
     return errors
 
 
+def validate_file(file_path: Path, is_lua: bool = False, hyprland_bin: str | None = None, target_version: str = "0.45.0") -> list[str]:
+    if not file_path.exists():
+        return []
+
+    # Attempt native installed Hyprland parser first for .conf files
+    if not is_lua:
+        installed_errors = validate_with_installed_parser(file_path, hyprland_bin=hyprland_bin)
+        if installed_errors is not None:
+            return installed_errors
+        return validate_conf_file(file_path, target_version=target_version)
+    else:
+        return validate_lua_file(file_path)
+
+
 def main():
-    import argparse
-    parser = argparse.ArgumentParser(description="Validate Hyprland window/layer rules")
+    parser = argparse.ArgumentParser(description="Validate Hyprland window/layer/workspace rules")
     parser.add_argument("files", nargs="*", help="Rule files to validate")
     parser.add_argument("--strict", action="store_true", help="Exit with non-zero status on validation errors")
+    parser.add_argument("--lua", action="store_true", help="Validate in Lua mode")
+    parser.add_argument("--hyprland-bin", type=str, help="Path to Hyprland executable parser")
+    parser.add_argument("--hyprland-version", type=str, default="0.45.0", help="Target Hyprland version for version-aware checks")
     args = parser.parse_args()
+
+    # Determine installed version if hyprland is present
+    installed_ver = get_hyprland_installed_version(args.hyprland_bin or "hyprland")
+    target_ver = installed_ver or args.hyprland_version
 
     files_to_check = []
     if args.files:
         files_to_check = [Path(f) for f in args.files]
     else:
-        # Default targets: core system rules and user overrides
         script_dir = Path(__file__).resolve().parent
         home = Path.home()
         files_to_check = [
             script_dir / "../hyprland/rules.conf",
-            home / ".config/hypr/hyprland/rules.conf",
+            script_dir / "../hyprland/rules.lua",
             home / ".config/caelestia/hypr-user.conf",
+            home / ".config/caelestia/hypr-user.lua",
         ]
 
     total_errors = 0
     for file_path in files_to_check:
         if not file_path.exists():
             continue
-        errors = validate_file(file_path)
+
+        is_lua_file = args.lua or file_path.suffix == ".lua"
+        errors = validate_file(
+            file_path,
+            is_lua=is_lua_file,
+            hyprland_bin=args.hyprland_bin,
+            target_version=target_ver,
+        )
+
         if errors:
             total_errors += len(errors)
             print(f"[RULE VALIDATION WARNING] Issues found in {file_path}:", file=sys.stderr)

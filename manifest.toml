@@ -15,14 +15,6 @@ packages = [
     "grim",
     "slurp",
     "swappy",
-    "fuzzel",
-    "brightnessctl",
-    "ddcutil",
-    "networkmanager",
-    "libnotify",
-    "playerctl",
-    "gpu-screen-recorder",
-    "dart-sass",
     "inotify-tools",
     "app2unit",
     "wireplumber",
@@ -38,4 +30,67 @@ packages = [
     "papirus-icon-theme",
     "qtengine",
     "ttf-jetbrains-mono-nerd",
+]
+
+[[components]]
+name = "hypr"
+default = true
+entries = [
+    { src = "hypr", dest = "$XDG_CONFIG_HOME/hypr" }
+]
+
+[[components]]
+name = "portal"
+default = true
+entries = [
+    { src = "xdg-desktop-portal", dest = "$XDG_CONFIG_HOME/xdg-desktop-portal" }
+]
+
+[[components]]
+name = "starship"
+default = true
+entries = [
+    { src = "starship.toml", dest = "$XDG_CONFIG_HOME/starship.toml" }
+]
+
+[[components]]
+name = "foot"
+default = true
+entries = [
+    { src = "foot", dest = "$XDG_CONFIG_HOME/foot" }
+]
+
+[[components]]
+name = "fish"
+default = true
+entries = [
+    { src = "fish", dest = "$XDG_CONFIG_HOME/fish" }
+]
+
+[[components]]
+name = "fastfetch"
+default = true
+entries = [
+    { src = "fastfetch", dest = "$XDG_CONFIG_HOME/fastfetch" }
+]
+
+[[components]]
+name = "uwsm"
+default = true
+entries = [
+    { src = "uwsm", dest = "$XDG_CONFIG_HOME/uwsm" }
+]
+
+[[components]]
+name = "btop"
+default = true
+entries = [
+    { src = "btop", dest = "$XDG_CONFIG_HOME/btop" }
+]
+
+[[components]]
+name = "caelestia"
+default = true
+entries = [
+    { src = "caelestia", dest = "$XDG_CONFIG_HOME/caelestia" }
 ]

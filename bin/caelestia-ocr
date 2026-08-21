@@ -30,6 +30,14 @@ copy_text() {
     fi
 }
 
+if ! command -v tesseract &>/dev/null; then
+    if command -v notify-send &>/dev/null; then
+        notify-send -a "caelestia-cli" "Missing utility: tesseract" "Required binary 'tesseract' is not installed."
+    fi
+    echo "caelestia-ocr: tesseract is not installed" >&2
+    exit 1
+fi
+
 if [[ "${1:-}" == "--stdout" && -n "${2:-}" ]]; then
     if [[ ! -f "$2" ]]; then
         echo "caelestia-ocr: file not found: $2" >&2
@@ -40,7 +48,7 @@ if [[ "${1:-}" == "--stdout" && -n "${2:-}" ]]; then
 fi
 
 # Interactive region OCR (grim + slurp + tesseract) — Super+C path
-for cmd in grim slurp tesseract wl-copy; do
+for cmd in grim slurp wl-copy; do
     if ! command -v "$cmd" &>/dev/null; then
         notify-send -a "caelestia-cli" "Missing utility: $cmd" "Required binary '$cmd' is not installed."
         exit 1

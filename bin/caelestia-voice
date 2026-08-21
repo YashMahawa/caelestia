@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""On-demand Gemini dictation controller for Caelestia.
+"""On-demand Gemini dictation controller for Caelestia with native IPC bridge.
 
-The recording path has no ML imports and consumes no idle RAM.  Gemini is only
-loaded in the short-lived transcription worker after recording stops.
+Attempts native QuickShell voice service IPC when available; falls back to standalone execution
+and background transcription when native service is unavailable or incompatible.
 """
 
 from __future__ import annotations
@@ -10,9 +10,9 @@ from __future__ import annotations
 import fcntl
 import json
 import os
-import signal
 import random
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -219,11 +219,61 @@ def transcribe() -> None:
     write_state("idle", "")
 
 
+def try_native_voice_ipc(command: str) -> bool:
+    if not shutil.which("caelestia"):
+        return False
+    try:
+        res = subprocess.run(
+            ["caelestia", "shell", "voice", command],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if res.returncode != 0:
+            return False
+
+        out_err = (res.stdout + " " + res.stderr).lower()
+        error_keywords = [
+            "unknown command",
+            "unknown subcommand",
+            "unrecognized",
+            "ipc error",
+            "failed to connect",
+            "connection refused",
+            "service unavailable",
+            "not running",
+            "no such object",
+            "command not found",
+        ]
+        if any(kw in out_err for kw in error_keywords):
+            return False
+
+        if command == "status":
+            out = res.stdout.strip()
+            if not out:
+                return False
+            print(out)
+            return True
+        else:
+            if res.stdout.strip():
+                print(res.stdout.strip())
+            return True
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def main() -> None:
+    command = sys.argv[1] if len(sys.argv) > 1 else "toggle"
+    if command not in ("toggle", "start", "stop", "status", "_transcribe"):
+        raise SystemExit("usage: caelestia-voice [toggle|start|stop|status]")
+
+    if command != "_transcribe" and try_native_voice_ipc(command):
+        return
+
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     with LOCK.open("a+") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        command = sys.argv[1] if len(sys.argv) > 1 else "toggle"
         if command == "start":
             start()
         elif command == "stop":
@@ -234,8 +284,6 @@ def main() -> None:
             print(STATE.read_text() if STATE.exists() else '{"status":"idle"}')
         elif command == "_transcribe":
             transcribe()
-        else:
-            raise SystemExit("usage: caelestia-voice [toggle|start|stop|status]")
 
 
 if __name__ == "__main__":

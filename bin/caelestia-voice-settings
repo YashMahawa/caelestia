@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Manage Gemini voice settings without exposing secrets in process arguments."""
+"""Manage Gemini voice settings via secret-tool and config file with optional native IPC sync."""
 
 from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -37,9 +38,28 @@ def store(slot: int, value: str) -> None:
     if result.returncode:
         raise SystemExit("Secret Service rejected the key")
 
+    if shutil.which("caelestia"):
+        try:
+            subprocess.run(
+                ["caelestia", "shell", "voice", "store", str(slot)],
+                input=value + "\n", text=True, timeout=3, check=False,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
+
 
 def clear(slot: int) -> None:
     subprocess.run(["secret-tool", "clear", *ATTRS, "slot", str(slot)], check=False)
+    if shutil.which("caelestia"):
+        try:
+            subprocess.run(
+                ["caelestia", "shell", "voice", "clear", str(slot)],
+                timeout=3, check=False,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
 
 
 def load_config() -> dict:
@@ -60,6 +80,16 @@ def save_prompt(prompt: str) -> None:
     temporary.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     os.chmod(temporary, 0o600)
     os.replace(temporary, CONFIG)
+
+    if shutil.which("caelestia"):
+        try:
+            subprocess.run(
+                ["caelestia", "shell", "voice", "set-prompt"],
+                input=json.dumps(prompt) + "\n", text=True, timeout=3, check=False,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
 
 
 def migrate() -> None:
@@ -83,7 +113,41 @@ def migrate() -> None:
         existing[slot - 1] = value
 
 
+def try_native_settings_status() -> bool:
+    if not shutil.which("caelestia"):
+        return False
+    try:
+        res = subprocess.run(
+            ["caelestia", "shell", "voice", "status"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if res.returncode == 0 and res.stdout.strip():
+            out_err = (res.stdout + " " + res.stderr).lower()
+            error_keywords = [
+                "unknown command",
+                "unknown subcommand",
+                "unrecognized",
+                "ipc error",
+                "failed to connect",
+                "connection refused",
+                "service unavailable",
+                "not running",
+            ]
+            if not any(kw in out_err for kw in error_keywords):
+                print(res.stdout.strip())
+                return True
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return False
+
+
 def status() -> None:
+    if try_native_settings_status():
+        return
+
     config = load_config()
     print(json.dumps({
         "keys": [bool(lookup(slot)) for slot in range(1, 4)],

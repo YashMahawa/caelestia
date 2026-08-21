@@ -3,6 +3,8 @@
 argparse -n 'install.fish' -X 0 \
     'h/help' \
     'noconfirm' \
+    'no-packages' \
+    'user-only' \
     'spotify' \
     'vscode=?!contains -- "$_flag_value" codium code' \
     'discord' \
@@ -14,11 +16,12 @@ or exit
 
 # Print help
 if set -q _flag_h
-    echo 'usage: ./install.fish [-h] [--noconfirm] [--spotify] [--vscode] [--discord] [--zen] [--aur-helper] [--enable-power-daemon]'
+    echo 'usage: ./install.fish [-h] [--noconfirm] [--no-packages] [--user-only] [--spotify] [--vscode] [--discord] [--zen] [--aur-helper] [--enable-power-daemon]'
     echo
     echo 'options:'
     echo '  -h, --help                  show this help message and exit'
     echo '  --noconfirm                 do not confirm package installation'
+    echo '  --no-packages, --user-only  deploy user configurations without installing system packages'
     echo '  --spotify                   install Spotify (Spicetify)'
     echo '  --vscode=[codium|code]      install VSCodium (or VSCode)'
     echo '  --discord                   install Discord (OpenAsar + Equicord)'
@@ -91,6 +94,11 @@ set -q XDG_CONFIG_HOME && set -l config $XDG_CONFIG_HOME || set -l config $HOME/
 set -q XDG_STATE_HOME && set -l state $XDG_STATE_HOME || set -l state $HOME/.local/state
 set -l install_dir (path dirname (path resolve (status filename)))
 
+set -l no_packages 0
+if set -q _flag_no_packages; or set -q _flag_user_only
+    set no_packages 1
+end
+
 # Startup prompt
 set_color magenta
 echo '╭─────────────────────────────────────────────────╮'
@@ -136,40 +144,72 @@ if ! set -q _flag_noconfirm
 end
 
 
-# Install AUR helper if not already installed
-if ! pacman -Q $aur_helper &> /dev/null
-    log "$aur_helper not installed. Installing..."
-
-    # Install
-    sudo pacman -S --needed git base-devel $noconfirm
-    cd /tmp
-    git clone https://aur.archlinux.org/$aur_helper.git
-    cd $aur_helper
-    makepkg -si
-    cd ..
-    rm -rf $aur_helper
-
-    # Setup
-    if test $aur_helper = yay
-        $aur_helper -Y --gendb
-        $aur_helper -Y --devel --save
-    else
-        $aur_helper --gendb
-    end
-end
-
 # Cd into dir
 cd $install_dir || exit 1
 
-# Install metapackage for deps
-log 'Installing metapackage...'
+# System package installation
+if test $no_packages -eq 0
+    if command -qs pacman
+        # Install AUR helper if not already installed
+        if ! pacman -Q $aur_helper &> /dev/null
+            log "$aur_helper not installed. Installing..."
 
-if test $aur_helper = yay
-    $aur_helper -Bi . $noconfirm
+            if not command -qs sudo; and test (id -u) -ne 0
+                log 'Error: Installing packages via pacman requires administrator privileges (sudo).'
+                log 'Please run with sudo or use --no-packages / --user-only to deploy configs without installing system packages.'
+                exit 1
+            end
+
+            if test (id -u) -eq 0
+                pacman -S --needed git base-devel $noconfirm
+            else
+                sudo pacman -S --needed git base-devel $noconfirm
+            end
+            or begin
+                log 'Error: Failed to install git and base-devel via pacman.'
+                log 'System package management requires privileged access. Use --no-packages or --user-only to skip package installation.'
+                exit 1
+            end
+
+            cd /tmp
+            git clone https://aur.archlinux.org/$aur_helper.git
+            cd $aur_helper
+            makepkg -si $noconfirm
+            cd ..
+            rm -rf $aur_helper
+
+            # Setup
+            if test $aur_helper = yay
+                $aur_helper -Y --gendb
+                $aur_helper -Y --devel --save
+            else
+                $aur_helper --gendb
+            end
+
+            cd $install_dir || exit 1
+        end
+
+        # Install metapackage for deps
+        log 'Installing metapackage...'
+
+        if test $aur_helper = yay
+            $aur_helper -Bi . $noconfirm
+        else
+            $aur_helper -Ui $noconfirm
+        end
+        or begin
+            log 'Error: Failed to install metapackage dependencies.'
+            log 'System package management requires privileged access. Use --no-packages or --user-only to deploy configs without package installation.'
+            exit 1
+        end
+        fish -c 'rm -f caelestia-meta-*.pkg.tar.zst' 2> /dev/null
+    else
+        log 'Warning: pacman not found on system. Skipping system package installation.'
+        log 'Continuing with user-space config deployment...'
+    end
 else
-    $aur_helper -Ui $noconfirm
+    log 'User-only mode enabled (--no-packages / --user-only): Skipping system package installation.'
 end
-fish -c 'rm -f caelestia-meta-*.pkg.tar.zst' 2> /dev/null
 
 # Power management service setup
 if test -d /run/systemd/system; and type -q systemctl
@@ -277,14 +317,18 @@ end
 if set -q _flag_spotify
     log 'Installing spotify (spicetify)...'
 
-    set -l has_spicetify (pacman -Q spicetify-cli 2> /dev/null)
-    $aur_helper -S --needed spotify spicetify-cli spicetify-marketplace-bin $noconfirm
+    if test $no_packages -eq 0; and command -qs pacman
+        set -l has_spicetify (pacman -Q spicetify-cli 2> /dev/null)
+        $aur_helper -S --needed spotify spicetify-cli spicetify-marketplace-bin $noconfirm || true
 
-    # Set permissions and init if new install
-    if test -z "$has_spicetify"
-        sudo chmod a+wr /opt/spotify
-        sudo chmod a+wr /opt/spotify/Apps -R
-        spicetify backup apply
+        # Set permissions and init if new install
+        if test -z "$has_spicetify"
+            if test (id -u) -eq 0; or command -qs sudo
+                sudo chmod a+wr /opt/spotify 2>/dev/null || true
+                sudo chmod a+wr /opt/spotify/Apps -R 2>/dev/null || true
+            end
+            spicetify backup apply 2>/dev/null || true
+        end
     end
 
     # Install configs
@@ -293,8 +337,10 @@ if set -q _flag_spotify
         install-copy spicetify $config/spicetify
 
         # Set spicetify configs
-        spicetify config current_theme caelestia color_scheme caelestia custom_apps marketplace 2> /dev/null
-        spicetify apply
+        if command -qs spicetify
+            spicetify config current_theme caelestia color_scheme caelestia custom_apps marketplace 2> /dev/null
+            spicetify apply 2>/dev/null || true
+        end
     end
 end
 
@@ -306,7 +352,9 @@ if set -q _flag_vscode
     set -l folder $config/$folder/User
 
     log "Installing vs$prog..."
-    $aur_helper -S --needed $packages $noconfirm
+    if test $no_packages -eq 0; and command -qs $aur_helper
+        $aur_helper -S --needed $packages $noconfirm || true
+    end
 
     # Install configs
     if confirm-overwrite $folder/settings.json && confirm-overwrite $folder/keybindings.json && confirm-overwrite $config/$prog-flags.conf
@@ -316,27 +364,39 @@ if set -q _flag_vscode
         install-copy vscode/flags.conf $config/$prog-flags.conf
 
         # Install extension
-        $prog --install-extension vscode/caelestia-vscode-integration/caelestia-vscode-integration-*.vsix
+        if command -qs $prog
+            $prog --install-extension vscode/caelestia-vscode-integration/caelestia-vscode-integration-*.vsix 2>/dev/null || true
+        end
     end
 end
 
 # Install discord
 if set -q _flag_discord
     log 'Installing discord...'
-    $aur_helper -S --needed discord equicord-installer-bin $noconfirm
+    if test $no_packages -eq 0; and command -qs $aur_helper
+        $aur_helper -S --needed discord equicord-installer-bin $noconfirm || true
+    end
 
     # Install OpenAsar and Equicord
-    sudo Equilotl -install -location /opt/discord
-    sudo Equilotl -install-openasar -location /opt/discord
+    set -l discord_user_dir $config/discord
+    mkdir -p $discord_user_dir
+    if command -qs Equilotl
+        Equilotl -install -location $discord_user_dir 2>/dev/null || true
+        Equilotl -install-openasar -location $discord_user_dir 2>/dev/null || true
+    end
 
     # Remove installer
-    $aur_helper -Rns equicord-installer-bin $noconfirm
+    if test $no_packages -eq 0; and command -qs $aur_helper
+        $aur_helper -Rns equicord-installer-bin $noconfirm 2>/dev/null || true
+    end
 end
 
 # Install zen
 if set -q _flag_zen
     log 'Installing zen...'
-    $aur_helper -S --needed zen-browser-bin $noconfirm
+    if test $no_packages -eq 0; and command -qs $aur_helper
+        $aur_helper -S --needed zen-browser-bin $noconfirm || true
+    end
 
     # Install userChrome css
     set -l chrome_dirs

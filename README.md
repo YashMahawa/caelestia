@@ -60,11 +60,12 @@ The install script has some options for installing configs for some apps.
 
 ```
 $ ./install.fish -h
-usage: ./install.fish [-h] [--noconfirm] [--spotify] [--vscode] [--discord] [--zen] [--aur-helper] [--enable-power-daemon]
+usage: ./install.fish [-h] [--noconfirm] [--no-packages] [--user-only] [--spotify] [--vscode] [--discord] [--zen] [--aur-helper] [--enable-power-daemon]
 
 options:
   -h, --help                  show this help message and exit
   --noconfirm                 do not confirm package installation
+  --no-packages, --user-only  deploy user configurations without installing system packages
   --spotify                   install Spotify (Spicetify)
   --vscode=[codium|code]      install VSCodium (or VSCode)
   --discord                   install Discord (OpenAsar + Equicord)

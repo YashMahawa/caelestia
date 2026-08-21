@@ -28,6 +28,9 @@ def run(command, *, text=None, timeout=8):
 
 
 def menu(prompt, entries=None):
+    if not shutil.which("rofi"):
+        run(["notify-send", "-a", "caelestia-cli", "Missing utility: rofi", "Required binary 'rofi' is not installed."])
+        return ""
     payload = "\n".join(entries or [])
     result = run(
         ["rofi", "-dmenu", "-i", "-p", prompt, "-matching", "fuzzy"],

@@ -1,5 +1,12 @@
 #!/usr/bin/env fish
 
+if not type -q hyprctl
+    exit 1
+end
+if not type -q jq
+    exit 1
+end
+
 if test "$argv[1]" = '-g'
     set group
     set -e $argv[1]

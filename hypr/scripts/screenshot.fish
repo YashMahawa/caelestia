@@ -1,5 +1,17 @@
 #!/usr/bin/env fish
 
+function check_bin -a bin
+    if not type -q $bin
+        if type -q notify-send
+            notify-send -a "caelestia-cli" "Missing utility: $bin" "Required binary '$bin' is not installed."
+        end
+        exit 1
+    end
+end
+
+check_bin grim
+check_bin wl-copy
+
 set -l mode region
 if test (count $argv) -ge 1
     set mode $argv[1]
@@ -17,12 +29,15 @@ set -l dest "$screenshots_dir/"(date +%Y-%m-%d_%H-%M-%S-%3N)".png"
 
 switch $mode
     case region area
+        check_bin slurp
         set -l geometry (slurp 2>/dev/null)
         if test -z "$geometry"
             exit 1
         end
         grim -g "$geometry" "$dest"
     case full fullscreen screen
+        check_bin hyprctl
+        check_bin jq
         # Capture the focused monitor at its native pixel dimensions.  Unlike
         # selecting the whole screen in the area picker, this does not lose
         # edge pixels, and PNG remains fully lossless.

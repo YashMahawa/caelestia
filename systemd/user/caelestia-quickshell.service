@@ -6,11 +6,12 @@ PartOf=graphical-session.target
 
 [Service]
 Type=simple
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 ExecStartPre=%h/.local/bin/caelestia-display auto
 ExecStartPre=%h/.local/bin/caelestia-qs-clean-runtime
 ExecStart=%h/.local/bin/caelestia-qs-launch
 ExecStartPost=%h/.local/bin/caelestia-lock-recover
-ExecStop=/usr/sbin/qs kill -c caelestia
+ExecStop=qs kill -c caelestia
 Restart=on-failure
 RestartSec=2
 

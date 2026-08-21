@@ -166,6 +166,66 @@ return {
         self.assertEqual(errs_conf, [], f"rules.conf has errors: {errs_conf}")
         self.assertEqual(errs_lua, [], f"rules.lua has errors: {errs_lua}")
 
+    def test_validate_with_installed_parser_unknown_option_fallback(self):
+        from unittest.mock import patch, MagicMock
+        with patch("shutil.which", return_value="/usr/bin/hyprland"):
+            mock_res = MagicMock()
+            mock_res.returncode = 1
+            mock_res.stdout = ""
+            mock_res.stderr = "[ERROR] Unknown option: --config-only\n"
+            with patch("subprocess.run", return_value=mock_res):
+                with tempfile.NamedTemporaryFile("w", suffix=".conf", delete=False) as f:
+                    f.write("windowrule rule_test {\n    match {\n        class = ^(test)$\n    }\n}\n")
+                    tmp_path = Path(f.name)
+                result = validate_with_installed_parser(tmp_path)
+                tmp_path.unlink()
+                self.assertIsNone(result)
+
+    def test_validate_with_installed_parser_supported_option_success(self):
+        from unittest.mock import patch, MagicMock
+        with patch("shutil.which", return_value="/usr/bin/hyprland"):
+            mock_help = MagicMock()
+            mock_help.stdout = "Usage: hyprland [--verify-config] [-c CONFIG]\n"
+            mock_help.stderr = ""
+            mock_res = MagicMock()
+            mock_res.returncode = 0
+            mock_res.stdout = "Config verified successfully\n"
+            mock_res.stderr = ""
+            def mock_run(cmd, **kwargs):
+                if "--help" in cmd:
+                    return mock_help
+                return mock_res
+            with patch("subprocess.run", side_effect=mock_run):
+                with tempfile.NamedTemporaryFile("w", suffix=".conf", delete=False) as f:
+                    f.write("windowrule rule_test {\n    match {\n        class = ^(test)$\n    }\n}\n")
+                    tmp_path = Path(f.name)
+                result = validate_with_installed_parser(tmp_path)
+                tmp_path.unlink()
+                self.assertEqual(result, [])
+
+    def test_validate_with_installed_parser_supported_option_failure(self):
+        from unittest.mock import patch, MagicMock
+        with patch("shutil.which", return_value="/usr/bin/hyprland"):
+            mock_help = MagicMock()
+            mock_help.stdout = "Usage: hyprland [--verify-config] [-c CONFIG]\n"
+            mock_help.stderr = ""
+            mock_res = MagicMock()
+            mock_res.returncode = 1
+            mock_res.stdout = ""
+            mock_res.stderr = "Config error: syntax error at line 2\n"
+            def mock_run(cmd, **kwargs):
+                if "--help" in cmd:
+                    return mock_help
+                return mock_res
+            with patch("subprocess.run", side_effect=mock_run):
+                with tempfile.NamedTemporaryFile("w", suffix=".conf", delete=False) as f:
+                    f.write("invalid config content\n")
+                    tmp_path = Path(f.name)
+                result = validate_with_installed_parser(tmp_path)
+                tmp_path.unlink()
+                self.assertTrue(len(result) > 0)
+                self.assertTrue(any("syntax error" in err for err in result))
+
 
 if __name__ == "__main__":
     unittest.main()

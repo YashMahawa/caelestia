@@ -13,11 +13,22 @@ dbus-update-activation-environment --systemd \
 
 systemctl --user start hyprland-session-anchor.service || true
 
-# Validate portal configuration presence prior to invoking background portal services
+# Pre-flight check on user portal configuration: validate malformed installed config if present,
+# but fall back to normal portal startup when absent or malformed.
 config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/xdg-desktop-portal"
-if [[ ! -f "$config_dir/hyprland-portals.conf" && ! -f "$config_dir/portals.conf" ]]; then
-    echo "Warning: Portal configuration file not found in $config_dir. Skipping xdg-desktop-portal initialization." >&2
-    exit 0
+portal_config=""
+if [[ -f "$config_dir/hyprland-portals.conf" ]]; then
+    portal_config="$config_dir/hyprland-portals.conf"
+elif [[ -f "$config_dir/portals.conf" ]]; then
+    portal_config="$config_dir/portals.conf"
+fi
+
+if [[ -n "$portal_config" ]]; then
+    if ! grep -q "^\[preferred\]" "$portal_config" 2>/dev/null; then
+        echo "Warning: Portal configuration file $portal_config is malformed (missing [preferred] section). Falling back to default portal startup." >&2
+    fi
+else
+    echo "Notice: Custom portal configuration file not found in $config_dir. Falling back to default portal startup." >&2
 fi
 
 systemctl --user reset-failed \

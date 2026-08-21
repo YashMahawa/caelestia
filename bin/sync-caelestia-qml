@@ -1,14 +1,86 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-user_name="${1:-$USER}"
-user_home="${HOME:-$(getent passwd "$user_name" | cut -d: -f6)}"
-user_id="$(id -u "$user_name" 2>/dev/null || id -u)"
+restart_shell=0
+target_user=""
 
-package_src="${XDG_CONFIG_DIRS:-/etc/xdg}/quickshell/caelestia"
+for arg in "$@"; do
+    case "$arg" in
+        --restart)
+            restart_shell=1
+            ;;
+        -*)
+            ;;
+        *)
+            if [[ -z "$target_user" ]]; then
+                target_user="$arg"
+            fi
+            ;;
+    esac
+done
+
+# Target user resolution: never infer root from USER/HOME when invoked by a package hook
+user_name=""
+if [[ -n "$target_user" ]]; then
+    if [[ "$target_user" == "root" || "$(id -u "$target_user" 2>/dev/null || echo 0)" -eq 0 ]]; then
+        echo "sync-caelestia-qml: Refusing to sync QML for root user; skipping." >&2
+        exit 0
+    fi
+    user_name="$target_user"
+elif [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
+    user_name="$SUDO_USER"
+elif [[ -n "${USER:-}" && "$USER" != "root" && "$(id -u "${USER}" 2>/dev/null || id -u)" -ne 0 ]]; then
+    user_name="$USER"
+elif [[ -n "${LOGNAME:-}" && "$LOGNAME" != "root" ]]; then
+    user_name="$LOGNAME"
+else
+    if command -v loginctl >/dev/null 2>&1; then
+        user_name="$(loginctl list-sessions 2>/dev/null | awk '$3 != "root" && $3 ~ /^[a-zA-Z0-9_-]+$/ {print $3; exit}')"
+    fi
+    if [[ -z "$user_name" ]]; then
+        user_name="$(getent passwd | awk -F: '$3 >= 1000 && $3 < 60000 && $1 != "nobody" {print $1; exit}')"
+    fi
+fi
+
+if [[ -z "$user_name" || "$user_name" == "root" ]]; then
+    echo "sync-caelestia-qml: Cannot determine a valid non-root user; skipping QML sync." >&2
+    exit 0
+fi
+
+user_id="$(id -u "$user_name" 2>/dev/null || true)"
+if [[ -z "$user_id" || "$user_id" -eq 0 ]]; then
+    echo "sync-caelestia-qml: Refusing to sync QML for root user ($user_name); skipping." >&2
+    exit 0
+fi
+
+user_home="$(getent passwd "$user_name" 2>/dev/null | cut -d: -f6)"
+if [[ -z "$user_home" || "$user_home" == "/root" ]]; then
+    echo "sync-caelestia-qml: Invalid home directory ($user_home) for user $user_name; skipping." >&2
+    exit 0
+fi
+
+# Resolve package source from colon-separated XDG_CONFIG_DIRS search list
+package_src=""
+config_dirs="${XDG_CONFIG_DIRS:-/etc/xdg}"
+IFS=':' read -ra dirs <<< "$config_dirs"
+for dir in "${dirs[@]}"; do
+    [[ -z "$dir" ]] && continue
+    candidate="$dir/quickshell/caelestia"
+    if [[ -d "$candidate" ]]; then
+        package_src="$candidate"
+        break
+    fi
+done
+
+if [[ -z "$package_src" || ! -d "$package_src" ]]; then
+    echo "Caelestia package QML source not found in XDG_CONFIG_DIRS ($config_dirs)" >&2
+    exit 0
+fi
+
 fork_src="$user_home/caelestia-repo-work/shell"
 dst="$user_home/.config/quickshell/caelestia"
 parent="$(dirname "$dst")"
+mkdir -p "$parent"
 stage="$(mktemp -d "$parent/.caelestia-sync.XXXXXX")"
 previous="$parent/.caelestia-previous-sync"
 
@@ -17,19 +89,22 @@ cleanup() {
 }
 trap cleanup EXIT
 
-if [[ ! -d "$package_src" ]]; then
-    echo "Caelestia package QML source not found: $package_src" >&2
-    exit 0
-fi
-
 cp -a "$package_src" "$stage/caelestia"
 
 # The fork is the canonical customized shell. Overlaying it after the packaged
 # tree keeps local features while still supplying any new package-only files.
-if [[ -d "$fork_src/.git" ]]; then
-    for entry in assets components modules services utils shell.qml greeter.qml; do
-        if [[ -e "$fork_src/$entry" ]]; then
-            cp -a "$fork_src/$entry" "$stage/caelestia/"
+if [[ -d "$fork_src" ]]; then
+    for entry in "$fork_src"/* "$fork_src"/.*; do
+        [[ -e "$entry" ]] || continue
+        base="$(basename "$entry")"
+        [[ "$base" == "." || "$base" == ".." || "$base" == ".git" || "$base" == "build" ]] && continue
+        cp -a "$entry" "$stage/caelestia/"
+    done
+elif [[ -d "$dst" ]]; then
+    # Preserve local user configurations (including Lua configs) if no separate fork repo is present
+    for entry in lua user.json user.conf hypr-user.conf; do
+        if [[ -e "$dst/$entry" && ! -e "$stage/caelestia/$entry" ]]; then
+            cp -a "$dst/$entry" "$stage/caelestia/"
         fi
     done
 fi
@@ -40,14 +115,22 @@ rm -f \
     "$stage/caelestia/modules/continuity/ContinuityIsland.qml" \
     "$stage/caelestia/modules/dashboard/AgentsTab.qml"
 
-# Build first. If a new Qt/Quickshell ABI is incompatible with the fork, the
-# live shell remains untouched and the hook fails safely.
-build_dir=""
+# Build and install plugin first before touching live QML tree.
+# If compilation or installation fails, abort transactionally so live shell remains intact.
 if [[ -f "$fork_src/CMakeLists.txt" ]]; then
     build_dir="$user_home/.cache/caelestia-shell-plugin-build"
+    mkdir -p "$build_dir"
     cmake -S "$fork_src" -B "$build_dir" -G Ninja \
         -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$user_home/.local" -DENABLE_MODULES=plugin
     cmake --build "$build_dir" -j4
+    cmake --install "$build_dir" --prefix "$user_home/.local"
+fi
+
+if [[ "$(id -u)" -eq 0 ]]; then
+    chown -R "$user_name:$user_name" "$stage" 2>/dev/null || true
+    if [[ -d "$user_home/.local" ]]; then
+        chown -R "$user_name:$user_name" "$user_home/.local" 2>/dev/null || true
+    fi
 fi
 
 # Replace the live tree transactionally and retain the previous copy only until
@@ -58,16 +141,23 @@ if [[ -e "$dst" ]]; then
 fi
 if ! mv "$stage/caelestia" "$dst"; then
     [[ -e "$previous" ]] && mv "$previous" "$dst"
+    echo "sync-caelestia-qml: Failed to update QML directory transactionally" >&2
     exit 1
 fi
 rm -rf "$previous"
 
-# Package upgrades replace the QML plugin as well. Install the fork build made
-# against the newly installed ABI so custom services remain compatible.
-if [[ -n "$build_dir" ]]; then
-    cmake --install "$build_dir" --prefix "$user_home/.local" 2>/dev/null || true
+if [[ "$(id -u)" -eq 0 ]]; then
+    chown -R "$user_name:$user_name" "$dst" 2>/dev/null || true
 fi
 
-systemctl --user restart caelestia-quickshell.service >/dev/null 2>&1 || true
-
-echo "Synced the customized Caelestia shell for $user_name"
+if [[ "$restart_shell" -eq 1 ]]; then
+    if [[ "$(id -u)" -eq 0 ]]; then
+        runuser -u "$user_name" -- env HOME="$user_home" XDG_RUNTIME_DIR="/run/user/$user_id" \
+            systemctl --user restart caelestia-quickshell.service >/dev/null 2>&1 || true
+    else
+        systemctl --user restart caelestia-quickshell.service >/dev/null 2>&1 || true
+    fi
+    echo "Synced and restarted the customized Caelestia shell for $user_name"
+else
+    echo "Synced the customized Caelestia shell for $user_name (restart deferred; run 'caelestia shell -r' or 'systemctl --user restart caelestia-quickshell.service' to apply)"
+fi

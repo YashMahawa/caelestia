@@ -1,0 +1,4 @@
+[Portal]
+DBusName=org.freedesktop.impl.portal.desktop.hyprland
+Interfaces=org.freedesktop.impl.portal.ScreenCast;org.freedesktop.impl.portal.Screenshot;org.freedesktop.impl.portal.GlobalShortcuts;org.freedesktop.impl.portal.InputCapture;
+UseIn=hyprland;

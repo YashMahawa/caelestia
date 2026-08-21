@@ -1,5 +1,12 @@
 #!/bin/bash
 
+for cmd in hyprctl jq grim wl-copy; do
+    if ! command -v "$cmd" &>/dev/null; then
+        notify-send -a "caelestia-cli" "Missing utility: $cmd" "Required binary '$cmd' is not installed." 2>/dev/null || true
+        exit 1
+    fi
+done
+
 # Get the geometry of the window that was focused before the screenshot command
 # focusHistoryID: 1 is the window focused just before the current one.
 WINDOW_INFO=$(hyprctl clients -j | jq -r '.[] | select(.focusHistoryID == 1)')

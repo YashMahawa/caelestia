@@ -16,15 +16,15 @@ while read -r candidate _; do
     type="$(loginctl show-session "$candidate" -p Type --value 2>/dev/null || true)"
     if [[ "$active" == "yes" && "$remote" == "no" && ( "$type" == "wayland" || "$type" == "x11" ) ]]; then
         session_id="$candidate"
-        user_id="$(loginctl show-session "$candidate" -p User --value)"
-        user_name="$(loginctl show-session "$candidate" -p Name --value)"
+        user_id="$(loginctl show-session "$candidate" -p User --value 2>/dev/null || true)"
+        user_name="$(loginctl show-session "$candidate" -p Name --value 2>/dev/null || true)"
         break
     fi
 done < <(loginctl list-sessions --no-legend 2>/dev/null || true)
 
 if [[ -z "$session_id" || -z "$user_id" || -z "$user_name" ]]; then
-    log "pre-sleep: no active local graphical session; nothing to lock"
-    exit 0
+    log "pre-sleep: active session parameter resolution failed; refusing unsafe sleep"
+    exit 1
 fi
 
 user_home="$(getent passwd "$user_id" | cut -d: -f6)"

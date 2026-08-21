@@ -14,7 +14,8 @@ depends=('caelestia-cli' 'caelestia-shell'
          'gnome-keyring' 'polkit-gnome'
          'wl-clipboard' 'cliphist' 'grim' 'slurp' 'swappy' 'inotify-tools' 'app2unit' 'wireplumber' 'trash-cli'
          'foot' 'fish' 'eza' 'fastfetch' 'starship' 'btop' 'jq' 'adw-gtk-theme'
-         'papirus-icon-theme' 'qtengine' 'ttf-jetbrains-mono-nerd')
+         'papirus-icon-theme' 'qtengine' 'ttf-jetbrains-mono-nerd'
+         'upower' 'power-profiles-daemon')
 optdepends=('thunar: file manager'
             'nemo: file manager'
             'qps: process manager'

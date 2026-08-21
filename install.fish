@@ -8,12 +8,13 @@ argparse -n 'install.fish' -X 0 \
     'discord' \
     'zen' \
     'aur-helper=!contains -- "$_flag_value" yay paru' \
+    'enable-power-daemon' \
     -- $argv
 or exit
 
 # Print help
 if set -q _flag_h
-    echo 'usage: ./install.sh [-h] [--noconfirm] [--spotify] [--vscode] [--discord] [--aur-helper]'
+    echo 'usage: ./install.fish [-h] [--noconfirm] [--spotify] [--vscode] [--discord] [--zen] [--aur-helper] [--enable-power-daemon]'
     echo
     echo 'options:'
     echo '  -h, --help                  show this help message and exit'
@@ -23,6 +24,7 @@ if set -q _flag_h
     echo '  --discord                   install Discord (OpenAsar + Equicord)'
     echo '  --zen                       install Zen browser'
     echo '  --aur-helper=[yay|paru]     the AUR helper to use'
+    echo '  --enable-power-daemon       enable power-profiles-daemon service'
 
     exit
 end
@@ -168,6 +170,58 @@ else
     $aur_helper -Ui $noconfirm
 end
 fish -c 'rm -f caelestia-meta-*.pkg.tar.zst' 2> /dev/null
+
+# Power management service setup
+if test -d /run/systemd/system; and type -q systemctl
+    log 'Checking power management services...'
+
+    set -l conflicting_managers tlp.service tuned.service auto-cpufreq.service system76-power.service laptop-mode.service
+    set -l detected_manager ""
+
+    for manager in $conflicting_managers
+        if systemctl is-active --quiet $manager 2>/dev/null; or systemctl is-enabled --quiet $manager 2>/dev/null
+            set detected_manager $manager
+            break
+        end
+    end
+
+    if test -n "$detected_manager"
+        log "Detected active or enabled alternative power manager ($detected_manager). Leaving it untouched."
+        log "Skipping power-profiles-daemon activation to prevent conflicts."
+    else if systemctl is-active --quiet power-profiles-daemon.service 2>/dev/null; or systemctl is-enabled --quiet power-profiles-daemon.service 2>/dev/null
+        log 'power-profiles-daemon.service is already active/enabled.'
+    else
+        set -l enable_pdm 0
+        if set -q _flag_enable_power_daemon; or test "$ENABLE_POWER_DAEMON" = "1"
+            set enable_pdm 1
+        else if set -q noconfirm
+            log 'Noninteractive installation: skipping power-profiles-daemon activation (use --enable-power-daemon to enable).'
+        else
+            input 'Enable power-profiles-daemon.service for system power profiles? [Y/n] ' -n
+            set -l confirm (sh-read)
+            if test "$confirm" = 'n' -o "$confirm" = 'N'
+                log 'Skipping power-profiles-daemon activation.'
+            else
+                set enable_pdm 1
+            end
+        end
+
+        if test "$enable_pdm" -eq 1
+            log 'Enabling power-profiles-daemon.service...'
+            if test (id -u) -eq 0
+                if ! systemctl enable --now power-profiles-daemon.service
+                    log 'Warning: Failed to enable power-profiles-daemon.service.'
+                end
+            else if type -q sudo
+                if ! sudo systemctl enable --now power-profiles-daemon.service
+                    log 'Warning: Failed to enable power-profiles-daemon.service via sudo.'
+                end
+            else
+                log "Warning: Root or sudo privileges required to enable power-profiles-daemon.service. Run 'sudo systemctl enable --now power-profiles-daemon.service' manually."
+            end
+        end
+    end
+end
 
 # Install hypr* configs
 if confirm-overwrite $config/hypr

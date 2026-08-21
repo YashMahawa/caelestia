@@ -59,6 +59,22 @@ if [[ -z "$user_home" || "$user_home" == "/root" ]]; then
     exit 0
 fi
 
+# Helper to execute commands as target user when running as root
+run_as_target() {
+    local cmd="$1"
+    if [[ "$(id -u)" -eq 0 ]]; then
+        if command -v sudo >/dev/null 2>&1; then
+            sudo -u "$user_name" env HOME="$user_home" PATH="$PATH" XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$user_id}" bash -c "$cmd"
+        elif command -v setpriv >/dev/null 2>&1; then
+            setpriv --reuid="$user_id" --regid="$(id -g "$user_name")" --clear-groups env HOME="$user_home" PATH="$PATH" XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$user_id}" bash -c "$cmd"
+        else
+            su -s /bin/bash "$user_name" -c "$cmd"
+        fi
+    else
+        bash -c "$cmd"
+    fi
+}
+
 # Resolve package source from colon-separated XDG_CONFIG_DIRS search list
 package_src=""
 config_dirs="${XDG_CONFIG_DIRS:-/etc/xdg}"
@@ -72,15 +88,16 @@ for dir in "${dirs[@]}"; do
     fi
 done
 
-if [[ -z "$package_src" || ! -d "$package_src" ]]; then
-    echo "Caelestia package QML source not found in XDG_CONFIG_DIRS ($config_dirs)" >&2
-    exit 0
-fi
-
 fork_src="$user_home/caelestia-repo-work/shell"
 dst="$user_home/.config/quickshell/caelestia"
 parent="$(dirname "$dst")"
-mkdir -p "$parent"
+
+if [[ "$(id -u)" -eq 0 ]]; then
+    run_as_target "mkdir -p '$parent'"
+else
+    mkdir -p "$parent"
+fi
+
 stage="$(mktemp -d "$parent/.caelestia-sync.XXXXXX")"
 previous="$parent/.caelestia-previous-sync"
 
@@ -89,52 +106,97 @@ cleanup() {
 }
 trap cleanup EXIT
 
-cp -a "$package_src" "$stage/caelestia"
+if [[ "$(id -u)" -eq 0 ]]; then
+    chown "$user_name:$user_name" "$stage"
+fi
 
-# The fork is the canonical customized shell. Overlaying it after the packaged
-# tree keeps local features while still supplying any new package-only files.
-if [[ -d "$fork_src" ]]; then
-    for entry in "$fork_src"/* "$fork_src"/.*; do
+mkdir -p "$stage/caelestia"
+
+# Helper to copy runtime files/directories explicitly while omitting non-runtime source/build/test items
+copy_runtime_entries() {
+    local src_dir="$1"
+    local dst_dir="$2"
+    [[ -d "$src_dir" ]] || return 0
+
+    for entry in "$src_dir"/* "$src_dir"/.*; do
         [[ -e "$entry" ]] || continue
+        local base
         base="$(basename "$entry")"
-        [[ "$base" == "." || "$base" == ".." || "$base" == ".git" || "$base" == "build" ]] && continue
-        cp -a "$entry" "$stage/caelestia/"
+
+        case "$base" in
+            .|..|.git|.github|.gitignore|build|build-plugin|build-plugin.sh|tests|test|src|cmake|CMakeLists.txt|PKGBUILD|README*|LICENSE*|Makefile)
+                continue
+                ;;
+            *.cpp|*.h|*.hpp|*.c|*.o|*.a)
+                continue
+                ;;
+        esac
+
+        cp -a "$entry" "$dst_dir/"
     done
-elif [[ -d "$dst" ]]; then
-    # Preserve local user configurations (including Lua configs) if no separate fork repo is present
+}
+
+# Copy explicit runtime directories/files from package source if present
+if [[ -n "$package_src" && -d "$package_src" ]]; then
+    copy_runtime_entries "$package_src" "$stage/caelestia"
+fi
+
+# Overlay runtime directories/files from the user's customized fork if present
+if [[ -d "$fork_src" ]]; then
+    copy_runtime_entries "$fork_src" "$stage/caelestia"
+fi
+
+# Preserve explicit user configurations and Lua configs from live destination if present
+if [[ -d "$dst" ]]; then
     for entry in lua user.json user.conf hypr-user.conf; do
-        if [[ -e "$dst/$entry" && ! -e "$stage/caelestia/$entry" ]]; then
-            cp -a "$dst/$entry" "$stage/caelestia/"
+        if [[ -e "$dst/$entry" ]]; then
+            if [[ -d "$dst/$entry" ]]; then
+                mkdir -p "$stage/caelestia/$entry"
+                cp -an "$dst/$entry/." "$stage/caelestia/$entry/" 2>/dev/null || true
+            elif [[ ! -e "$stage/caelestia/$entry" ]]; then
+                cp -a "$dst/$entry" "$stage/caelestia/"
+            fi
         fi
     done
 fi
 
-# Removed custom surfaces must not be resurrected by an older package tree.
+# Defensive cleanup: remove any remaining non-runtime artifacts inside the staged runtime tree
+find "$stage/caelestia" -type f \( -name "*.cpp" -o -name "*.h" -o -name "*.hpp" -o -name "*.c" -o -name "*.o" -o -name "*.a" -o -name "CMakeLists.txt" -o -name "Makefile" \) -delete 2>/dev/null || true
+find "$stage/caelestia" -type d \( -name "tests" -o -name "test" -o -name "cmake" -o -name "build" -o -name "build-plugin" \) -exec rm -rf {} + 2>/dev/null || true
+
+# Removed custom surfaces must not be resurrected
 rm -f \
     "$stage/caelestia/modules/continuity/CallGuard.qml" \
     "$stage/caelestia/modules/continuity/ContinuityIsland.qml" \
     "$stage/caelestia/modules/dashboard/AgentsTab.qml"
 
-# Build and install plugin first before touching live QML tree.
+# If no runtime files were staged at all, abort safely
+if [[ -z "$(ls -A "$stage/caelestia" 2>/dev/null)" ]]; then
+    echo "sync-caelestia-qml: No runtime QML files found to sync; skipping." >&2
+    exit 0
+fi
+
+# Build and install plugin strictly as the target user.
 # If compilation or installation fails, abort transactionally so live shell remains intact.
 if [[ -f "$fork_src/CMakeLists.txt" ]]; then
     build_dir="$user_home/.cache/caelestia-shell-plugin-build"
-    mkdir -p "$build_dir"
-    cmake -S "$fork_src" -B "$build_dir" -G Ninja \
-        -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$user_home/.local" -DENABLE_MODULES=plugin
-    cmake --build "$build_dir" -j4
-    cmake --install "$build_dir" --prefix "$user_home/.local"
+    run_as_target "mkdir -p '$build_dir' '$user_home/.local'"
+    run_as_target "cmake -S '$fork_src' -B '$build_dir' -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX='$user_home/.local' -DENABLE_MODULES=plugin"
+    run_as_target "cmake --build '$build_dir' -j4"
+    run_as_target "cmake --install '$build_dir' --prefix '$user_home/.local'"
 fi
 
+# Validate ownership per staged artifact before live swap
 if [[ "$(id -u)" -eq 0 ]]; then
-    chown -R "$user_name:$user_name" "$stage" 2>/dev/null || true
-    if [[ -d "$user_home/.local" ]]; then
-        chown -R "$user_name:$user_name" "$user_home/.local" 2>/dev/null || true
+    chown -R "$user_name:$user_name" "$stage"
+    unowned_count="$(find "$stage/caelestia" ! -user "$user_name" 2>/dev/null | wc -l)"
+    if [[ "$unowned_count" -gt 0 ]]; then
+        echo "sync-caelestia-qml: Error: Staged artifacts contain files not owned by $user_name; aborting transaction." >&2
+        exit 1
     fi
 fi
 
-# Replace the live tree transactionally and retain the previous copy only until
-# the new one is in place.
+# Atomic transactional swap of live QML directory
 rm -rf "$previous"
 if [[ -e "$dst" ]]; then
     mv "$dst" "$previous"
@@ -152,8 +214,7 @@ fi
 
 if [[ "$restart_shell" -eq 1 ]]; then
     if [[ "$(id -u)" -eq 0 ]]; then
-        runuser -u "$user_name" -- env HOME="$user_home" XDG_RUNTIME_DIR="/run/user/$user_id" \
-            systemctl --user restart caelestia-quickshell.service >/dev/null 2>&1 || true
+        run_as_target "systemctl --user restart caelestia-quickshell.service >/dev/null 2>&1 || true"
     else
         systemctl --user restart caelestia-quickshell.service >/dev/null 2>&1 || true
     fi

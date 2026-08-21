@@ -178,9 +178,38 @@ def export_state(connection: sqlite3.Connection) -> None:
         atomic_write_text(STATE, json.dumps(payload, ensure_ascii=False))
 
 
+SENSITIVE_MIME_TYPES = {
+    "x-kde-passwordmanagerhint",
+    "application/x-kde-passwordmanagerhint",
+    "text/x-moz-password",
+    "secret",
+    "application/x-keepassxc-password",
+    "x-keepassxc-password",
+    "text/password",
+    "application/x-password",
+}
+
+
 def offered_types() -> list[str]:
     result = run("wl-paste", "--list-types")
     return result.stdout.decode("utf-8", "replace").splitlines() if result.returncode == 0 else []
+
+
+def is_sensitive_type(types: list[str]) -> bool:
+    if not types:
+        return False
+    for mime in types:
+        if not mime or not isinstance(mime, str):
+            continue
+        cleaned = mime.strip().lower()
+        if not cleaned:
+            continue
+        base_mime = cleaned.split(";")[0].strip()
+        if cleaned in SENSITIVE_MIME_TYPES or base_mime in SENSITIVE_MIME_TYPES:
+            return True
+        if "passwordmanagerhint" in cleaned or "x-moz-password" in cleaned or "password-manager" in cleaned:
+            return True
+    return False
 
 
 def preferred_type(types: list[str]) -> tuple[str, str] | None:
@@ -215,7 +244,10 @@ def prune(connection: sqlite3.Connection) -> None:
 def capture() -> int:
     if os.environ.get("CLIPBOARD_STATE") in {"sensitive", "nil", "clear"}:
         return 0
-    choice = preferred_type(offered_types())
+    types = offered_types()
+    if is_sensitive_type(types):
+        return 0
+    choice = preferred_type(types)
     if choice is None:
         return 0
     kind, mime = choice
@@ -262,6 +294,8 @@ def capture() -> int:
 def capture_stdin() -> int:
     """Store the payload wl-paste --watch already supplied on stdin."""
     if os.environ.get("CLIPBOARD_STATE") in {"sensitive", "nil", "clear"}:
+        return 0
+    if is_sensitive_type(offered_types()):
         return 0
     data = sys.stdin.buffer.read(MAX_IMAGE + 1)
     if not data or len(data) > MAX_IMAGE:

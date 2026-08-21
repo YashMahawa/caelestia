@@ -32,20 +32,13 @@ class TestRuleValidation(unittest.TestCase):
         self.assertTrue(check_regex_validity(".*polkit.*"))
         self.assertFalse(check_regex_validity("[unclosed_bracket"))
 
-    def test_named_windowrule_block_syntax(self):
+    def test_nested_block_syntax_rejection_in_conf(self):
         content = """
 windowrule rule_opacity {
     match {
         fullscreen = false
     }
     opacity = $windowOpacity override
-}
-
-windowrule rule_float_utils {
-    match {
-        class = ^(foot|yad)$
-    }
-    float = true
 }
 """
         with tempfile.NamedTemporaryFile("w", suffix=".conf", delete=False) as f:
@@ -54,7 +47,8 @@ windowrule rule_float_utils {
 
         errors = validate_conf_file(tmp_path, target_version="0.45.0")
         tmp_path.unlink()
-        self.assertEqual(errors, [])
+        self.assertTrue(len(errors) > 0)
+        self.assertTrue(any("Invalid block syntax" in err for err in errors))
 
     def test_declarative_match_line_syntax(self):
         content = """
@@ -80,29 +74,9 @@ windowrule = float true, match:class foot
         tmp_path.unlink()
         self.assertTrue(any("windowrulev2" in err for err in errors_v45))
 
-    def test_unclosed_block_brace(self):
+    def test_invalid_regex_in_declarative_match_line(self):
         content = """
-windowrule rule_unclosed {
-    match {
-        class = ^(foot)$
-    # missing closing braces
-"""
-        with tempfile.NamedTemporaryFile("w", suffix=".conf", delete=False) as f:
-            f.write(content)
-            tmp_path = Path(f.name)
-
-        errors = validate_conf_file(tmp_path, target_version="0.45.0")
-        tmp_path.unlink()
-        self.assertTrue(len(errors) > 0)
-
-    def test_invalid_regex_in_match_block(self):
-        content = """
-windowrule rule_bad_regex {
-    match {
-        class = ^([bad_regex)$
-    }
-    float = true
-}
+windowrule = float true, match:class ^([bad_regex)$
 """
         with tempfile.NamedTemporaryFile("w", suffix=".conf", delete=False) as f:
             f.write(content)
@@ -143,7 +117,7 @@ return {
 
     def test_user_override_file_preservation(self):
         # Ensure validator does not write or mutate user override file
-        override_content = "# User custom rules\nwindowrule my_rule {\n    match {\n        class = ^(my_app)$\n    }\n    float = true\n}\n"
+        override_content = "# User custom rules\nwindowrule = float true, match:class ^(my_app)$\n"
         with tempfile.NamedTemporaryFile("w", suffix=".conf", delete=False) as f:
             f.write(override_content)
             tmp_path = Path(f.name)
@@ -178,7 +152,7 @@ return {
             mock_res.stderr = "[ERROR] Unknown option: --config-only\n"
             with patch("subprocess.run", return_value=mock_res):
                 with tempfile.NamedTemporaryFile("w", suffix=".conf", delete=False) as f:
-                    f.write("windowrule rule_test {\n    match {\n        class = ^(test)$\n    }\n}\n")
+                    f.write("windowrule = float true, match:class ^(test)$\n")
                     tmp_path = Path(f.name)
                 result = validate_with_installed_parser(tmp_path)
                 tmp_path.unlink()

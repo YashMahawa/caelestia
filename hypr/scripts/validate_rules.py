@@ -245,16 +245,18 @@ def validate_conf_file(file_path: Path, target_version: str = "0.45.0") -> list[
         if not line:
             continue
 
-        # Check block structures: windowrule name { ... }, layerrule name { ... }, workspace name { ... }
-        block_match = re.match(r'^(windowrule|layerrule|workspace)\s+([a-zA-Z0-9_\-]+)\s*\{', line)
-        if block_match:
+        # Reject invalid block structure with nested match { ... }
+        if re.match(r'^(windowrule|layerrule|workspace)\s+[a-zA-Z0-9_\-]+\s*\{', line):
+            errors.append(
+                f"Line {idx}: Invalid block syntax '{line}' in .conf file. "
+                f"Hyprland rejects windowrule blocks with nested match blocks in .conf files; use native Lua (rules.lua) for Hyprland 0.55+ or declarative 'windowrule = ..., match:...' syntax."
+            )
             in_block = True
-            block_type = block_match.group(1)
-            block_name = block_match.group(2)
             brace_depth += 1
             continue
 
         if line == 'match {' and in_block:
+            errors.append(f"Line {idx}: Invalid nested match block syntax in .conf file.")
             in_match = True
             brace_depth += 1
             continue
@@ -264,52 +266,49 @@ def validate_conf_file(file_path: Path, target_version: str = "0.45.0") -> list[
                 brace_depth -= 1
             else:
                 errors.append(f"Line {idx}: Unexpected closing brace '}}'")
-            if in_match and brace_depth == 1:
+            if in_match and brace_depth <= 1:
                 in_match = False
             elif in_block and brace_depth == 0:
                 in_block = False
-                block_type = None
-                block_name = None
             continue
 
-        # Inside match block validation
-        if in_match:
-            if '=' in line:
-                key, val = line.split('=', 1)
-                key = key.strip()
-                val = val.strip()
-                if key in ("class", "title", "initialClass", "initialTitle", "namespace"):
-                    clean_pattern = val
-                    if clean_pattern.startswith('^(') and clean_pattern.endswith(')$'):
-                        clean_pattern = clean_pattern[2:-2]
-                    elif clean_pattern.startswith('^'):
-                        clean_pattern = clean_pattern[1:]
-                    elif clean_pattern.endswith('$'):
-                        clean_pattern = clean_pattern[:-1]
-                    if not check_regex_validity(clean_pattern):
-                        errors.append(f"Line {idx}: Invalid regex pattern '{val}' for property '{key}'")
-            else:
-                errors.append(f"Line {idx}: Missing '=' in match definition: '{line}'")
-            continue
-
-        # Line-based rule check
+        # Line-based declarative rule check
         if '=' in line and not in_block:
             directive, body = line.split('=', 1)
             directive = directive.strip()
             body = body.strip()
 
             if directive == "windowrulev2":
-                # Deprecated in newer Hyprland
                 ver_parts = [int(p) for p in target_version.split('.')] if target_version else [0, 45, 0]
                 if ver_parts >= [0, 45, 0]:
                     errors.append(
                         f"Line {idx}: Deprecated 'windowrulev2' syntax used. "
-                        f"Newer Hyprland ({target_version}) requires named windowrule block syntax "
-                        f"('windowrule <name> {{ match {{ ... }} ... }}') or declarative match syntax."
+                        f"Hyprland 0.55+ requires native Lua rules (rules.lua) or declarative 'windowrule = ..., match:...' syntax."
                     )
             elif directive in ("windowrule", "layerrule", "workspace"):
-                # Single line directive
-                pass
+                # Extract match clauses e.g. match:class ^(...)$ or match:title ...
+                parts = [p.strip() for p in body.split(',')]
+                for part in parts:
+                    if part.startswith("match:"):
+                        match_body = part[len("match:"):].strip()
+                        if ' ' in match_body or '\t' in match_body:
+                            key, val = re.split(r'\s+', match_body, maxsplit=1)
+                        elif '=' in match_body:
+                            key, val = match_body.split('=', 1)
+                        else:
+                            continue
+                        key = key.strip()
+                        val = val.strip()
+                        if key in ("class", "title", "initialClass", "initialTitle", "namespace"):
+                            clean_pattern = val
+                            if clean_pattern.startswith('^(') and clean_pattern.endswith(')$'):
+                                clean_pattern = clean_pattern[2:-2]
+                            elif clean_pattern.startswith('^'):
+                                clean_pattern = clean_pattern[1:]
+                            elif clean_pattern.endswith('$'):
+                                clean_pattern = clean_pattern[:-1]
+                            if not check_regex_validity(clean_pattern):
+                                errors.append(f"Line {idx}: Invalid regex pattern '{val}' for property '{key}'")
 
     if brace_depth != 0:
         errors.append(f"Unclosed block brace in {file_path} (depth={brace_depth})")
@@ -351,10 +350,10 @@ def main():
         script_dir = Path(__file__).resolve().parent
         home = Path.home()
         files_to_check = [
-            script_dir / "../hyprland/rules.conf",
             script_dir / "../hyprland/rules.lua",
-            home / ".config/caelestia/hypr-user.conf",
+            script_dir / "../hyprland/rules.conf",
             home / ".config/caelestia/hypr-user.lua",
+            home / ".config/caelestia/hypr-user.conf",
         ]
 
     total_errors = 0

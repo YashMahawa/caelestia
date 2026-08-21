@@ -37,14 +37,14 @@ DISPLAY_MODES = {"extend", "mirror", "laptop", "external"}
 MONITOR_HEALTH_INTERVAL = 1.0
 MONITOR_FAILURE_THRESHOLD = 2
 MONITOR_RECOVERY_THRESHOLD = 2
-RESUME_GRACE_SECONDS = 10.0
+RESUME_GRACE_SECONDS = 2.0
 SUSPEND_OFFSET_THRESHOLD = 0.5
 
 
 def suspend_clock_offset() -> float:
     """Return time spent suspended since boot, using kernel clock semantics."""
     try:
-        return time.clock_gettime(time.CLOCK_BOOTTIME) - time.monotonic()
+        return max(0.0, time.clock_gettime(time.CLOCK_BOOTTIME) - time.monotonic())
     except (AttributeError, OSError):
         return 0.0
 
@@ -288,6 +288,39 @@ def connected_output_names() -> list[str]:
         if VALID_NAME.fullmatch(name):
             names.append(name)
     return sorted(set(names))
+
+
+def is_display_ready(events: list[str] | None = None) -> bool:
+    """Probe kernel DRM connectors and Hyprland IPC to check if display topology is settled."""
+    try:
+        drm_connected = connected_output_names()
+        hypr_monitors = monitors()
+    except Exception:
+        return False
+
+    if not hypr_monitors:
+        return False
+
+    active_hypr_monitors = [
+        m for m in hypr_monitors
+        if not m.get("disabled") and not m.get("name", "").startswith("HEADLESS-")
+    ]
+
+    if not active_hypr_monitors:
+        return False
+
+    for monitor in active_hypr_monitors:
+        width, height = logical_monitor_size(monitor)
+        if width <= 0 or height <= 0:
+            return False
+
+    if drm_connected:
+        known_hypr_names = {m.get("name") for m in hypr_monitors}
+        for connector in drm_connected:
+            if connector not in known_hypr_names:
+                return False
+
+    return True
 
 
 def validate_name(name: str) -> str:
@@ -1007,7 +1040,6 @@ def watch() -> int:
 
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
                 client.connect(str(event_socket_path()))
-                client.settimeout(1.0)
                 buffer = ""
                 next_health_check = time.monotonic() + MONITOR_HEALTH_INTERVAL
                 last_suspend_offset = suspend_clock_offset()
@@ -1016,6 +1048,9 @@ def watch() -> int:
                 health_failures = 0
                 health_successes = 0
                 while True:
+                    now = time.monotonic()
+                    in_resume_grace = now < resume_grace_until
+                    client.settimeout(0.05 if in_resume_grace else 1.0)
                     try:
                         chunk = client.recv(8192)
                         if not chunk:
@@ -1038,12 +1073,27 @@ def watch() -> int:
                         health_failures = 0
                         health_successes = 0
                         print(
-                            f"resume detected; deferring display changes for {RESUME_GRACE_SECONDS:.0f}s",
+                            f"resume detected; initiating dynamic display probing (max cap {RESUME_GRACE_SECONDS:.1f}s)",
                             file=sys.stderr,
                         )
                     last_suspend_offset = max(last_suspend_offset, suspend_offset)
 
+                    display_events = [
+                        line for line in lines if line.startswith((
+                            "monitoradded", "monitorremoved", "configreloaded"
+                        ))
+                    ]
+
                     in_resume_grace = now < resume_grace_until
+                    if in_resume_grace:
+                        if is_display_ready(display_events):
+                            in_resume_grace = False
+                            resume_grace_until = now
+                            print("displays settled; terminating resume grace period dynamically", file=sys.stderr)
+                        else:
+                            if display_events:
+                                resume_reconcile_pending = True
+
                     if resume_reconcile_pending and not in_resume_grace:
                         try:
                             apply_automatic()
@@ -1051,8 +1101,10 @@ def watch() -> int:
                             resume_reconcile_pending = False
                         except Exception as error:
                             print(f"post-resume display reconciliation failed: {error}", file=sys.stderr)
-                            resume_grace_until = now + 2.0
-                            in_resume_grace = True
+                            resume_reconcile_pending = False
+
+                    if in_resume_grace:
+                        continue
 
                     if now >= next_health_check and not in_resume_grace:
                         next_health_check = now + MONITOR_HEALTH_INTERVAL
@@ -1098,17 +1150,6 @@ def watch() -> int:
                             health_failures = 0
                             health_successes = 0
 
-                    display_events = [
-                        line for line in lines if line.startswith((
-                            "monitoradded", "monitorremoved", "configreloaded"
-                        ))
-                    ]
-                    if in_resume_grace:
-                        # Ignore all transient monitor/workspace/focus events;
-                        # the stable topology is reconciled once after grace.
-                        if display_events:
-                            resume_reconcile_pending = True
-                        continue
                     if display_events:
                         if display_change_pending():
                             continue

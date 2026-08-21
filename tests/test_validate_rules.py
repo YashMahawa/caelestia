@@ -19,6 +19,9 @@ from validate_rules import (
     validate_file,
     validate_with_installed_parser,
     check_regex_validity,
+    strip_ansi,
+    is_debug_or_log_line,
+    is_recognized_parser_diagnostic,
 )
 
 
@@ -203,6 +206,55 @@ return {
                 tmp_path.unlink()
                 self.assertEqual(result, [])
 
+    def test_strip_ansi_and_log_filtering(self):
+        ansi_text = "\x1b[31m[ERROR] Config error at line 5\x1b[0m"
+        self.assertEqual(strip_ansi(ansi_text), "[ERROR] Config error at line 5")
+
+        debug_line = "[DEBUG] Config: loading file /tmp/test.conf"
+        self.assertTrue(is_debug_or_log_line(debug_line))
+        self.assertFalse(is_recognized_parser_diagnostic(debug_line))
+
+        error_line = "Config error: syntax error at line 2"
+        self.assertFalse(is_debug_or_log_line(error_line))
+        self.assertTrue(is_recognized_parser_diagnostic(error_line))
+
+    def test_validate_with_installed_parser_debug_output_returns_none(self):
+        from unittest.mock import patch, MagicMock
+        with patch("shutil.which", return_value="/usr/bin/hyprland"):
+            mock_help = MagicMock()
+            mock_help.stdout = "Usage: hyprland [--verify-config] [-c CONFIG]\n"
+            mock_help.stderr = ""
+            mock_res = MagicMock()
+            mock_res.returncode = 1
+            # 11 DEBUG lines like in the reported test failure
+            debug_lines = "\n".join([
+                "DEBUG: Loading config file /tmp/tmp123.conf",
+                "[DEBUG] Setting config option windowrule",
+                "[DEBUG] Error handling initialized",
+                "[DEBUG] Config parsing stage 1",
+                "[DEBUG] Config parsing stage 2",
+                "[DEBUG] Config option windowrule parsed",
+                "[DEBUG] Invalid backend handle",
+                "[DEBUG] Error in display initialization",
+                "[DEBUG] Config file processed",
+                "[DEBUG] Exiting with code 1",
+                "[DEBUG] Cleaning up resources"
+            ])
+            mock_res.stdout = ""
+            mock_res.stderr = debug_lines
+            def mock_run(cmd, **kwargs):
+                if "--help" in cmd:
+                    return mock_help
+                return mock_res
+            with patch("subprocess.run", side_effect=mock_run):
+                with tempfile.NamedTemporaryFile("w", suffix=".conf", delete=False) as f:
+                    f.write("windowrule rule_test {\n    match {\n        class = ^(test)$\n    }\n}\n")
+                    tmp_path = Path(f.name)
+                # Should return None (fallback to internal structural validator) rather than returning DEBUG lines as errors
+                result = validate_with_installed_parser(tmp_path)
+                tmp_path.unlink()
+                self.assertIsNone(result)
+
     def test_validate_with_installed_parser_supported_option_failure(self):
         from unittest.mock import patch, MagicMock
         with patch("shutil.which", return_value="/usr/bin/hyprland"):
@@ -212,7 +264,7 @@ return {
             mock_res = MagicMock()
             mock_res.returncode = 1
             mock_res.stdout = ""
-            mock_res.stderr = "Config error: syntax error at line 2\n"
+            mock_res.stderr = "\x1b[31m[ERROR] Config error: syntax error at line 2\x1b[0m\n"
             def mock_run(cmd, **kwargs):
                 if "--help" in cmd:
                     return mock_help
@@ -223,6 +275,7 @@ return {
                     tmp_path = Path(f.name)
                 result = validate_with_installed_parser(tmp_path)
                 tmp_path.unlink()
+                self.assertIsNotNone(result)
                 self.assertTrue(len(result) > 0)
                 self.assertTrue(any("syntax error" in err for err in result))
 

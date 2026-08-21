@@ -46,6 +46,55 @@ def get_hyprland_installed_version(hyprland_bin: str = "hyprland") -> str | None
     return None
 
 
+def strip_ansi(text: str) -> str:
+    """Removes ANSI escape sequences from a string."""
+    ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+    return ansi_escape.sub('', text)
+
+
+def is_debug_or_log_line(line: str) -> bool:
+    """Checks if a line is debug or normal startup/logging output from Hyprland."""
+    clean = line.strip()
+    if not clean:
+        return True
+
+    upper = clean.upper()
+    if upper.startswith(("[DEBUG]", "DEBUG:", "DEBUG ", "[LOG]", "LOG:", "LOG ", "[INFO]", "INFO:", "INFO ", "[TRACE]", "TRACE:", "TRACE ", "[WARN]", "WARN:", "WARN ")):
+        return True
+    if re.match(r'^\[?(DEBUG|LOG|INFO|TRACE|WARN)\]?:?\s', clean, re.IGNORECASE):
+        return True
+    return False
+
+
+def is_recognized_parser_diagnostic(line: str) -> bool:
+    """
+    Checks if a line represents a recognized Hyprland config/parser diagnostic error.
+    Ignores debug output, startup logs, and environment/display connection errors.
+    """
+    clean = line.strip()
+    if is_debug_or_log_line(clean):
+        return False
+
+    patterns = [
+        r'\bconfig error\b',
+        r'\bsyntax error\b',
+        r'\bparse error\b',
+        r'\binvalid keyword\b',
+        r'\binvalid directive\b',
+        r'\binvalid rule\b',
+        r'\bunknown keyword\b',
+        r'\bunknown directive\b',
+        r'\berror at line\b',
+        r'\berror in\b',
+        r'\bline \d+:',
+        r'^\[?error\]?:?\s*(config|syntax|line|invalid|unknown|parse)',
+    ]
+    for pat in patterns:
+        if re.search(pat, clean, re.IGNORECASE):
+            return True
+    return False
+
+
 def validate_with_installed_parser(file_path: Path, hyprland_bin: str | None = None) -> list[str] | None:
     bin_name = hyprland_bin or "hyprland"
     bin_path = shutil.which(bin_name) or shutil.which("Hyprland") or shutil.which("hyprland")
@@ -63,37 +112,40 @@ def validate_with_installed_parser(file_path: Path, hyprland_bin: str | None = N
         help_output = ""
         try:
             help_res = subprocess.run([bin_path, "--help"], capture_output=True, text=True, timeout=5)
-            help_output = (help_res.stdout + "\n" + help_res.stderr).lower()
+            help_output = strip_ansi(help_res.stdout + "\n" + help_res.stderr).lower()
         except Exception:
             pass
 
-        candidate_cmds = [
-            [bin_path, "--verify-config", "-c", tmp_path],
-            [bin_path, "-c", tmp_path, "--config-only"],
-            [bin_path, "--dry-run", "-c", tmp_path],
-        ]
+        # If --help failed or returned empty, do not run hyprland (prevents launching a compositor instance)
+        if not help_output:
+            os.unlink(tmp_path)
+            return None
 
-        # If help text exists, filter candidates to flags that appear in --help
-        if help_output:
-            filtered = [
-                cmd for cmd in candidate_cmds
-                if any(arg in help_output for arg in cmd if arg.startswith("--"))
-            ]
-            if filtered:
-                candidate_cmds = filtered
-            else:
-                # None of the non-destructive validation flags are supported by this Hyprland binary
-                os.unlink(tmp_path)
-                return None
+        # Build candidate commands ONLY using flags explicitly supported in --help
+        candidate_cmds = []
+        if "--verify-config" in help_output:
+            candidate_cmds.append([bin_path, "--verify-config", "-c", tmp_path])
+        if "--config-only" in help_output:
+            candidate_cmds.append([bin_path, "-c", tmp_path, "--config-only"])
+        if "--dry-run" in help_output:
+            candidate_cmds.append([bin_path, "--dry-run", "-c", tmp_path])
+
+        if not candidate_cmds:
+            # None of the non-destructive validation flags are supported by this Hyprland binary
+            os.unlink(tmp_path)
+            return None
+
+        env = os.environ.copy()
+        env["HYPRLAND_NO_SD_NOTIFY"] = "1"
 
         res = None
         for cmd in candidate_cmds:
             try:
-                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-                output = (proc.stderr + "\n" + proc.stdout).strip().lower()
+                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=10, env=env)
+                output = strip_ansi(proc.stderr + "\n" + proc.stdout).lower()
 
                 # If the binary rejected the option as unknown/invalid, do not treat it as validation
-                if any(kw in output for kw in ["unknown option", "invalid option", "unrecognized option", "unknown flag"]):
+                if any(kw in output for kw in ["unknown option", "invalid option", "unrecognized option", "unknown flag", "usage:"]):
                     continue
 
                 res = proc
@@ -106,23 +158,28 @@ def validate_with_installed_parser(file_path: Path, hyprland_bin: str | None = N
         if res is None:
             return None
 
-        stderr_full = (res.stderr + "\n" + res.stdout).strip()
-        stderr_lower = stderr_full.lower()
+        raw_output = res.stderr + "\n" + res.stdout
+        clean_output = strip_ansi(raw_output)
 
         # Guard again against unknown option messages in case exit code was non-zero
-        if any(kw in stderr_lower for kw in ["unknown option", "invalid option", "unrecognized option", "unknown flag"]):
+        if any(kw in clean_output.lower() for kw in ["unknown option", "invalid option", "unrecognized option", "unknown flag"]):
             return None
 
+        if res.returncode == 0:
+            return []
+
+        # Nonzero exit case: classify failure ONLY if recognized parser diagnostics exist
         errors = []
-        if res.returncode != 0:
-            if stderr_full:
-                for err_line in stderr_full.splitlines():
-                    if any(kw in err_line.lower() for kw in ["error", "syntax", "config", "invalid"]):
-                        errors.append(f"Hyprland Parser Error: {err_line}")
-                if not errors:
-                    errors.append(f"Hyprland Parser exited with code {res.returncode}: {stderr_full}")
-            else:
-                errors.append(f"Hyprland Parser validation failed with exit code {res.returncode}")
+        for line in clean_output.splitlines():
+            line_str = line.strip()
+            if is_recognized_parser_diagnostic(line_str):
+                errors.append(f"Hyprland Parser Error: {line_str}")
+
+        if not errors:
+            # Non-zero exit code without recognized parser diagnostics (e.g. headless environment display error)
+            # Fall back to internal structural validator
+            return None
+
         return errors
     except Exception:
         # Fallback to internal validator if process invocation failed

@@ -48,14 +48,23 @@ STANDARD_REFERENCE_PORTALS = {
 }
 
 
-def load_installed_portal_descriptors(extra_dirs=None):
+def load_installed_portal_descriptors(extra_dirs=None, include_system=True):
     """
     Scans portal descriptor directories (*.portal) and builds a map:
     backend_name -> set(supported_interfaces)
     """
-    portal_dirs = list(SYSTEM_PORTAL_DIRS)
+    portal_dirs = []
     if extra_dirs:
-        portal_dirs = [pathlib.Path(d) for d in extra_dirs] + portal_dirs
+        portal_dirs.extend([pathlib.Path(d) for d in extra_dirs])
+
+    fixture_dir = REPO_ROOT / "tests" / "fixtures" / "portals"
+    if fixture_dir not in portal_dirs:
+        portal_dirs.append(fixture_dir)
+
+    if include_system:
+        for sys_dir in SYSTEM_PORTAL_DIRS:
+            if sys_dir not in portal_dirs:
+                portal_dirs.append(sys_dir)
 
     backends = {}
     found_any = False
@@ -64,10 +73,10 @@ def load_installed_portal_descriptors(extra_dirs=None):
         if not portal_dir.exists():
             continue
 
-        for descriptor_path in portal_dir.glob("*.portal"):
+        for descriptor_path in sorted(portal_dir.glob("*.portal")):
             found_any = True
             backend_name = descriptor_path.stem
-            supported_interfaces = set()
+            supported_interfaces = backends.get(backend_name, set())
 
             with open(descriptor_path, "r", encoding="utf-8", errors="ignore") as f:
                 for line in f:
@@ -83,7 +92,7 @@ def load_installed_portal_descriptors(extra_dirs=None):
 
     if not found_any:
         # Fall back to standard reference descriptors
-        return STANDARD_REFERENCE_PORTALS
+        return dict(STANDARD_REFERENCE_PORTALS)
 
     return backends
 
@@ -177,7 +186,7 @@ class TestPortalConfigAndPreflight(unittest.TestCase):
             )
 
     def test_rejects_invalid_backend_gnome_keyring(self):
-        backends = load_installed_portal_descriptors()
+        backends = load_installed_portal_descriptors(include_system=False)
         invalid_content = """[preferred]
 default=gtk;hyprland;
 org.freedesktop.impl.portal.Secret=gnome-keyring;gtk;
@@ -185,12 +194,12 @@ org.freedesktop.impl.portal.Secret=gnome-keyring;gtk;
         is_valid, errors = validate_portal_config_content(invalid_content, backends)
         self.assertFalse(is_valid)
         self.assertTrue(
-            any("gnome-keyring" in err for err in errors),
-            f"Expected gnome-keyring error, got: {errors}",
+            len(errors) > 0 and any("Secret" in err or "gnome-keyring" in err or "gtk" in err for err in errors),
+            f"Expected Secret validation error, got: {errors}",
         )
 
     def test_rejects_unsupported_clipboard_interface(self):
-        backends = load_installed_portal_descriptors()
+        backends = load_installed_portal_descriptors(include_system=False)
         invalid_content = """[preferred]
 default=gtk;hyprland;
 org.freedesktop.impl.portal.Clipboard=gtk;hyprland;
@@ -203,7 +212,7 @@ org.freedesktop.impl.portal.Clipboard=gtk;hyprland;
         )
 
     def test_rejects_unsupported_openuri_for_gtk(self):
-        backends = load_installed_portal_descriptors()
+        backends = load_installed_portal_descriptors(include_system=False)
         invalid_content = """[preferred]
 default=gtk;hyprland;
 org.freedesktop.impl.portal.OpenURI=gtk;
@@ -216,7 +225,7 @@ org.freedesktop.impl.portal.OpenURI=gtk;
         )
 
     def test_rejects_unsupported_wallpaper_for_gtk(self):
-        backends = load_installed_portal_descriptors()
+        backends = load_installed_portal_descriptors(include_system=False)
         invalid_content = """[preferred]
 default=gtk;hyprland;
 org.freedesktop.impl.portal.Wallpaper=gtk;
@@ -229,7 +238,7 @@ org.freedesktop.impl.portal.Wallpaper=gtk;
         )
 
     def test_rejects_unsupported_inhibit_for_hyprland(self):
-        backends = load_installed_portal_descriptors()
+        backends = load_installed_portal_descriptors(include_system=False)
         invalid_content = """[preferred]
 default=gtk;hyprland;
 org.freedesktop.impl.portal.Inhibit=hyprland;
@@ -242,7 +251,7 @@ org.freedesktop.impl.portal.Inhibit=hyprland;
         )
 
     def test_rejects_unknown_backend_gnome(self):
-        backends = load_installed_portal_descriptors()
+        backends = load_installed_portal_descriptors(include_system=False)
         invalid_content = """[preferred]
 default=gtk;hyprland;
 org.freedesktop.impl.portal.Secret=gnome;

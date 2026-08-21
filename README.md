@@ -96,6 +96,8 @@ Dependencies:
 -   app2unit
 -   wireplumber
 -   trash-cli
+-   upower
+-   power-profiles-daemon
 -   foot
 -   fish
 -   fastfetch

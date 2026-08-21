@@ -169,6 +169,16 @@ else
 end
 fish -c 'rm -f caelestia-meta-*.pkg.tar.zst' 2> /dev/null
 
+# Enable power management services
+if test -d /run/systemd/system
+    log 'Enabling power management services...'
+    if test (id -u) -eq 0
+        systemctl enable --now upower.service power-profiles-daemon.service 2>/dev/null || true
+    else if command -v sudo &>/dev/null
+        sudo systemctl enable --now upower.service power-profiles-daemon.service 2>/dev/null || true
+    end
+end
+
 # Install hypr* configs
 if confirm-overwrite $config/hypr
     log 'Installing hypr* configs...'

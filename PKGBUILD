@@ -13,7 +13,8 @@ depends=('caelestia-cli' 'caelestia-shell'
          'hyprland' 'xdg-desktop-portal-hyprland' 'xdg-desktop-portal-gtk' 'hyprpicker'
          'wl-clipboard' 'cliphist' 'grim' 'slurp' 'swappy' 'inotify-tools' 'app2unit' 'wireplumber' 'trash-cli'
          'foot' 'fish' 'eza' 'fastfetch' 'starship' 'btop' 'jq' 'adw-gtk-theme'
-         'papirus-icon-theme' 'qtengine' 'ttf-jetbrains-mono-nerd')
+         'papirus-icon-theme' 'qtengine' 'ttf-jetbrains-mono-nerd'
+         'upower' 'power-profiles-daemon')
 optdepends=('thunar: file manager'
             'spotify: music player'
             'vscode: code editor'

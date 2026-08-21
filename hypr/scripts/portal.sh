@@ -13,6 +13,13 @@ dbus-update-activation-environment --systemd \
 
 systemctl --user start hyprland-session-anchor.service || true
 
+# Validate portal configuration presence prior to invoking background portal services
+config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/xdg-desktop-portal"
+if [[ ! -f "$config_dir/hyprland-portals.conf" && ! -f "$config_dir/portals.conf" ]]; then
+    echo "Warning: Portal configuration file not found in $config_dir. Skipping xdg-desktop-portal initialization." >&2
+    exit 0
+fi
+
 systemctl --user reset-failed \
     xdg-desktop-portal.service \
     xdg-desktop-portal-hyprland.service \

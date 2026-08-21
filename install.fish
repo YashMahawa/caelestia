@@ -177,6 +177,12 @@ if confirm-overwrite $config/hypr
     hyprctl reload
 end
 
+# xdg-desktop-portal
+if confirm-overwrite $config/xdg-desktop-portal
+    log 'Installing xdg-desktop-portal config...'
+    install-copy xdg-desktop-portal $config/xdg-desktop-portal
+end
+
 # Starship
 if confirm-overwrite $config/starship.toml
     log 'Installing starship config...'

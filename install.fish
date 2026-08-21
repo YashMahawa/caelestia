@@ -8,12 +8,13 @@ argparse -n 'install.fish' -X 0 \
     'discord' \
     'zen' \
     'aur-helper=!contains -- "$_flag_value" yay paru' \
+    'enable-power-daemon' \
     -- $argv
 or exit
 
 # Print help
 if set -q _flag_h
-    echo 'usage: ./install.sh [-h] [--noconfirm] [--spotify] [--vscode] [--discord] [--aur-helper]'
+    echo 'usage: ./install.fish [-h] [--noconfirm] [--spotify] [--vscode] [--discord] [--zen] [--aur-helper] [--enable-power-daemon]'
     echo
     echo 'options:'
     echo '  -h, --help                  show this help message and exit'
@@ -23,6 +24,7 @@ if set -q _flag_h
     echo '  --discord                   install Discord (OpenAsar + Equicord)'
     echo '  --zen                       install Zen browser'
     echo '  --aur-helper=[yay|paru]     the AUR helper to use'
+    echo '  --enable-power-daemon       enable power-profiles-daemon service'
 
     exit
 end
@@ -190,8 +192,10 @@ if test -d /run/systemd/system; and type -q systemctl
         log 'power-profiles-daemon.service is already active/enabled.'
     else
         set -l enable_pdm 0
-        if set -q noconfirm
+        if set -q _flag_enable_power_daemon; or test "$ENABLE_POWER_DAEMON" = "1"
             set enable_pdm 1
+        else if set -q noconfirm
+            log 'Noninteractive installation: skipping power-profiles-daemon activation (use --enable-power-daemon to enable).'
         else
             input 'Enable power-profiles-daemon.service for system power profiles? [Y/n] ' -n
             set -l confirm (sh-read)

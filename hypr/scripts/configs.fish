@@ -36,6 +36,9 @@ end
 # Run startup rule syntax validation on core system rules and user override files
 if test -f $script_dir/validate_rules.py
     python3 $script_dir/validate_rules.py $script_dir/../hyprland/rules.conf $_config_dir/hypr-user.conf
+    if test -f $script_dir/../hyprland.lua
+        python3 $script_dir/validate_rules.py --lua $script_dir/../hyprland.lua
+    end
     if test -f $script_dir/../hyprland/rules.lua
         python3 $script_dir/validate_rules.py --lua $script_dir/../hyprland/rules.lua $_config_dir/hypr-user.lua
     end

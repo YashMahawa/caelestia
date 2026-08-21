@@ -50,39 +50,38 @@ windowrule rule_opacity {
         self.assertTrue(len(errors) > 0)
         self.assertTrue(any("Invalid block syntax" in err for err in errors))
 
-    def test_declarative_match_line_syntax(self):
+    def test_declarative_windowrulev2_line_syntax(self):
         content = """
-windowrule = opacity $windowOpacity override, match:fullscreen false
-windowrule = float true, match:class foot
+windowrulev2 = opacity $windowOpacity override, fullscreen:0
+windowrulev2 = float, class:^(foot)$
 """
         with tempfile.NamedTemporaryFile("w", suffix=".conf", delete=False) as f:
             f.write(content)
             tmp_path = Path(f.name)
 
-        errors = validate_conf_file(tmp_path, target_version="0.40.0")
+        errors = validate_conf_file(tmp_path, target_version="0.56.2")
         tmp_path.unlink()
         self.assertEqual(errors, [])
 
-    def test_version_aware_deprecated_windowrulev2_warning(self):
-        content = "windowrulev2 = opacity $windowOpacity override, fullscreen:0\n"
+    def test_match_clause_rejection_in_conf(self):
+        content = "windowrule = opacity $windowOpacity override, match:fullscreen false\n"
         with tempfile.NamedTemporaryFile("w", suffix=".conf", delete=False) as f:
             f.write(content)
             tmp_path = Path(f.name)
 
-        # Version >= 0.45 flags deprecated windowrulev2
-        errors_v45 = validate_conf_file(tmp_path, target_version="0.45.0")
+        errors = validate_conf_file(tmp_path, target_version="0.56.2")
         tmp_path.unlink()
-        self.assertTrue(any("windowrulev2" in err for err in errors_v45))
+        self.assertTrue(any("Invalid 'match:' clause" in err for err in errors))
 
-    def test_invalid_regex_in_declarative_match_line(self):
+    def test_invalid_regex_in_windowrulev2_line(self):
         content = """
-windowrule = float true, match:class ^([bad_regex)$
+windowrulev2 = float, class:^([bad_regex)$
 """
         with tempfile.NamedTemporaryFile("w", suffix=".conf", delete=False) as f:
             f.write(content)
             tmp_path = Path(f.name)
 
-        errors = validate_conf_file(tmp_path, target_version="0.45.0")
+        errors = validate_conf_file(tmp_path, target_version="0.56.2")
         tmp_path.unlink()
         self.assertTrue(any("Invalid regex" in err for err in errors))
 
@@ -117,12 +116,12 @@ return {
 
     def test_user_override_file_preservation(self):
         # Ensure validator does not write or mutate user override file
-        override_content = "# User custom rules\nwindowrule = float true, match:class ^(my_app)$\n"
+        override_content = "# User custom rules\nwindowrulev2 = float, class:^(my_app)$\n"
         with tempfile.NamedTemporaryFile("w", suffix=".conf", delete=False) as f:
             f.write(override_content)
             tmp_path = Path(f.name)
 
-        errors = validate_file(tmp_path, target_version="0.45.0")
+        errors = validate_file(tmp_path, target_version="0.56.2")
         read_back = tmp_path.read_text()
         tmp_path.unlink()
 
@@ -133,15 +132,19 @@ return {
         repo_root = Path(__file__).resolve().parent.parent
         rules_conf = repo_root / "hypr" / "hyprland" / "rules.conf"
         rules_lua = repo_root / "hypr" / "hyprland" / "rules.lua"
+        hyprland_lua = repo_root / "hypr" / "hyprland.lua"
 
         self.assertTrue(rules_conf.exists())
         self.assertTrue(rules_lua.exists())
+        self.assertTrue(hyprland_lua.exists())
 
-        errs_conf = validate_conf_file(rules_conf, target_version="0.45.0")
+        errs_conf = validate_conf_file(rules_conf, target_version="0.56.2")
         errs_lua = validate_lua_file(rules_lua)
+        errs_hyprland_lua = validate_lua_file(hyprland_lua)
 
         self.assertEqual(errs_conf, [], f"rules.conf has errors: {errs_conf}")
         self.assertEqual(errs_lua, [], f"rules.lua has errors: {errs_lua}")
+        self.assertEqual(errs_hyprland_lua, [], f"hyprland.lua has errors: {errs_hyprland_lua}")
 
     def test_validate_with_installed_parser_unknown_option_fallback(self):
         from unittest.mock import patch, MagicMock

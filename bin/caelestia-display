@@ -37,7 +37,9 @@ DISPLAY_MODES = {"extend", "mirror", "laptop", "external"}
 MONITOR_HEALTH_INTERVAL = 1.0
 MONITOR_FAILURE_THRESHOLD = 2
 MONITOR_RECOVERY_THRESHOLD = 2
-RESUME_GRACE_SECONDS = 10.0
+RESUME_MIN_GRACE_SECONDS = 1.25
+RESUME_MAX_GRACE_SECONDS = 8.0
+RESUME_TOPOLOGY_STABLE_SECONDS = 0.75
 SUSPEND_OFFSET_THRESHOLD = 0.5
 
 
@@ -75,6 +77,30 @@ def hypr_json(*args: str):
 def monitors() -> list[dict]:
     value = hypr_json("monitors", "all")
     return value if isinstance(value, list) else []
+
+
+def resume_topology(values: list[dict]) -> tuple[tuple[str, bool], ...]:
+    """Return a stable signature for real compositor outputs."""
+    return tuple(sorted(
+        (str(monitor.get("name", "")), bool(monitor.get("disabled")))
+        for monitor in values
+        if monitor.get("name") and not str(monitor.get("name", "")).startswith("HEADLESS-")
+    ))
+
+
+def resume_outputs_ready(values: list[dict], mode: str) -> bool:
+    """Wait only for outputs required by the selected display mode."""
+    active = [
+        monitor for monitor in values
+        if not monitor.get("disabled")
+        and not str(monitor.get("name", "")).startswith("HEADLESS-")
+    ]
+    if mode == "laptop":
+        return any(str(monitor.get("name", "")).startswith(("eDP-", "LVDS-", "DSI-")) for monitor in active)
+    return any(
+        not str(monitor.get("name", "")).startswith(("eDP-", "LVDS-", "DSI-"))
+        for monitor in active
+    )
 
 
 def logical_monitor_size(monitor: dict) -> tuple[float, float]:
@@ -1011,8 +1037,11 @@ def watch() -> int:
                 buffer = ""
                 next_health_check = time.monotonic() + MONITOR_HEALTH_INTERVAL
                 last_suspend_offset = suspend_clock_offset()
-                resume_grace_until = 0.0
+                resume_started = 0.0
+                resume_not_before = 0.0
                 resume_reconcile_pending = False
+                resume_signature: tuple[tuple[str, bool], ...] = ()
+                resume_stable_since = 0.0
                 health_failures = 0
                 health_successes = 0
                 while True:
@@ -1029,30 +1058,40 @@ def watch() -> int:
                     now = time.monotonic()
                     suspend_offset = suspend_clock_offset()
                     if suspend_offset - last_suspend_offset >= SUSPEND_OFFSET_THRESHOLD:
-                        # HDMI, DDC and Qt's wl_output objects recover at
-                        # different rates. Reconfiguring during that interval
-                        # can destroy QuickshellScreenInfo while Qt Quick still
-                        # evaluates geometry bindings, causing a SIGSEGV.
-                        resume_grace_until = now + RESUME_GRACE_SECONDS
+                        # Wait for a stable, usable output topology instead of
+                        # imposing a fixed ten-second delay on every wake.
+                        resume_started = now
+                        resume_not_before = now + RESUME_MIN_GRACE_SECONDS
                         resume_reconcile_pending = True
+                        resume_signature = ()
+                        resume_stable_since = now
                         health_failures = 0
                         health_successes = 0
                         print(
-                            f"resume detected; deferring display changes for {RESUME_GRACE_SECONDS:.0f}s",
+                            "resume detected; waiting for stable display topology",
                             file=sys.stderr,
                         )
                     last_suspend_offset = max(last_suspend_offset, suspend_offset)
 
-                    in_resume_grace = now < resume_grace_until
-                    if resume_reconcile_pending and not in_resume_grace:
+                    in_resume_grace = resume_reconcile_pending
+                    if resume_reconcile_pending and now >= resume_not_before:
                         try:
-                            apply_automatic()
-                            sync_shell_to_external_state()
-                            resume_reconcile_pending = False
+                            resume_values = monitors()
+                            signature = resume_topology(resume_values)
+                            if signature != resume_signature:
+                                resume_signature = signature
+                                resume_stable_since = now
+                            ready = resume_outputs_ready(resume_values, selected_display_mode())
+                            stable = now - resume_stable_since >= RESUME_TOPOLOGY_STABLE_SECONDS
+                            timed_out = now - resume_started >= RESUME_MAX_GRACE_SECONDS
+                            if (ready and stable) or timed_out:
+                                apply_automatic()
+                                sync_shell_to_external_state()
+                                resume_reconcile_pending = False
+                                in_resume_grace = False
                         except Exception as error:
                             print(f"post-resume display reconciliation failed: {error}", file=sys.stderr)
-                            resume_grace_until = now + 2.0
-                            in_resume_grace = True
+                            resume_not_before = now + 1.0
 
                     if now >= next_health_check and not in_resume_grace:
                         next_health_check = now + MONITOR_HEALTH_INTERVAL

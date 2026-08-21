@@ -17,6 +17,7 @@ import unittest
 
 REPO_ROOT = pathlib.Path(__file__).parent.parent.resolve()
 SYSTEM_PORTAL_DIRS = [
+    REPO_ROOT / "tests" / "fixtures" / "portals",
     pathlib.Path("/usr/share/xdg-desktop-portal/portals"),
     pathlib.Path("/usr/local/share/xdg-desktop-portal/portals"),
     pathlib.Path("/etc/xdg-desktop-portal/portals"),
@@ -28,7 +29,6 @@ STANDARD_REFERENCE_PORTALS = {
     "hyprland": {
         "org.freedesktop.impl.portal.ScreenCast",
         "org.freedesktop.impl.portal.Screenshot",
-        "org.freedesktop.impl.portal.Inhibit",
         "org.freedesktop.impl.portal.GlobalShortcuts",
         "org.freedesktop.impl.portal.InputCapture",
     },
@@ -40,35 +40,10 @@ STANDARD_REFERENCE_PORTALS = {
         "org.freedesktop.impl.portal.Inhibit",
         "org.freedesktop.impl.portal.Notification",
         "org.freedesktop.impl.portal.Print",
-        "org.freedesktop.impl.portal.RemoteDesktop",
-        "org.freedesktop.impl.portal.ScreenCast",
-        "org.freedesktop.impl.portal.Screenshot",
         "org.freedesktop.impl.portal.Settings",
-        "org.freedesktop.impl.portal.Wallpaper",
         "org.freedesktop.impl.portal.Access",
         "org.freedesktop.impl.portal.Lockdown",
         "org.freedesktop.impl.portal.Email",
-        "org.freedesktop.impl.portal.OpenURI",
-    },
-    "gnome": {
-        "org.freedesktop.impl.portal.Secret",
-        "org.freedesktop.impl.portal.FileChooser",
-        "org.freedesktop.impl.portal.AppChooser",
-        "org.freedesktop.impl.portal.Notification",
-        "org.freedesktop.impl.portal.Inhibit",
-        "org.freedesktop.impl.portal.ScreenCast",
-        "org.freedesktop.impl.portal.Screenshot",
-        "org.freedesktop.impl.portal.Settings",
-    },
-    "kde": {
-        "org.freedesktop.impl.portal.Secret",
-        "org.freedesktop.impl.portal.FileChooser",
-        "org.freedesktop.impl.portal.AppChooser",
-        "org.freedesktop.impl.portal.Notification",
-        "org.freedesktop.impl.portal.Inhibit",
-        "org.freedesktop.impl.portal.ScreenCast",
-        "org.freedesktop.impl.portal.Screenshot",
-        "org.freedesktop.impl.portal.Settings",
     },
 }
 
@@ -225,6 +200,58 @@ org.freedesktop.impl.portal.Clipboard=gtk;hyprland;
         self.assertTrue(
             any("Clipboard" in err for err in errors),
             f"Expected Clipboard error, got: {errors}",
+        )
+
+    def test_rejects_unsupported_openuri_for_gtk(self):
+        backends = load_installed_portal_descriptors()
+        invalid_content = """[preferred]
+default=gtk;hyprland;
+org.freedesktop.impl.portal.OpenURI=gtk;
+"""
+        is_valid, errors = validate_portal_config_content(invalid_content, backends)
+        self.assertFalse(is_valid)
+        self.assertTrue(
+            any("OpenURI" in err for err in errors),
+            f"Expected OpenURI error, got: {errors}",
+        )
+
+    def test_rejects_unsupported_wallpaper_for_gtk(self):
+        backends = load_installed_portal_descriptors()
+        invalid_content = """[preferred]
+default=gtk;hyprland;
+org.freedesktop.impl.portal.Wallpaper=gtk;
+"""
+        is_valid, errors = validate_portal_config_content(invalid_content, backends)
+        self.assertFalse(is_valid)
+        self.assertTrue(
+            any("Wallpaper" in err for err in errors),
+            f"Expected Wallpaper error, got: {errors}",
+        )
+
+    def test_rejects_unsupported_inhibit_for_hyprland(self):
+        backends = load_installed_portal_descriptors()
+        invalid_content = """[preferred]
+default=gtk;hyprland;
+org.freedesktop.impl.portal.Inhibit=hyprland;
+"""
+        is_valid, errors = validate_portal_config_content(invalid_content, backends)
+        self.assertFalse(is_valid)
+        self.assertTrue(
+            any("Inhibit" in err for err in errors),
+            f"Expected Inhibit error, got: {errors}",
+        )
+
+    def test_rejects_unknown_backend_gnome(self):
+        backends = load_installed_portal_descriptors()
+        invalid_content = """[preferred]
+default=gtk;hyprland;
+org.freedesktop.impl.portal.Secret=gnome;
+"""
+        is_valid, errors = validate_portal_config_content(invalid_content, backends)
+        self.assertFalse(is_valid)
+        self.assertTrue(
+            any("gnome" in err for err in errors),
+            f"Expected gnome error, got: {errors}",
         )
 
     def test_portal_script_preflight_missing_config_fallback(self):

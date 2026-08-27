@@ -5,14 +5,13 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
 import sys
 from pathlib import Path
 
 HOME = Path.home()
 ULTRA_STATE = HOME / ".local/state/caelestia/ultra-power.json"
-MAX_START_TEMP_C = 70.0
-MAX_LOAD_1M = 2.0
+MAX_START_TEMP_C = 68.0
+MAX_LOAD_PER_CPU = 0.75
 
 
 def deny(reason: str) -> int:
@@ -35,19 +34,6 @@ def cpu_temperature() -> float | None:
     return max(readings) if readings else None
 
 
-def command_succeeds(command: list[str]) -> bool:
-    try:
-        return subprocess.run(
-            command,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=3,
-            check=False,
-        ).returncode == 0
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-
-
 def main() -> int:
     try:
         if json.loads(ULTRA_STATE.read_text()).get("active"):
@@ -55,16 +41,18 @@ def main() -> int:
     except (OSError, ValueError):
         pass
 
-    if command_succeeds(["systemctl", "is-active", "--quiet", "waydroid-container.service"]):
-        return deny("Waydroid is running")
-
     # Media playback is allowed. The semantic worker detects active MPRIS
     # playback and keeps embedding on CPU, leaving the iGPU to the decoder.
 
     try:
         load_1m = os.getloadavg()[0]
-        if load_1m > MAX_LOAD_1M:
-            return deny(f"system load is {load_1m:.2f}")
+        cpu_count = max(1, os.cpu_count() or 1)
+        max_load = cpu_count * MAX_LOAD_PER_CPU
+        if load_1m > max_load:
+            return deny(
+                f"system load is {load_1m:.2f} "
+                f"(limit {max_load:.2f} for {cpu_count} CPUs)"
+            )
     except OSError:
         pass
 

@@ -3,14 +3,13 @@ Description=Caelestia bounded local semantic indexing worker
 ConditionACPower=true
 
 [Service]
-Environment=CAELESTIA_TORCH_AUTO_GPU=0
 Environment=TOKENIZERS_PARALLELISM=false
 Type=oneshot
 ExecCondition=%h/.local/bin/caelestia-index-guard
-ExecStart=/usr/bin/flock -n -E 0 %t/caelestia-index-writer.lock %h/.local/bin/caelestia-semantic-search work --limit 16
+ExecStart=/usr/bin/flock -n -E 0 %t/caelestia-index-writer.lock %h/.local/bin/caelestia-semantic-search work --limit 32
 Nice=15
 CPUWeight=5
-CPUQuota=40%
+CPUQuota=20%
 IOWeight=5
 IOSchedulingClass=idle
 MemoryHigh=1800M
@@ -19,5 +18,5 @@ TasksMax=128
 TimeoutStartSec=15min
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=%h/.local/share/caelestia-search %h/.cache/caelestia-search %h/.cache/huggingface
+ReadWritePaths=%h/.local/share/caelestia-search %h/.cache/caelestia-search %h/.cache/huggingface %t
 PrivateTmp=true

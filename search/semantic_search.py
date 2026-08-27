@@ -7,6 +7,7 @@ import argparse
 import configparser
 import difflib
 import fnmatch
+import hashlib
 import json
 import mimetypes
 import os
@@ -301,6 +302,34 @@ def office_text(path: Path) -> str:
     return " ".join(chunks)
 
 
+def clipboard_ocr_text(path: Path) -> str:
+    """Reuse OCR already produced for an identical clipboard image."""
+    clipboard_root = HOME / ".local/share/caelestia-clipboard"
+    database = clipboard_root / "history.sqlite3"
+    if not database.is_file():
+        return ""
+    try:
+        digest = hashlib.sha256()
+        with path.open("rb") as image:
+            for chunk in iter(lambda: image.read(1024 * 1024), b""):
+                digest.update(chunk)
+        cached_path = clipboard_root / "items" / f"{digest.hexdigest()}{path.suffix.casefold()}"
+        connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True, timeout=1)
+        try:
+            row = connection.execute(
+                "SELECT text FROM items WHERE kind='image' AND path=? "
+                "ORDER BY created DESC LIMIT 1",
+                (str(cached_path),),
+            ).fetchone()
+        finally:
+            connection.close()
+    except (OSError, sqlite3.Error):
+        return ""
+    if not row or not row[0] or row[0] in {"Copied image", "Image", "Scanning…"}:
+        return ""
+    return str(row[0])
+
+
 def extract_text(path: Path, cfg: dict) -> str:
     if path.is_dir():
         return ""
@@ -338,6 +367,9 @@ def extract_text(path: Path, cfg: dict) -> str:
                 return ""
         except OSError:
             return ""
+        cached = clipboard_ocr_text(path)
+        if cached:
+            return cached[:limit]
         return command_text(
             ["tesseract", str(path), "stdout", "-l", cfg["ocr"]["languages"], "--psm", "11"],
             45,
@@ -363,31 +395,10 @@ class Embedder:
             # execution; vector scoring below is iGPU accelerated as well.
             self.device = "GPU"
         else:
-            # Use both processors only while the desktop is genuinely idle.
-            # A playing MPRIS source keeps the iGPU free for video decoding,
-            # while Nice/CPUWeight/IOWeight still make CPU work yield quickly.
-            try:
-                playing = subprocess.run(
-                    ["playerctl", "-a", "status"], capture_output=True,
-                    text=True, timeout=1, check=False,
-                ).stdout.splitlines()
-            except (OSError, subprocess.TimeoutExpired):
-                playing = []
-            load_per_cpu = os.getloadavg()[0] / max(1, os.cpu_count() or 1)
-            temperatures = []
-            for zone in Path("/sys/class/thermal").glob("thermal_zone*"):
-                try:
-                    value = float((zone / "temp").read_text().strip()) / 1000
-                    if 0 < value < 130:
-                        temperatures.append(value)
-                except (OSError, ValueError):
-                    continue
-            cool_enough = not temperatures or max(temperatures) < 55
-            self.device = (
-                "MULTI:GPU,CPU"
-                if cool_enough and "Playing" not in playing and load_per_cpu < 0.25
-                else "CPU"
-            )
+            # Reuse the proven Intel GPU path. Content work uses the same
+            # batch-one graph shape as queries, avoiding a costly second
+            # OpenVINO compilation while retaining parallel tensor execution.
+            self.device = "GPU"
         device_cache = CACHE_PATH / self.device.casefold()
         device_cache.mkdir(parents=True, exist_ok=True)
         # The low-level Rust tokenizer produces byte-for-byte identical IDs for
@@ -411,7 +422,7 @@ class Embedder:
             self.device,
             {
                 "CACHE_DIR": str(device_cache),
-                "PERFORMANCE_HINT": "LATENCY" if query else "THROUGHPUT",
+                "PERFORMANCE_HINT": "LATENCY" if query or self.batch_size == 1 else "THROUGHPUT",
             },
         )
         self.output = self.model.output(0)
@@ -601,14 +612,14 @@ def cpu_temperature() -> float | None:
 def wait_for_safe_temperature() -> None:
     """Yield between embedding batches if sustained indexing gets too hot."""
     temperature = cpu_temperature()
-    if temperature is None or temperature < 72:
+    if temperature is None or temperature < 70:
         return
     print(
-        f"caelestia-search: pausing at {temperature:.1f} C until below 65 C",
+        f"caelestia-search: pausing at {temperature:.1f} C until below 64 C",
         file=sys.stderr,
         flush=True,
     )
-    while temperature is not None and temperature >= 65:
+    while temperature is not None and temperature >= 64:
         time.sleep(5)
         temperature = cpu_temperature()
 
@@ -672,15 +683,16 @@ def work(limit: int = 0):
                 ORDER BY CASE WHEN {priority_sql} THEN 0 ELSE 1 END,
                   CASE
                     WHEN lower(path) GLOB '*.md' OR lower(path) GLOB '*.markdown'
-                      OR lower(path) GLOB '*.txt' OR lower(path) GLOB '*.pdf' THEN 0
-                    WHEN lower(path) GLOB '*.docx' OR lower(path) GLOB '*.odt'
-                      OR lower(path) GLOB '*.png' OR lower(path) GLOB '*.jpg'
-                      OR lower(path) GLOB '*.jpeg' OR lower(path) GLOB '*.webp' THEN 1
+                      OR lower(path) GLOB '*.txt' OR lower(path) GLOB '*.png'
+                      OR lower(path) GLOB '*.jpg' OR lower(path) GLOB '*.jpeg'
+                      OR lower(path) GLOB '*.webp' THEN 0
+                    WHEN lower(path) GLOB '*.pdf' OR lower(path) GLOB '*.docx'
+                      OR lower(path) GLOB '*.odt' THEN 1
                     WHEN lower(path) GLOB '*.json' OR lower(path) GLOB '*.jsonl'
                       OR lower(path) GLOB '*.log' THEN 3
                     ELSE 2
                   END,
-                  queued_at DESC LIMIT 4""",
+                  queued_at DESC LIMIT 1""",
             tuple(prefix + "%" for prefix in personal_prefixes),
         ).fetchall()
         if not batch_rows or (limit and processed >= limit):
@@ -712,7 +724,7 @@ def work(limit: int = 0):
             db.commit()
             continue
         if embedder is None:
-            embedder = Embedder(cfg["embedding_dimensions"])
+            embedder = Embedder(cfg["embedding_dimensions"], batch_size=1)
         vectors = embedder.encode([item[3] for item in documents])
         for (path, stat, text, _semantic), vector in zip(documents, vectors):
             raw = str(path)

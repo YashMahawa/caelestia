@@ -22,7 +22,7 @@
     "*.env", "*.env.*", "*.key", "*.pem", "*.p12", "*.pfx", "*credentials*",
     "*api_key*", "*api-key*", "*production_keys*", "*keys_handoff*", "jules-cerebras.env",
     "*secret*", "*token*", "*password*", "*passwd*", "*cookie*", "*auth*",
-    "*_files", "*.iso", "*.img", "*.safetensors",
+    "*_files", "build-*", "cmake-build-*", "*.iso", "*.img", "*.safetensors",
     "*.gguf", "*.onnx", "*.pt", "*.pth", "*.apk", "*.AppImage",
     "*.zip", "*.7z", "*.rar", "*.tar", "*.gz", "*.xz", "*.zst",
     "*.o", "*.so", "*.a", "*.class", "*.pyc", "*.map", "*.min.js",

@@ -10,7 +10,7 @@
   "discover_top_level_projects": false,
   "exclude_directories": [
     ".cache", "cache", ".git", ".hg", ".svn", ".idea", ".vscode", ".obsidian",
-    "__pycache__", "node_modules", ".venv", ".venv-openvino-convert",
+    "__pycache__", ".pytest_cache", "node_modules", ".venv", ".venv-openvino-convert",
     ".cxx", ".gradle", ".expo", ".dart_tool", ".pub-cache", ".terraform", "Pods", "DerivedData",
     "venv", "venv_new",
     "build", "dist", "target", "coverage", ".next", ".nuxt",

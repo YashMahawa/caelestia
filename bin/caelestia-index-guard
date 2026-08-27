@@ -10,7 +10,7 @@ from pathlib import Path
 
 HOME = Path.home()
 ULTRA_STATE = HOME / ".local/state/caelestia/ultra-power.json"
-MAX_START_TEMP_C = 68.0
+MAX_START_TEMP_C = 75.0
 MAX_LOAD_PER_CPU = 0.75
 
 

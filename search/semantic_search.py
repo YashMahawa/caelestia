@@ -50,7 +50,7 @@ IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff", ".bmp"}
 OFFICE_EXTENSIONS = {".docx", ".pptx", ".xlsx", ".odt", ".odp", ".ods"}
 CONTENT_TEXT_EXTENSIONS = {
     ".txt", ".md", ".markdown", ".rst", ".org", ".tex", ".csv", ".tsv",
-    ".json", ".jsonl", ".yaml", ".yml", ".toml", ".ini", ".conf", ".log",
+    ".json", ".jsonl", ".yaml", ".yml", ".toml", ".ini", ".conf",
     ".ipynb",
 }
 PROJECT_MARKERS = {
@@ -612,14 +612,14 @@ def cpu_temperature() -> float | None:
 def wait_for_safe_temperature() -> None:
     """Yield between embedding batches if sustained indexing gets too hot."""
     temperature = cpu_temperature()
-    if temperature is None or temperature < 70:
+    if temperature is None or temperature < 72:
         return
     print(
-        f"caelestia-search: pausing at {temperature:.1f} C until below 64 C",
+        f"caelestia-search: pausing at {temperature:.1f} C until below 68 C",
         file=sys.stderr,
         flush=True,
     )
-    while temperature is not None and temperature >= 64:
+    while temperature is not None and temperature >= 68:
         time.sleep(5)
         temperature = cpu_temperature()
 

@@ -31,6 +31,7 @@ user_home="$(getent passwd "$user_id" | cut -d: -f6)"
 runtime_dir="/run/user/${user_id}"
 bus="unix:path=${runtime_dir}/bus"
 ipc="${user_home}/.local/bin/caelestia-qs-ipc"
+lock_state_file="${user_home}/.local/state/caelestia/session-lock"
 
 run_user() {
     /usr/bin/setpriv --reuid="$user_id" --regid="$user_id" --init-groups \
@@ -55,6 +56,13 @@ fi
 
 log "resume recovery: preserving compositor topology and waiting for the existing shell"
 
+# Unlocking removes this marker.  If the user has already authenticated while
+# the delayed resume helper was waiting, never lock the session a second time.
+if [[ ! -r "$lock_state_file" ]]; then
+    log "resume recovery: session was already unlocked; no recovery needed"
+    exit 0
+fi
+
 # A monitor and Wayland compositor can need several seconds to settle after
 # resume. Do not mistake that transient for a dead shell or rewrite outputs.
 for _ in $(/usr/bin/seq 1 20); do
@@ -64,6 +72,7 @@ for _ in $(/usr/bin/seq 1 20); do
         exit 0
     fi
     if [[ "$lock_state" == "false" ]]; then
+        [[ -r "$lock_state_file" ]] || exit 0
         if qs_ipc lock safeLock >&2; then
             log "resume recovery: existing shell is healthy; lock restored"
         else
@@ -85,7 +94,7 @@ for _ in $(/usr/bin/seq 1 40); do
         log "resume recovery: shell recovered and is already locked"
         exit 0
     fi
-    if [[ "$lock_state" == "false" ]] && qs_ipc lock safeLock >&2; then
+    if [[ "$lock_state" == "false" && -r "$lock_state_file" ]] && qs_ipc lock safeLock >&2; then
         log "resume recovery: shell recovered and lock restored"
         exit 0
     fi

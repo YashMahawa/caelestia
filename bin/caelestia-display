@@ -37,9 +37,9 @@ DISPLAY_MODES = {"extend", "mirror", "laptop", "external"}
 MONITOR_HEALTH_INTERVAL = 1.0
 MONITOR_FAILURE_THRESHOLD = 2
 MONITOR_RECOVERY_THRESHOLD = 2
-RESUME_MIN_GRACE_SECONDS = 1.25
-RESUME_MAX_GRACE_SECONDS = 8.0
-RESUME_TOPOLOGY_STABLE_SECONDS = 0.75
+RESUME_MIN_GRACE_SECONDS = 3.0
+RESUME_MAX_GRACE_SECONDS = 15.0
+RESUME_TOPOLOGY_STABLE_SECONDS = 2.0
 SUSPEND_OFFSET_THRESHOLD = 0.5
 
 
@@ -411,9 +411,7 @@ def activate_power_loss_fallback(connector: str) -> None:
     set_dpms(internal, True)
     set_internal_panel_visible(True)
     time.sleep(0.15)
-    for workspace in workspaces():
-        if workspace.get("monitor") != internal and workspace.get("windows", 0) > 0:
-            move_workspace_to(workspace.get("name", workspace.get("id")), internal)
+    migrate_occupied_workspaces(internal)
     rules = profile_rules("extend", values) if external_names(values) else [panel_rule]
     write_runtime_monitor_rules(rules)
     for name in external_names(values):
@@ -655,6 +653,36 @@ def move_workspace_to(workspace: str | int, monitor: str) -> None:
     dispatch("moveworkspacetomonitor", f"{workspace} {monitor}")
 
 
+def migrate_occupied_workspaces(target: str, *, retries: int = 4) -> list[str]:
+    """Move every live application workspace to target and verify the move."""
+    target = validate_name(target)
+    moved: list[str] = []
+    for attempt in range(max(1, retries)):
+        stranded = [
+            workspace for workspace in workspaces()
+            if (
+                workspace.get("windows", 0) > 0
+                and workspace.get("name") != FALLBACK_WORKSPACE
+                and workspace.get("monitor") != target
+            )
+        ]
+        if not stranded:
+            break
+        for workspace in stranded:
+            name = str(workspace.get("name", workspace.get("id", "")))
+            if not name:
+                continue
+            try:
+                move_workspace_to(name, target)
+                if name not in moved:
+                    moved.append(name)
+            except (RuntimeError, subprocess.SubprocessError, ValueError):
+                continue
+        if attempt + 1 < retries:
+            time.sleep(0.12 * (attempt + 1))
+    return moved
+
+
 def centre_pointer(name: str) -> None:
     monitor = next((m for m in monitors() if m["name"] == name), None)
     if monitor is None:
@@ -840,9 +868,7 @@ def apply_automatic() -> int:
                     occupied[0].get("name", occupied[0].get("id", ""))
                 ))
             run([str(HYPR_SET), "monitor", panel_rule])
-            for workspace in workspaces():
-                if workspace.get("monitor") != internal and workspace.get("windows", 0) > 0:
-                    move_workspace_to(workspace.get("name", workspace.get("id")), internal)
+            migrate_occupied_workspaces(internal)
             write_runtime_monitor_rules([panel_rule])
             # External-only is a preference while HDMI exists, not permission
             # to leave the user with a black laptop after unplug/hotplug loss.
@@ -870,9 +896,7 @@ def apply_automatic() -> int:
                 ) else externals[0]
             )
             if mode == "laptop":
-                for workspace in workspaces():
-                    if workspace.get("monitor") != internal and workspace.get("windows", 0) > 0:
-                        move_workspace_to(workspace.get("name", workspace.get("id")), internal)
+                migrate_occupied_workspaces(internal)
             write_runtime_monitor_rules(rules)
             internal_visible = mode in ("extend", "mirror", "laptop")
             set_dpms(internal, internal_visible)
@@ -927,9 +951,7 @@ def apply_automatic() -> int:
         time.sleep(0.35)
         set_dpms(target, True)
 
-        for workspace in workspaces():
-            if workspace.get("monitor") != target and workspace.get("windows", 0) > 0:
-                move_workspace_to(workspace.get("name", workspace.get("id")), target)
+        migrate_occupied_workspaces(target)
         dispatch("focusmonitor", target)
         # Every workspace and the pointer now have a valid HDMI destination.
         write_runtime_monitor_rules(physical_rules)
@@ -1023,13 +1045,14 @@ def watch() -> int:
         try:
             # Apply once at service startup, including sessions that began with
             # the external monitor already attached.
-            for _ in range(20):
-                try:
-                    apply_automatic()
-                    sync_shell_to_external_state()
-                    break
-                except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
-                    time.sleep(0.5)
+            if os.environ.get("CAELESTIA_DISPLAY_SKIP_INITIAL") != "1":
+                for _ in range(20):
+                    try:
+                        apply_automatic()
+                        sync_shell_to_external_state()
+                        break
+                    except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+                        time.sleep(0.5)
 
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
                 client.connect(str(event_socket_path()))
@@ -1041,6 +1064,8 @@ def watch() -> int:
                 resume_not_before = 0.0
                 resume_reconcile_pending = False
                 resume_signature: tuple[tuple[str, bool], ...] = ()
+                known_signature = resume_topology(monitors())
+                pre_resume_signature = known_signature
                 resume_stable_since = 0.0
                 health_failures = 0
                 health_successes = 0
@@ -1063,6 +1088,7 @@ def watch() -> int:
                         resume_started = now
                         resume_not_before = now + RESUME_MIN_GRACE_SECONDS
                         resume_reconcile_pending = True
+                        pre_resume_signature = known_signature
                         resume_signature = ()
                         resume_stable_since = now
                         health_failures = 0
@@ -1085,8 +1111,10 @@ def watch() -> int:
                             stable = now - resume_stable_since >= RESUME_TOPOLOGY_STABLE_SECONDS
                             timed_out = now - resume_started >= RESUME_MAX_GRACE_SECONDS
                             if (ready and stable) or timed_out:
-                                apply_automatic()
+                                if signature != pre_resume_signature:
+                                    apply_automatic()
                                 sync_shell_to_external_state()
+                                known_signature = resume_topology(monitors())
                                 resume_reconcile_pending = False
                                 in_resume_grace = False
                         except Exception as error:
@@ -1171,6 +1199,7 @@ def watch() -> int:
                         try:
                             apply_automatic()
                             sync_shell_to_external_state()
+                            known_signature = resume_topology(monitors())
                         except Exception as error:  # keep watcher alive
                             print(f"automatic display update failed: {error}", file=sys.stderr)
                     elif any(line.startswith(("workspace", "focusedmon")) for line in lines):

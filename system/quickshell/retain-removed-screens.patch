@@ -1,0 +1,30 @@
+diff --git a/src/core/qmlglobal.cpp b/src/core/qmlglobal.cpp
+--- a/src/core/qmlglobal.cpp
++++ b/src/core/qmlglobal.cpp
+@@ -125,8 +125,10 @@ void QuickshellTracked::updateScreens() {
+ 	next:;
+ 	}
+ 
++	// Retain removed screens rather than deleting them, since QML models may
++	// still hold a bare QObject pointer while an output is being reconnected.
+ 	for (auto* oldScreen: this->screens) {
+-		oldScreen->deleteLater();
++		this->mDeadScreens.push_back(oldScreen);
+ 	}
+ 
+ 	this->screens = newScreens;
+diff --git a/src/core/qmlglobal.hpp b/src/core/qmlglobal.hpp
+--- a/src/core/qmlglobal.hpp
++++ b/src/core/qmlglobal.hpp
+@@ -77,6 +77,11 @@ private slots:
+ 
+ signals:
+ 	void screensChanged();
++
++private:
++	// Keep wrappers alive so QVariant/QML references cannot become dangling
++	// during rapid output removal and re-addition.
++	QVector<QuickshellScreenInfo*> mDeadScreens;
+ };
+ 
+ class QuickshellGlobal: public QObject {

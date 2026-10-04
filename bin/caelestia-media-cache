@@ -1,0 +1,155 @@
+#!/usr/bin/env python3
+"""Usage-aware cache for Caelestia's music media (motion artwork, album art,
+lyrics, romanisation).
+
+  caelestia-media-cache hit PATH...       record that cached files were used
+  caelestia-media-cache gc [--limit-mb N] evict least-listened files over N MB
+  caelestia-media-cache stats             print sizes per cache
+
+Every use bumps a per-file play count and last-used time. When the caches
+together exceed the limit (1 GB by default), files are evicted in order of a
+score that favours songs played often and recently, until usage drops to 80%
+of the limit, so eviction does not run on every new song.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+CACHE = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "caelestia"
+STATE = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state")) / "caelestia"
+INDEX = CACHE / "media-cache" / "usage.json"
+ROOTS = [
+    CACHE / "motion-art" / "clips",
+    CACHE / "immersive-art" / "originals",
+    CACHE / "immersive-art" / "backgrounds",
+    CACHE / "romaji",
+    STATE / "lyrics-plus",
+]
+
+
+def locked_index(mutator):
+    INDEX.parent.mkdir(parents=True, exist_ok=True)
+    with open(INDEX.with_suffix(".lock"), "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            data = json.loads(INDEX.read_text())
+        except (OSError, ValueError):
+            data = {}
+        result = mutator(data)
+        tmp = INDEX.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data))
+        tmp.replace(INDEX)
+        return result
+
+
+def hit(paths: list[str]) -> int:
+    now = time.time()
+
+    def mutate(data):
+        for raw in paths:
+            path = os.path.realpath(raw.removeprefix("file://"))
+            if not os.path.isfile(path):
+                continue
+            entry = data.get(path, {"plays": 0, "last": 0})
+            # Repeated hits within a few minutes are one listen.
+            if now - entry.get("last", 0) > 300:
+                entry["plays"] = entry.get("plays", 0) + 1
+            entry["last"] = now
+            data[path] = entry
+            try:
+                os.utime(path)
+            except OSError:
+                pass
+
+    locked_index(mutate)
+    return 0
+
+
+def files():
+    for root in ROOTS:
+        if not root.is_dir():
+            continue
+        for entry in root.rglob("*"):
+            if entry.is_file() and not entry.name.endswith((".lock", ".part", ".tmp")):
+                try:
+                    yield entry, entry.stat()
+                except OSError:
+                    continue
+
+
+def gc(limit_mb: int) -> int:
+    limit = limit_mb * 1024 * 1024
+    target = int(limit * 0.8)
+    now = time.time()
+
+    def mutate(data):
+        inventory = list(files())
+        total = sum(stat.st_size for _, stat in inventory)
+        removed = 0
+        if total > limit:
+            def score(item):
+                path, stat = item
+                entry = data.get(str(path.resolve()), {})
+                plays = entry.get("plays", 1)
+                last = max(entry.get("last", 0), stat.st_mtime)
+                age_days = max(0.0, (now - last) / 86400)
+                return plays / (1 + age_days / 14)
+
+            for path, stat in sorted(inventory, key=score):
+                if total <= target:
+                    break
+                try:
+                    path.unlink()
+                except OSError:
+                    continue
+                data.pop(str(path.resolve()), None)
+                total -= stat.st_size
+                removed += 1
+        # Forget usage of files that no longer exist.
+        for key in [k for k in data if not os.path.exists(k)]:
+            data.pop(key, None)
+        # Stray lock files from older cache helpers.
+        for lock in (CACHE / "immersive-art").glob("*.lock"):
+            try:
+                lock.unlink()
+            except OSError:
+                pass
+        return removed, total
+
+    removed, total = locked_index(mutate)
+    print(json.dumps({"removed": removed, "totalMB": round(total / 1048576, 1)}))
+    return 0
+
+
+def stats() -> int:
+    for root in ROOTS:
+        size = sum(f.stat().st_size for f in root.rglob("*") if f.is_file()) if root.is_dir() else 0
+        print(f"{size / 1048576:9.1f} MB  {root}")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    sub = parser.add_subparsers(dest="command", required=True)
+    hit_parser = sub.add_parser("hit")
+    hit_parser.add_argument("paths", nargs="+")
+    gc_parser = sub.add_parser("gc")
+    gc_parser.add_argument("--limit-mb", type=int, default=1024)
+    sub.add_parser("stats")
+    args = parser.parse_args()
+    if args.command == "hit":
+        return hit(args.paths)
+    if args.command == "gc":
+        return gc(args.limit_mb)
+    return stats()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

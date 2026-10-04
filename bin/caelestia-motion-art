@@ -1,0 +1,434 @@
+#!/usr/bin/env python3
+"""Resolve Apple Music motion artwork (animated album covers) for a track.
+
+The approach mirrors BitChord's AppleMusicCanvas: the catalog API exposes the
+animated sleeve as `editorialVideo` on albums, reachable with the anonymous
+bearer token the Apple Music web player ships in its JS bundle. Search hits are
+scored rather than trusted, because a wrong animated cover is worse than none.
+
+The clip is an HLS stream whose segments are byte ranges of one fragmented MP4.
+Instead of streaming HLS every time the cover loops, the whole fMP4 for a
+single H.264 rendition is downloaded once and remuxed (stream copy, no
+re-encode) into a plain MP4 in the cache, which Qt Multimedia then loops
+locally with hardware decoding.
+
+Output is a single JSON object on stdout:
+  {"status": "ok", "path": "...mp4", "album": "...", "cached": true}
+  {"status": "none"}                      no motion artwork for this track
+  {"status": "error", "error": "..."}     transient failure, not cached
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import fcntl
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+UA = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/140.0 Safari/537.36"
+)
+AMP = "https://amp-api.music.apple.com/v1/catalog"
+WEB_PLAYER = "https://music.apple.com/us/new"
+CACHE = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "caelestia" / "motion-art"
+NEGATIVE_TTL = 3 * 24 * 3600
+TOKEN_RETRY = 30 * 60
+MAX_DOWNLOAD = 40 * 1024 * 1024
+MIN_SCORE = 12
+
+COMPILATION_MARKERS = (
+    "playlist", "set list", "essentials", "dj mix", "mixed",
+    "apple music", "today's hits", "session",
+)
+EDITION_WORDS = ("deluxe", "expanded", "remastered", "remix", "version", "edit", "mix", "bonus")
+
+
+def emit(payload: dict) -> int:
+    print(json.dumps(payload, ensure_ascii=False))
+    return 0
+
+
+def http_get(url: str, headers: dict | None = None, timeout: float = 8.0, limit: int | None = None) -> bytes:
+    request = urllib.request.Request(url, headers={"User-Agent": UA, **(headers or {})})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        if limit is None:
+            return response.read()
+        data = response.read(limit + 1)
+        if len(data) > limit:
+            raise ValueError("download exceeds size limit")
+        return data
+
+
+# ---- token ---------------------------------------------------------------
+
+def _jwt_part(jwt: str, index: int) -> str:
+    part = jwt.split(".")[index]
+    return base64.urlsafe_b64decode(part + "=" * (-len(part) % 4)).decode("utf-8", "replace")
+
+
+def _jwt_expiry(jwt: str) -> int | None:
+    try:
+        match = re.search(r'"exp"\s*:\s*(\d+)', _jwt_part(jwt, 1))
+        return int(match.group(1)) if match else None
+    except (ValueError, IndexError):
+        return None
+
+
+def _is_web_player(jwt: str) -> bool:
+    try:
+        return "WebPlayKid" in _jwt_part(jwt, 0) or "AMPWebPlay" in _jwt_part(jwt, 1)
+    except (ValueError, IndexError):
+        return False
+
+
+def token(force: bool = False) -> str | None:
+    path = CACHE / "token.json"
+    now = time.time()
+    state: dict = {}
+    try:
+        state = json.loads(path.read_text())
+    except (OSError, ValueError):
+        pass
+    if not force and state.get("token") and now < state.get("exp", 0) - 3600:
+        return state["token"]
+    if not force and now < state.get("retryAfter", 0):
+        return None
+
+    try:
+        page = http_get(WEB_PLAYER).decode("utf-8", "replace")
+        scripts = list(dict.fromkeys(re.findall(r"/assets/index(?:-legacy)?[~-][A-Za-z0-9_.-]+\.js", page)))
+        for script_path in scripts:
+            script = http_get(f"https://music.apple.com{script_path}", timeout=15).decode("utf-8", "replace")
+            candidates = []
+            for jwt in dict.fromkeys(re.findall(r"ey[A-Za-z0-9_-]+\.ey[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", script)):
+                expiry = _jwt_expiry(jwt)
+                if expiry and expiry > now and jwt not in state.get("rejected", []):
+                    candidates.append((jwt, expiry))
+            if not candidates:
+                continue
+            jwt, expiry = next((c for c in candidates if _is_web_player(c[0])), candidates[0])
+            path.write_text(json.dumps({"token": jwt, "exp": expiry, "rejected": state.get("rejected", [])[-8:]}))
+            return jwt
+    except (OSError, urllib.error.URLError, ValueError):
+        pass
+
+    state["retryAfter"] = now + TOKEN_RETRY
+    try:
+        path.write_text(json.dumps(state))
+    except OSError:
+        pass
+    return None
+
+
+def reject_token(jwt: str) -> None:
+    path = CACHE / "token.json"
+    try:
+        state = json.loads(path.read_text())
+    except (OSError, ValueError):
+        state = {}
+    rejected = state.get("rejected", [])
+    rejected.append(jwt)
+    path.write_text(json.dumps({"rejected": rejected[-8:]}))
+
+
+def catalog(url: str, bearer: str) -> dict | None:
+    try:
+        body = http_get(url, {
+            "Authorization": f"Bearer {bearer}",
+            "Origin": "https://music.apple.com",
+            "Referer": "https://music.apple.com/",
+        })
+        return json.loads(body)
+    except urllib.error.HTTPError as error:
+        if error.code == 401:
+            reject_token(bearer)
+            raise PermissionError("token rejected") from error
+        return None
+    except (OSError, ValueError):
+        return None
+
+
+# ---- matching ------------------------------------------------------------
+
+def normalise(value: str) -> str:
+    value = unicodedata.normalize("NFKD", value or "")
+    value = "".join(ch for ch in value if not unicodedata.combining(ch)).lower()
+    value = re.sub(r"\s*[\[(](feat|ft|with)\.?[^\])]*[\])]", "", value)
+    value = re.sub(r"\s+-\s+(single|ep|topic)$", "", value)
+    value = re.sub(r"[^\w]+", " ", value)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def split_artists(value: str) -> list[str]:
+    value = re.sub(r"\s+-\s+topic$", "", value or "", flags=re.I)
+    parts = re.split(r"\s*(?:,|&|\bfeat\.?|\bft\.?|\bfeaturing\b|\bx\b|\band\b|\bwith\b|/)\s*", value, flags=re.I)
+    return [p for p in (normalise(part) for part in parts) if p]
+
+
+def is_compilation(name: str) -> bool:
+    lower = (name or "").lower()
+    return any(marker in lower for marker in COMPILATION_MARKERS)
+
+
+def score(attributes: dict, title: str, artist: str, album: str, album_is_self: bool = False) -> int | None:
+    hit_name = attributes.get("name", "")
+    hit_album = hit_name if album_is_self else attributes.get("albumName", "")
+    if is_compilation(hit_name) or is_compilation(hit_album):
+        return None
+
+    wanted = split_artists(artist)
+    credited = split_artists(attributes.get("artistName", ""))
+    if not wanted or not credited:
+        return None
+    # The lead artist must be credited. MPRIS often reports only the lead, and
+    # browsers sometimes drop features, so additional names are a bonus.
+    if wanted[0] not in credited and not any(wanted[0] in c or c in wanted[0] for c in credited):
+        return None
+
+    total = 10 + 2 * sum(1 for name in wanted[1:] if name in credited)
+    want_title, got_title = normalise(title), normalise(hit_name)
+    if got_title == want_title:
+        total += 15
+    elif want_title and got_title and (want_title in got_title or got_title in want_title):
+        total += 7
+    else:
+        total -= 10
+
+    if album and hit_album:
+        want_album, got_album = normalise(album), normalise(hit_album)
+        if got_album == want_album:
+            total += 20
+        elif want_album and got_album and (want_album in got_album or got_album in want_album):
+            total += 10
+
+    for word in EDITION_WORDS:
+        in_wanted = word in title.lower()
+        in_hit = word in hit_name.lower()
+        if in_wanted and in_hit:
+            total += 5
+        elif in_hit:
+            total -= 3
+    return total
+
+
+def motion_url(video: dict) -> str | None:
+    for key in ("motionDetailSquare", "motionSquareVideo1x1", "motionDetailRaw", "motionDetailTall", "motionTallVideo3x4"):
+        asset = video.get(key) or {}
+        for field in ("video", "videoUrl", "hlsUrl", "url"):
+            if asset.get(field):
+                return asset[field]
+    return None
+
+
+def album_id(song: dict) -> str | None:
+    related = (song.get("relationships", {}).get("albums", {}).get("data") or [{}])[0].get("id")
+    if related and not related.startswith("pl."):
+        return related
+    url = song.get("attributes", {}).get("url", "")
+    candidate = url.partition("/album/")[2].split("?")[0].rsplit("/", 1)[-1]
+    return candidate if candidate.isdigit() else None
+
+
+def resolve(title: str, artist: str, album: str, storefront: str) -> tuple[str, str] | None:
+    bearer = token()
+    if not bearer:
+        raise ConnectionError("no Apple Music web token")
+
+    term = title if artist.lower() in title.lower() else f"{artist} {title}"
+    if album and album.lower() not in title.lower():
+        term += f" {album}"
+    query = urllib.parse.urlencode({
+        "term": term, "types": "songs", "limit": 10,
+        "extend": "editorialVideo", "include": "albums",
+    })
+    data = catalog(f"{AMP}/{storefront}/search?{query}", bearer)
+    if data is None:
+        raise ConnectionError("catalog search failed")
+
+    hits = data.get("results", {}).get("songs", {}).get("data", [])
+    ranked = sorted(
+        ((s, h) for h in hits if (s := score(h.get("attributes", {}), title, artist, album)) is not None),
+        key=lambda pair: pair[0], reverse=True,
+    )
+    checked: set[str] = set()
+    for value, song in ranked:
+        if value < MIN_SCORE:
+            break
+        attributes = song.get("attributes", {})
+        inline = motion_url(attributes.get("editorialVideo") or {})
+        if inline:
+            return inline, attributes.get("albumName", "")
+        identifier = album_id(song)
+        if not identifier or identifier in checked:
+            continue
+        checked.add(identifier)
+        record = catalog(f"{AMP}/{storefront}/albums/{identifier}?extend=editorialVideo", bearer)
+        entry = ((record or {}).get("data") or [{}])[0].get("attributes", {})
+        if is_compilation(entry.get("name", "")):
+            continue
+        url = motion_url(entry.get("editorialVideo") or {})
+        if url:
+            return url, entry.get("name", "")
+
+    # Singles are often searched under the album name the player reports;
+    # fall back to an album search when one is known.
+    if album:
+        query = urllib.parse.urlencode({
+            "term": album if artist.lower() in album.lower() else f"{artist} {album}",
+            "types": "albums", "limit": 10, "extend": "editorialVideo",
+        })
+        data = catalog(f"{AMP}/{storefront}/search?{query}", bearer) or {}
+        hits = data.get("results", {}).get("albums", {}).get("data", [])
+        ranked = sorted(
+            ((s, h) for h in hits
+             if (s := score(h.get("attributes", {}), album, artist, album, album_is_self=True)) is not None),
+            key=lambda pair: pair[0], reverse=True,
+        )
+        for value, record in ranked:
+            if value < MIN_SCORE:
+                break
+            entry = record.get("attributes", {})
+            url = motion_url(entry.get("editorialVideo") or {})
+            if url and not is_compilation(entry.get("name", "")):
+                return url, entry.get("name", "")
+    return None
+
+
+# ---- download ------------------------------------------------------------
+
+def pick_variant(master_url: str, max_size: int) -> str | None:
+    text = http_get(master_url).decode("utf-8", "replace")
+    lines = text.splitlines()
+    best: tuple[int, int, str] | None = None
+    for index, line in enumerate(lines):
+        if not line.startswith("#EXT-X-STREAM-INF:") or index + 1 >= len(lines):
+            continue
+        codecs = re.search(r'CODECS="([^"]+)"', line)
+        resolution = re.search(r"RESOLUTION=(\d+)x(\d+)", line)
+        bandwidth = re.search(r"[^-]BANDWIDTH=(\d+)", line)
+        if not codecs or "avc1" not in codecs.group(1) or not resolution:
+            continue
+        size = max(int(resolution.group(1)), int(resolution.group(2)))
+        if size > max_size:
+            continue
+        rank = (size, int(bandwidth.group(1)) if bandwidth else 0)
+        uri = urllib.parse.urljoin(master_url, lines[index + 1].strip())
+        if best is None or rank > best[:2]:
+            best = (*rank, uri)
+    return best[2] if best else None
+
+
+def fetch_clip(master_url: str, destination: Path, max_size: int) -> None:
+    variant = pick_variant(master_url, max_size)
+    if not variant:
+        raise ValueError("no H.264 rendition")
+    playlist = http_get(variant).decode("utf-8", "replace")
+    maps = re.findall(r'#EXT-X-MAP:URI="([^"]+)"', playlist)
+    segments = [line.strip() for line in playlist.splitlines() if line.strip() and not line.startswith("#")]
+    files = list(dict.fromkeys(maps + segments))
+
+    with tempfile.TemporaryDirectory(dir=CACHE) as scratch:
+        source = Path(scratch) / "source.mp4"
+        if len(files) == 1:
+            # Byte-range HLS: every segment lives in one fragmented MP4.
+            source.write_bytes(http_get(urllib.parse.urljoin(variant, files[0]), timeout=30, limit=MAX_DOWNLOAD))
+        else:
+            total = 0
+            with source.open("wb") as handle:
+                for name in files:
+                    chunk = http_get(urllib.parse.urljoin(variant, name), timeout=30, limit=MAX_DOWNLOAD)
+                    total += len(chunk)
+                    if total > MAX_DOWNLOAD:
+                        raise ValueError("download exceeds size limit")
+                    handle.write(chunk)
+        partial = Path(scratch) / "clip.mp4"
+        subprocess.run(
+            ["ffmpeg", "-nostdin", "-loglevel", "error", "-y", "-i", str(source),
+             "-map", "0:v:0", "-c", "copy", "-an", "-movflags", "+faststart", str(partial)],
+            check=True, timeout=60,
+        )
+        os.replace(partial, destination)
+
+
+def record_use(path: str, downloaded: bool) -> None:
+    """Count the listen and, after a new download, trim the media cache."""
+    try:
+        subprocess.Popen(["caelestia-media-cache", "hit", path], start_new_session=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if downloaded:
+            subprocess.Popen(["nice", "-n", "19", "caelestia-media-cache", "gc"], start_new_session=True,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        pass
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--title", required=True)
+    parser.add_argument("--artist", required=True)
+    parser.add_argument("--album", default="")
+    parser.add_argument("--storefront", default="us")
+    parser.add_argument("--max-size", type=int, default=1080)
+    parser.add_argument("--no-cache", action="store_true", help="ignore cached negative lookups")
+    args = parser.parse_args()
+
+    title, artist, album = args.title.strip(), args.artist.strip(), args.album.strip()
+    if not title or not artist:
+        return emit({"status": "none"})
+
+    (CACHE / "lookup").mkdir(parents=True, exist_ok=True)
+    (CACHE / "clips").mkdir(parents=True, exist_ok=True)
+    key = hashlib.sha256(f"{normalise(artist)}\n{normalise(title)}\n{normalise(album)}".encode()).hexdigest()[:32]
+    lookup = CACHE / "lookup" / f"{key}.json"
+
+    with open(CACHE / "lookup" / f".{key}.lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            cached = json.loads(lookup.read_text())
+        except (OSError, ValueError):
+            cached = {}
+        if cached.get("status") == "ok" and Path(cached.get("path", "")).is_file():
+            record_use(cached["path"], False)
+            return emit({**cached, "cached": True})
+        if (cached.get("status") == "none" and not args.no_cache
+                and time.time() - cached.get("time", 0) < NEGATIVE_TTL):
+            return emit({"status": "none", "cached": True})
+
+        try:
+            try:
+                found = resolve(title, artist, album, args.storefront)
+            except PermissionError:
+                token(force=True)
+                found = resolve(title, artist, album, args.storefront)
+            if not found:
+                lookup.write_text(json.dumps({"status": "none", "time": time.time()}))
+                return emit({"status": "none"})
+            master, album_name = found
+            clip = CACHE / "clips" / (hashlib.sha256(master.encode()).hexdigest()[:24] + ".mp4")
+            downloaded = not clip.is_file()
+            if downloaded:
+                fetch_clip(master, clip, args.max_size)
+            record_use(str(clip), downloaded)
+            result = {"status": "ok", "path": str(clip), "album": album_name, "time": time.time()}
+            lookup.write_text(json.dumps(result))
+            return emit({**result, "cached": False})
+        except (OSError, ValueError, ConnectionError, PermissionError,
+                urllib.error.URLError, subprocess.SubprocessError) as error:
+            return emit({"status": "error", "error": str(error)})
+
+
+if __name__ == "__main__":
+    sys.exit(main())

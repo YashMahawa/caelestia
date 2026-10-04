@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ ${1:-} == --finalize ]]; then
+    capture=${2:-}
+    final=${3:-}
+    [[ -s $capture && -n $final ]] || exit 4
+    temporary=$final.part.jpg
+    MAGICK_THREAD_LIMIT=1 magick -limit memory 384MiB -limit map 768MiB \
+        "$capture" -background '#10151c' -alpha background -alpha off \
+        -colorspace sRGB -strip -sampling-factor 4:4:4 -quality 98 "$temporary"
+    mv -f -- "$temporary" "$final"
+    printf '%s\n' "$final"
+    exit 0
+fi
+
+if [[ ${1:-} == --compose-paused ]]; then
+    background=${2:-}
+    foreground=${3:-}
+    final=${4:-}
+    [[ -s $background && -s $foreground && -n $final ]] || exit 4
+    temporary=$final.part.jpg
+    MAGICK_THREAD_LIMIT=1 magick -limit memory 384MiB -limit map 768MiB \
+        "$background" "$foreground" -background '#10151c' \
+        -compose over -composite -alpha off -colorspace sRGB -strip \
+        -sampling-factor 4:4:4 -quality 98 "$temporary"
+    mv -f -- "$temporary" "$final"
+    printf '%s\n' "$final"
+    exit 0
+fi
+
+source_url=${1:-}
+width=${2:-0}
+height=${3:-0}
+track_key=${4:-}
+
+if [[ ! $width =~ ^[0-9]+$ || ! $height =~ ^[0-9]+$ || $width -lt 320 || $height -lt 240 ]]; then
+    exit 2
+fi
+
+cache_root=${XDG_CACHE_HOME:-$HOME/.cache}/caelestia/immersive-art
+original_dir=$cache_root/originals
+background_dir=$cache_root/backgrounds
+track_dir=$cache_root/tracks
+mkdir -p "$original_dir" "$background_dir" "$track_dir"
+
+track_hash=
+if [[ -n $track_key ]]; then
+    track_hash=$(printf '%s' "$track_key" | sha256sum | cut -d ' ' -f 1)
+fi
+
+if [[ -n $source_url ]]; then
+    source_hash=$(printf '%s' "$source_url" | sha256sum | cut -d ' ' -f 1)
+    if [[ -n $track_hash ]]; then
+        printf '%s\n' "$source_hash" > "$track_dir/$track_hash"
+    fi
+elif [[ -n $track_hash && -s $track_dir/$track_hash ]]; then
+    source_hash=$(<"$track_dir/$track_hash")
+    [[ $source_hash =~ ^[0-9a-f]{64}$ ]] || exit 5
+else
+    exit 5
+fi
+original=$original_dir/$source_hash.art
+background=$background_dir/${source_hash}-${width}x${height}-scene.jpg
+capture=$background_dir/${source_hash}-${width}x${height}-scene-capture.png
+
+exec 9>"$cache_root/$source_hash.lock"
+flock 9
+
+if [[ ! -s $original && -n $source_url ]]; then
+    temporary=$original.part
+    case $source_url in
+        http://*|https://*)
+            if ! curl --fail --location --silent --show-error --max-time 20 --output "$temporary" "$source_url"; then
+                # Some older YouTube uploads do not provide maxresdefault.
+                # Retain a reliable immersive fallback instead of showing black.
+                if [[ $source_url == *'/maxresdefault.jpg' ]]; then
+                    fallback_url=${source_url/\/maxresdefault.jpg/\/hqdefault.jpg}
+                    curl --fail --location --silent --show-error --max-time 20 --output "$temporary" "$fallback_url"
+                else
+                    exit 3
+                fi
+            fi
+            ;;
+        file://*)
+            local_path=${source_url#file://}
+            cp -- "$local_path" "$temporary"
+            ;;
+        /*)
+            cp -- "$source_url" "$temporary"
+            ;;
+        *)
+            exit 3
+            ;;
+    esac
+    magick identify "$temporary" >/dev/null
+    mv -f -- "$temporary" "$original"
+fi
+
+[[ -s $original ]] || exit 5
+
+if [[ -s $background ]]; then
+    state=hit
+else
+    state=miss
+fi
+
+printf '%s\t%s\t%s\t%s\n' "$state" "$background" "$original" "$capture"

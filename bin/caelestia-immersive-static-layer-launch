@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+image=${1:-}
+monitor=${2:-}
+mode=${3:-}
+[[ -s $image && -n $monitor ]] || exit 2
+
+geometry=$(hyprctl monitors -j | jq -r --arg monitor "$monitor" \
+    '.[] | select(.name == $monitor) | "\(.x)\t\(.y)"' | head -n 1)
+[[ -n $geometry ]] || exit 3
+IFS=$'\t' read -r monitor_x monitor_y <<< "$geometry"
+
+exec /home/yash/.local/bin/caelestia-immersive-static-layer \
+    "$image" "$monitor_x" "$monitor_y" ${mode:+"$mode"}

@@ -245,6 +245,8 @@ def try_native_voice_ipc(command: str) -> bool:
             "not running",
             "no such object",
             "command not found",
+            "target not found",
+            "target unavailable",
         ]
         if any(kw in out_err for kw in error_keywords):
             return False
@@ -253,7 +255,13 @@ def try_native_voice_ipc(command: str) -> bool:
             out = res.stdout.strip()
             if not out:
                 return False
-            print(out)
+            try:
+                payload = json.loads(out)
+            except (TypeError, ValueError):
+                return False
+            if not isinstance(payload, dict) or not isinstance(payload.get("status"), str):
+                return False
+            print(json.dumps(payload, ensure_ascii=False))
             return True
         else:
             if res.stdout.strip():

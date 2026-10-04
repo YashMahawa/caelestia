@@ -424,8 +424,20 @@ def set_clipboard_sync(mode: str) -> int:
 
 def reconcile() -> int:
     # Caelestia Link deliberately uses only KDE Connect's LAN provider.
-    run("qdbus6", "org.kde.kdeconnect", "/modules/kdeconnect", "org.kde.kdeconnect.daemon.setLinkProviderState", "AsyncLinkProvider", "false")
-    run("qdbus6", "org.kde.kdeconnect", "/modules/kdeconnect", "org.kde.kdeconnect.daemon.setLinkProviderState", "LanLinkProvider", "true")
+    # Use advertised provider IDs. KDE Connect 26.08 dereferences a null
+    # provider for obsolete class names such as AsyncLinkProvider.
+    providers = run("qdbus6", "org.kde.kdeconnect", "/modules/kdeconnect", "org.kde.kdeconnect.daemon.linkProviders")
+    if providers.returncode == 0:
+        for line in providers.stdout.splitlines():
+            fields = line.split("|")
+            if len(fields) != 3:
+                continue
+            _, provider_id, state = fields
+            if provider_id not in {"lan", "bluetooth"}:
+                continue
+            enabled = provider_id == "lan"
+            if (state == "enabled") != enabled:
+                run("qdbus6", "org.kde.kdeconnect", "/modules/kdeconnect", "org.kde.kdeconnect.daemon.setLinkProviderState", provider_id, "true" if enabled else "false")
     settings = config()
     settings["callsEnabled"] = False
     current = device()

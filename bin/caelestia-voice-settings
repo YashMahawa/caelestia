@@ -137,8 +137,23 @@ def try_native_settings_status() -> bool:
                 "not running",
             ]
             if not any(kw in out_err for kw in error_keywords):
-                print(res.stdout.strip())
-                return True
+                # Some older CLI builds return exit status 0 with a plain-text
+                # error such as "Target not found.".  Only accept a response
+                # that is actually the voice settings object; otherwise use
+                # the local Secret Service/config fallback below.
+                try:
+                    payload = json.loads(res.stdout)
+                except (TypeError, ValueError):
+                    payload = None
+                if (
+                    isinstance(payload, dict)
+                    and isinstance(payload.get("keys"), list)
+                    and len(payload["keys"]) == 3
+                    and all(isinstance(value, bool) for value in payload["keys"])
+                    and isinstance(payload.get("prompt"), str)
+                ):
+                    print(json.dumps(payload, ensure_ascii=False))
+                    return True
     except (OSError, subprocess.SubprocessError):
         pass
     return False

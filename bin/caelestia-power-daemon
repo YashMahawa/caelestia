@@ -30,15 +30,25 @@ PROFILE_POLICY = {
 
 # Raptor Lake is designed to manage short high-temperature bursts. These limits
 # intervene only when heat is sustained, with wide hysteresis to avoid oscillation.
-SOFT_LIMIT = 85.0
-SOFT_RECOVER = 76.0
+# Start smoothing sustained turbo load before the chassis heat-soaks.  This
+# keeps the performance profile responsive for short bursts while avoiding the
+# old 65%/100% oscillation that repeatedly spun the fan up and down.
+SOFT_LIMIT = 81.0
+SOFT_RECOVER = 72.0
 HARD_LIMIT = 93.0
 HARD_RECOVER = 80.0
-RECOVERY_SECONDS = 30.0
+RECOVERY_SECONDS = 60.0
 SAMPLE_SECONDS = 3
 
 profile = "balanced"
 thermal_state = "normal"
+# AC/battery switching: unplugging selects power-saver and remembers the AC
+# profile, plugging in restores it. A profile chosen by hand while on battery
+# is left alone until the charger returns.
+AC_PROFILE_FILE = os.path.expanduser("~/.local/state/caelestia/ac-profile")
+on_battery = None
+switching = False
+ppd_props = None
 below_recovery_since = None
 last_temp = None
 
@@ -97,7 +107,7 @@ def active_policy():
     except (OSError, ValueError):
         pass
     if thermal_state == "soft":
-        base["max_perf"] = min(base["max_perf"], 65)
+        base["max_perf"] = min(base["max_perf"], 76)
     elif thermal_state == "hard":
         base["max_perf"] = min(base["max_perf"], 45)
         base["no_turbo"] = 1
@@ -174,8 +184,64 @@ def set_profile(new_profile):
 
 
 def properties_changed(_interface, changed, _invalidated):
+    global switching
     if "ActiveProfile" in changed:
         set_profile(changed["ActiveProfile"])
+        if not switching and on_battery is False:
+            remember_ac_profile(str(changed["ActiveProfile"]))
+        switching = False
+
+
+def remember_ac_profile(value):
+    try:
+        os.makedirs(os.path.dirname(AC_PROFILE_FILE), exist_ok=True)
+        with open(AC_PROFILE_FILE, "w", encoding="utf-8") as handle:
+            handle.write(value)
+    except OSError:
+        pass
+
+
+def remembered_ac_profile():
+    try:
+        with open(AC_PROFILE_FILE, encoding="utf-8") as handle:
+            value = handle.read().strip()
+            return value if value in PROFILE_POLICY else "performance"
+    except OSError:
+        return "performance"
+
+
+def request_profile(value):
+    global switching
+    if ppd_props is None or value == profile:
+        return
+    switching = True
+    try:
+        ppd_props.Set("net.hadess.PowerProfiles", "ActiveProfile", value)
+        log(f"power source change -> {value}")
+    except dbus.DBusException as error:
+        switching = False
+        log(f"could not switch profile: {error}")
+
+
+def power_source_changed(battery):
+    global on_battery
+    battery = bool(battery)
+    if battery == on_battery:
+        return
+    previous = on_battery
+    on_battery = battery
+    if previous is None:
+        return
+    if battery:
+        remember_ac_profile(profile)
+        request_profile("power-saver")
+    else:
+        request_profile(remembered_ac_profile())
+
+
+def upower_changed(_interface, changed, _invalidated):
+    if "OnBattery" in changed:
+        power_source_changed(changed["OnBattery"])
 
 
 def main():
@@ -190,7 +256,25 @@ def main():
     )
     obj = bus.get_object("net.hadess.PowerProfiles", "/net/hadess/PowerProfiles")
     props = dbus.Interface(obj, "org.freedesktop.DBus.Properties")
+    global ppd_props
+    ppd_props = props
     set_profile(props.Get("net.hadess.PowerProfiles", "ActiveProfile"))
+
+    try:
+        bus.add_signal_receiver(
+            upower_changed,
+            signal_name="PropertiesChanged",
+            dbus_interface="org.freedesktop.DBus.Properties",
+            bus_name="org.freedesktop.UPower",
+            path="/org/freedesktop/UPower",
+        )
+        upower = dbus.Interface(bus.get_object("org.freedesktop.UPower", "/org/freedesktop/UPower"),
+                                "org.freedesktop.DBus.Properties")
+        power_source_changed(upower.Get("org.freedesktop.UPower", "OnBattery"))
+        if on_battery is False:
+            remember_ac_profile(profile)
+    except dbus.DBusException as error:
+        log(f"UPower unavailable, automatic AC/battery profiles disabled: {error}")
 
     loop = GLib.MainLoop()
     GLib.timeout_add_seconds(SAMPLE_SECONDS, update_thermal_state)

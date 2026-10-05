@@ -756,28 +756,52 @@ def work(limit: int = 0):
     print(json.dumps({"names_processed": names_processed, "processed": processed, "failed": failed}))
 
 
+# The query server keeps the decoded vector matrix between searches and only
+# rebuilds it when the index database changes on disk. Rebuilding cost ~70 ms
+# of SQLite reads and float16 decoding on every keystroke batch.
+VECTOR_CACHE: dict = {"key": None, "rows": [], "vectors": None}
+
+
+def index_signature() -> tuple:
+    signature = []
+    for suffix in ("", "-wal"):
+        try:
+            stat = os.stat(f"{DB_PATH}{suffix}")
+            signature.append((stat.st_mtime_ns, stat.st_size))
+        except OSError:
+            signature.append(None)
+    return tuple(signature)
+
+
+def cached_vectors(db: sqlite3.Connection, dimensions: int):
+    key = index_signature()
+    if VECTOR_CACHE["key"] != key or VECTOR_CACHE["vectors"] is None:
+        rows = db.execute(
+            "SELECT path,name,parent,mime,size,mtime_ns,"
+            "COALESCE(vector,name_vector),COALESCE(vector_dim,name_vector_dim),kind "
+            f"FROM files WHERE (vector IS NOT NULL OR name_vector IS NOT NULL) AND {TRASH_EXCLUSION}"
+        ).fetchall()
+        vectors = np.vstack([
+            np.frombuffer(row[6], dtype=np.float16, count=row[7]).astype(np.float32)
+            for row in rows
+        ]) if rows else np.empty((0, dimensions), dtype=np.float32)
+        VECTOR_CACHE.update(key=key, rows=rows, vectors=vectors)
+    return VECTOR_CACHE["rows"], VECTOR_CACHE["vectors"]
+
+
 def search(query: str, count: int = 20, json_output: bool = False):
     global QUERY_EMBEDDER, GPU_SCORER
     cfg = config()
     db = connect()
-    rows = db.execute(
-        "SELECT path,name,parent,mime,size,mtime_ns,"
-        "COALESCE(vector,name_vector),COALESCE(vector_dim,name_vector_dim),kind "
-        f"FROM files WHERE (vector IS NOT NULL OR name_vector IS NOT NULL) AND {TRASH_EXCLUSION}"
-    ).fetchall()
     if os.environ.get("CAELESTIA_LEXICAL_ONLY") == "1":
-        rows = []
+        rows, vectors = [], np.empty((0, cfg["embedding_dimensions"]), dtype=np.float32)
+    else:
+        rows, vectors = cached_vectors(db, cfg["embedding_dimensions"])
     scores = np.array([], dtype=np.float32)
     if rows:
         if QUERY_EMBEDDER is None:
             QUERY_EMBEDDER = Embedder(cfg["embedding_dimensions"], query=True)
         query_vector = QUERY_EMBEDDER.encode([query])[0]
-        vectors = np.vstack([
-            np.frombuffer(row[6], dtype=np.float16, count=row[7]).astype(np.float32)
-            for row in rows
-        ])
-    else:
-        vectors = np.empty((0, cfg["embedding_dimensions"]), dtype=np.float32)
     vector_scores = None
     ultra = HOME / ".local/state/caelestia/ultra-power.json"
     ultra_active = False
@@ -785,9 +809,10 @@ def search(query: str, count: int = 20, json_output: bool = False):
         ultra_active = json.loads(ultra.read_text()).get("active", False)
     except (OSError, ValueError):
         pass
-    # OpenCL setup costs more than a CPU dot product for a small/incomplete
-    # backfill. It becomes worthwhile once several thousand vectors exist.
-    if len(rows) >= 4096 and not ultra_active:
+    # A CPU dot product over this index takes under a millisecond, while the
+    # OpenCL path re-uploads the whole matrix per query. Only use the iGPU once
+    # the index is large enough for scoring itself to dominate.
+    if len(rows) >= 100_000 and not ultra_active:
         try:
             if GPU_SCORER is None:
                 GPU_SCORER = GpuVectorScorer()
@@ -857,10 +882,19 @@ def search(query: str, count: int = 20, json_output: bool = False):
             "ORDER BY abs(length(name)-?) LIMIT 2000",
             (needle, len(query_folded)),
         )
+        matcher = difflib.SequenceMatcher(None)
+        matcher.set_seq1(query_folded)
         for raw, name in fuzzy_rows:
             stem = Path(name).stem.casefold()
             tokens = [name.casefold(), stem, *stem.replace("_", " ").replace("-", " ").split()]
-            similarity = max(difflib.SequenceMatcher(None, query_folded, token).ratio() for token in tokens)
+            # real_quick_ratio/quick_ratio are cheap upper bounds on ratio(),
+            # so most candidates are rejected without the full comparison.
+            similarity = 0.0
+            for token in tokens:
+                matcher.set_seq2(token)
+                if matcher.real_quick_ratio() < 0.74 or matcher.quick_ratio() < 0.74:
+                    continue
+                similarity = max(similarity, matcher.ratio())
             if similarity >= 0.74:
                 fuzzy[raw] = similarity
 
@@ -918,7 +952,9 @@ def serve():
     server.bind(str(socket_path))
     os.chmod(socket_path, 0o600)
     server.listen(4)
-    server.settimeout(45)
+    # Stay warm for ten minutes after the last query; idle costs no CPU and a
+    # cold start (model load) is ~1.5 s.
+    server.settimeout(600)
     # Launcher startup pre-warms the compact query model while apps are already
     # visible, so semantic results are fast by the time the user finishes typing.
     QUERY_EMBEDDER = Embedder(config()["embedding_dimensions"], query=True)

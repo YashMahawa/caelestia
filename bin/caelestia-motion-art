@@ -420,6 +420,9 @@ def main() -> int:
             clip = CACHE / "clips" / (hashlib.sha256(master.encode()).hexdigest()[:24] + ".mp4")
             downloaded = not clip.is_file()
             if downloaded:
+                # Tell the shell a clip exists before the download, so it can
+                # wait for it instead of flashing the still cover first.
+                print(json.dumps({"status": "found", "album": album_name}), flush=True)
                 fetch_clip(master, clip, args.max_size)
             record_use(str(clip), downloaded)
             result = {"status": "ok", "path": str(clip), "album": album_name, "time": time.time()}

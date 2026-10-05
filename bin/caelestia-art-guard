@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# Prints "placeholder" if an image is a browser's own logo rather than real
+# artwork, otherwise "ok".
+#
+# Chrome and Chromium publish their app logo as MPRIS artwork whenever a page
+# briefly has none (typically between songs). The logo is re-encoded, so it is
+# matched perceptually: both images are reduced to 16x16 and compared by RMSE
+# against the installed browser icons. Logos score ~0.0001, album art ~0.35+.
+set -euo pipefail
+
+image=${1#file://}
+[[ -r $image ]] || { echo ok; exit 0; }
+
+icons=()
+for name in google-chrome google-chrome-beta google-chrome-unstable chromium brave-browser microsoft-edge vivaldi firefox; do
+    for size in 256x256 128x128; do
+        icon=/usr/share/icons/hicolor/$size/apps/$name.png
+        [[ -r $icon ]] && { icons+=("$icon"); break; }
+    done
+done
+(( ${#icons[@]} )) || { echo ok; exit 0; }
+
+cache=${XDG_CACHE_HOME:-$HOME/.cache}/caelestia/art-guard
+mkdir -p "$cache"
+small() { magick "$1" -background white -alpha remove -resize '16x16!' "$2" 2>/dev/null; }
+
+probe=$(mktemp --suffix=.png)
+trap 'rm -f "$probe"' EXIT
+small "$image" "$probe" || { echo ok; exit 0; }
+
+for icon in "${icons[@]}"; do
+    reference=$cache/$(basename "$icon" .png)-16.png
+    [[ -s $reference && $reference -nt $icon ]] || small "$icon" "$reference"
+    # compare exits non-zero whenever images differ; that is not an error here.
+    score=$( (magick compare -metric RMSE "$probe" "$reference" null: 2>&1 || true) | grep -oE '\(([0-9.e-]+)\)' | tr -d '()' || true)
+    if [[ -n $score ]] && awk -v s="$score" 'BEGIN { exit !(s < 0.06) }'; then
+        echo placeholder
+        exit 0
+    fi
+done
+echo ok

@@ -27,6 +27,7 @@ STATE = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state"))
 INDEX = CACHE / "media-cache" / "usage.json"
 ROOTS = [
     CACHE / "motion-art" / "clips",
+    CACHE / "motion-art" / "art",
     CACHE / "immersive-art" / "originals",
     CACHE / "immersive-art" / "backgrounds",
     CACHE / "romaji",
@@ -141,7 +142,7 @@ def main() -> int:
     hit_parser = sub.add_parser("hit")
     hit_parser.add_argument("paths", nargs="+")
     gc_parser = sub.add_parser("gc")
-    gc_parser.add_argument("--limit-mb", type=int, default=1024)
+    gc_parser.add_argument("--limit-mb", type=int, default=2048)
     sub.add_parser("stats")
     args = parser.parse_args()
     if args.command == "hit":

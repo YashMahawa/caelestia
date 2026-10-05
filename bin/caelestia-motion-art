@@ -242,7 +242,12 @@ def album_id(song: dict) -> str | None:
     return candidate if candidate.isdigit() else None
 
 
-def resolve(title: str, artist: str, album: str, storefront: str) -> tuple[str, str] | None:
+def artwork_template(attributes: dict) -> str:
+    return ((attributes or {}).get("artwork") or {}).get("url", "")
+
+
+def resolve(title: str, artist: str, album: str, storefront: str) -> dict | None:
+    """Best match as {"motion": hls-url|None, "album": name, "artwork": template}."""
     bearer = token()
     if not bearer:
         raise ConnectionError("no Apple Music web token")
@@ -264,13 +269,20 @@ def resolve(title: str, artist: str, album: str, storefront: str) -> tuple[str, 
         key=lambda pair: pair[0], reverse=True,
     )
     checked: set[str] = set()
+    best: dict | None = None
     for value, song in ranked:
         if value < MIN_SCORE:
             break
         attributes = song.get("attributes", {})
+        if best is None:
+            # The best-scoring match supplies the high-resolution still cover,
+            # whether or not it has motion artwork.
+            best = {"motion": None, "album": attributes.get("albumName", ""),
+                    "artwork": artwork_template(attributes)}
         inline = motion_url(attributes.get("editorialVideo") or {})
         if inline:
-            return inline, attributes.get("albumName", "")
+            return {"motion": inline, "album": attributes.get("albumName", ""),
+                    "artwork": artwork_template(attributes) or best["artwork"]}
         identifier = album_id(song)
         if not identifier or identifier in checked:
             continue
@@ -281,7 +293,8 @@ def resolve(title: str, artist: str, album: str, storefront: str) -> tuple[str, 
             continue
         url = motion_url(entry.get("editorialVideo") or {})
         if url:
-            return url, entry.get("name", "")
+            return {"motion": url, "album": entry.get("name", ""),
+                    "artwork": artwork_template(entry) or best["artwork"]}
 
     # Singles are often searched under the album name the player reports;
     # fall back to an album search when one is known.
@@ -301,10 +314,15 @@ def resolve(title: str, artist: str, album: str, storefront: str) -> tuple[str, 
             if value < MIN_SCORE:
                 break
             entry = record.get("attributes", {})
+            if is_compilation(entry.get("name", "")):
+                continue
             url = motion_url(entry.get("editorialVideo") or {})
-            if url and not is_compilation(entry.get("name", "")):
-                return url, entry.get("name", "")
-    return None
+            if url:
+                return {"motion": url, "album": entry.get("name", ""),
+                        "artwork": artwork_template(entry) or (best or {}).get("artwork", "")}
+            if best is None:
+                best = {"motion": None, "album": entry.get("name", ""), "artwork": artwork_template(entry)}
+    return best
 
 
 # ---- download ------------------------------------------------------------
@@ -375,6 +393,28 @@ def record_use(path: str, downloaded: bool) -> None:
         pass
 
 
+def fetch_art(template: str, size: int = 1400) -> str:
+    """Download the Apple artwork at `size` px into the cache; returns the path."""
+    if not template:
+        return ""
+    url = (template.replace("{w}", str(size)).replace("{h}", str(size))
+           .replace("{c}", "bb").replace("{f}", "jpg"))
+    (CACHE / "art").mkdir(parents=True, exist_ok=True)
+    path = CACHE / "art" / (hashlib.sha256(url.encode()).hexdigest()[:24] + ".jpg")
+    if not path.is_file():
+        data = http_get(url, timeout=15, limit=8 * 1024 * 1024)
+        tmp = path.with_suffix(".part")
+        tmp.write_bytes(data)
+        os.replace(tmp, path)
+    return str(path)
+
+
+def announce_art(path: str) -> None:
+    if path and Path(path).is_file():
+        print(json.dumps({"status": "art", "art": path}), flush=True)
+        record_use(path, False)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--title", required=True)
@@ -400,12 +440,17 @@ def main() -> int:
             cached = json.loads(lookup.read_text())
         except (OSError, ValueError):
             cached = {}
-        if cached.get("status") == "ok" and Path(cached.get("path", "")).is_file():
+        cached_art = cached.get("art", "")
+        # Entries from before artwork was cached are looked up again once.
+        if cached.get("status") == "ok" and "art" in cached and Path(cached.get("path", "")).is_file():
+            announce_art(cached_art)
             record_use(cached["path"], False)
             return emit({**cached, "cached": True})
-        if (cached.get("status") == "none" and not args.no_cache
+        # Older negative entries carry no artwork; look those up again once.
+        if (cached.get("status") == "none" and not args.no_cache and "art" in cached
                 and time.time() - cached.get("time", 0) < NEGATIVE_TTL):
-            return emit({"status": "none", "cached": True})
+            announce_art(cached_art)
+            return emit({"status": "none", "art": cached_art, "cached": True})
 
         try:
             try:
@@ -413,10 +458,17 @@ def main() -> int:
             except PermissionError:
                 token(force=True)
                 found = resolve(title, artist, album, args.storefront)
-            if not found:
-                lookup.write_text(json.dumps({"status": "none", "time": time.time()}))
-                return emit({"status": "none"})
-            master, album_name = found
+            art = ""
+            if found and found.get("artwork"):
+                try:
+                    art = fetch_art(found["artwork"])
+                except (OSError, ValueError, urllib.error.URLError):
+                    art = ""
+                announce_art(art)
+            if not found or not found.get("motion"):
+                lookup.write_text(json.dumps({"status": "none", "art": art, "time": time.time()}))
+                return emit({"status": "none", "art": art})
+            master, album_name = found["motion"], found["album"]
             clip = CACHE / "clips" / (hashlib.sha256(master.encode()).hexdigest()[:24] + ".mp4")
             downloaded = not clip.is_file()
             if downloaded:
@@ -425,7 +477,7 @@ def main() -> int:
                 print(json.dumps({"status": "found", "album": album_name}), flush=True)
                 fetch_clip(master, clip, args.max_size)
             record_use(str(clip), downloaded)
-            result = {"status": "ok", "path": str(clip), "album": album_name, "time": time.time()}
+            result = {"status": "ok", "path": str(clip), "album": album_name, "art": art, "time": time.time()}
             lookup.write_text(json.dumps(result))
             return emit({**result, "cached": False})
         except (OSError, ValueError, ConnectionError, PermissionError,

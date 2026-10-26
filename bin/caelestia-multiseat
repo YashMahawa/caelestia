@@ -15,7 +15,16 @@ def run(args,**kw):
     result=subprocess.run([str(x) for x in args],capture_output=True,text=True,timeout=kw.pop('timeout',12),**kw)
     if result.returncode:raise RuntimeError((result.stderr or result.stdout).strip()[-1000:] or f'{args[0]} failed')
     return result.stdout.strip()
-def hypr(*args):return run(['hyprctl',*args])
+def host_env():
+    env=dict(os.environ)
+    signature=env.get('HYPRLAND_INSTANCE_SIGNATURE')
+    if not signature:
+        try:signature=json.loads((RUNTIME/'state.json').read_text()).get('host_hyprland_instance_signature')
+        except (OSError,ValueError):pass
+    if not signature:fail('Host compositor identity is unavailable; refusing to guess an instance')
+    env['HYPRLAND_INSTANCE_SIGNATURE']=signature
+    return env
+def hypr(*args):return run(['hyprctl',*args],env=host_env())
 def lua(code):
     value=hypr('eval',code)
     if value!='ok':raise RuntimeError(value)
@@ -117,6 +126,7 @@ class Desktop:
         data={'running':bool(self.child and self.child.poll() is None),'enabled':self.enabled,'testing':self.testing,'output':self.output['name'],
               'wayland_display':str(RUNTIME/'wayland.sock'),'sway_socket':str(RUNTIME/'sway.sock'),'main_output':self.main,
               'pid':self.child.pid if self.child else None,'supervisor_pid':os.getpid(),
+              'host_hyprland_instance_signature':os.environ.get('HYPRLAND_INSTANCE_SIGNATURE'),
               'host_wayland_display':str((RUNTIME.parent/os.environ.get('WAYLAND_DISPLAY','wayland-0')).resolve())}
         tmp=RUNTIME/'state.new';tmp.write_text(json.dumps(data));tmp.replace(RUNTIME/'state.json')
     def configure_guard(self):
@@ -336,7 +346,7 @@ def serve(output,testing):
 
 def start(output,testing):
     if testing:
-        query=subprocess.run(['hyprctl','multiseat','status'],capture_output=True,text=True,timeout=4)
+        query=subprocess.run(['hyprctl','multiseat','status'],capture_output=True,text=True,timeout=4,env=host_env())
         try:native=json.loads(query.stdout)
         except ValueError:native={}
         if native.get('enabled') and native.get('implementation')=='native':

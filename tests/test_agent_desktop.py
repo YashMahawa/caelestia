@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 ROOT=Path(__file__).resolve().parents[1]
@@ -40,6 +41,12 @@ class Routing(unittest.TestCase):
   helper=load('caelestia-multiseat')
   with patch.object(helper,'state',return_value={'running':True,'enabled':False}):
    with self.assertRaisesRegex(RuntimeError,'host fallback'):helper.private_env()
+ def test_unknown_host_mode_blocks_private_input(self):
+  cli=load('caelestia-agent-desktop')
+  helper=SimpleNamespace(state=lambda:{'running':True,'enabled':True,'testing':True})
+  with patch.object(cli,'module',return_value=helper),patch.object(cli,'native_status',return_value={'implementation':'unknown','enabled':False}):
+   self.assertEqual(cli.status()['hostMode'],'unknown')
+   self.assertFalse(cli.status()['inputReady'])
  def test_native_two_person_mode_blocks_agent_input(self):
   cli=load('caelestia-agent-desktop')
   with patch.object(cli,'status',return_value={'inputReady':False}):

@@ -45,17 +45,21 @@ def module():
     return value
 
 def native_status():
-    result=subprocess.run(['hyprctl','multiseat','status'],capture_output=True,text=True,timeout=4)
+    try:env=module().host_env()
+    except RuntimeError:return {'implementation':'unknown','enabled':False,'error':'Host compositor identity unavailable'}
+    result=subprocess.run(['hyprctl','multiseat','status'],capture_output=True,text=True,timeout=4,env=env)
     try:
         data=json.loads(result.stdout)
         if data.get('implementation')=='native':return data
     except ValueError:pass
-    return {'implementation':'unavailable','enabled':False}
+    if 'unknown request' in result.stdout.lower():return {'implementation':'unavailable','enabled':False}
+    return {'implementation':'unknown','enabled':False,'error':'Host cursor mode could not be queried'}
 
 def status():
     helper=module(); guest=helper.state(); native=native_status()
     mode='multi-cursor' if native.get('enabled') or (guest.get('enabled') and not guest.get('testing')) else 'single-cursor'
-    safe=bool(guest.get('enabled') and guest.get('testing') and not native.get('enabled'))
+    if native.get('implementation')=='unknown':mode='unknown'
+    safe=bool(mode!='unknown' and guest.get('enabled') and guest.get('testing') and not native.get('enabled'))
     return {'hostMode':mode,'native':native,'desktop':guest,'inputReady':safe,
             'coordinateSpace':'private screenshot pixels; never host global coordinates'}
 
@@ -229,6 +233,7 @@ def main():
     if a.action=='status':print(json.dumps(status(),indent=2));return
     if a.action=='start':
         info=status()
+        if info['hostMode']=='unknown':raise RuntimeError('Cannot determine the host cursor mode; no desktop was changed')
         if info['hostMode']=='multi-cursor':raise RuntimeError('Two-person mode is active; the laptop may contain human work. Leave it untouched.')
         result=run([HELPER,'test'],env=dict(os.environ,CAELESTIA_MULTISEAT_QUIET='1'),timeout=45)
         input_commands([],environment())

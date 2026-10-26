@@ -1,0 +1,40 @@
+#!/usr/bin/env python3
+"""Start the native compositor beside the stock one, with ABI-safe fallback."""
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+PREFIX = Path('/usr/lib/caelestia-hyprland-native')
+BINARY = PREFIX/'bin/Hyprland'
+
+def compatible():
+    try:
+        manifest = json.loads((PREFIX/'build-manifest.json').read_text())
+        for package, version in manifest['abiPackages'].items():
+            current = subprocess.run(['pacman','-Q',package],capture_output=True,text=True,check=True).stdout.split(maxsplit=1)[1].strip()
+            if current != version:
+                return False, f'{package} changed since the native build'
+        linked = subprocess.run(['ldd',str(BINARY)],capture_output=True,text=True,timeout=10)
+        if linked.returncode or 'not found' in linked.stdout:
+            return False, 'a native runtime library is missing'
+        return True, ''
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
+        return False, str(error)
+
+def main():
+    if '--check' in sys.argv[1:]:
+        ok, reason = compatible()
+        print(json.dumps({'compatible':ok,'reason':reason,'binary':str(BINARY)}))
+        return 0 if ok else 1
+    ok, reason = compatible()
+    if not ok:
+        subprocess.run(['logger','-t','caelestia-native-multiseat',f'Using stock Hyprland: {reason}'],check=False)
+        os.execv('/usr/local/bin/start-caelestia-hyprland',['start-caelestia-hyprland',*sys.argv[1:]])
+    os.environ['HYPRLAND_SEAT']='primary'
+    config = str(Path.home()/'.config/hypr/hyprland.lua')
+    os.execv('/usr/bin/start-hyprland',['start-hyprland','--path',str(BINARY),'--','--config',config,*sys.argv[1:]])
+
+if __name__=='__main__':
+    sys.exit(main())

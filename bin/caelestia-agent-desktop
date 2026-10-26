@@ -1,0 +1,361 @@
+#!/usr/bin/env python3
+"""Private laptop desktop computer use for agents. Coordinates are screenshot pixels."""
+import argparse
+import fcntl
+import select
+import importlib.machinery
+import importlib.util
+import json
+import mimetypes
+import os
+import re
+from pathlib import Path
+import socket
+import subprocess
+import sys
+import time
+import urllib.request
+
+HOME = Path.home()
+ROOT = HOME/'caelestia-repo-work/caelestia'
+HELPER = HOME/'.local/bin/caelestia-multiseat'
+RUNTIME = Path(os.environ.get('XDG_RUNTIME_DIR', f'/run/user/{os.getuid()}'))/'caelestia-multiseat'
+INPUT = ROOT/'system/agent-desktop/build/input'
+BUTTONS = {'left': 272, 'right': 273, 'middle': 274, 'back': 275, 'forward': 276}
+KEYS = {'ctrl':29,'control':29,'shift':42,'alt':56,'super':125,'win':125,'logo':125,
+        'enter':28,'return':28,'esc':1,'escape':1,'tab':15,'space':57,'backspace':14,
+        'delete':111,'left':105,'right':106,'up':103,'down':108,'home':102,'end':107,
+        'pageup':104,'pagedown':109,'insert':110,'minus':12,'equal':13,'comma':51,
+        'period':52,'slash':53,'bracketleft':26,'bracketright':27,'backslash':43,
+        'semicolon':39,'apostrophe':40,'grave':41,'print':99,'pause':119}
+KEYS.update(zip('1234567890',range(2,12)))
+KEYS.update(zip('qwertyuiop',range(16,26)))
+KEYS.update(zip('asdfghjkl',range(30,39)))
+KEYS.update(zip('zxcvbnm',range(44,51)))
+KEYS.update({f'f{i}':58+i if i<11 else 76+i for i in range(1,13)})
+
+def run(args, **kwargs):
+    return subprocess.run([str(x) for x in args], check=True, capture_output=True, text=True,
+                          timeout=kwargs.pop('timeout',15), **kwargs)
+
+def module():
+    loader=importlib.machinery.SourceFileLoader('caelestia_private_desktop',str(HELPER))
+    spec=importlib.util.spec_from_loader(loader.name,loader)
+    value=importlib.util.module_from_spec(spec);loader.exec_module(value)
+    return value
+
+def native_status():
+    result=subprocess.run(['hyprctl','multiseat','status'],capture_output=True,text=True,timeout=4)
+    try:
+        data=json.loads(result.stdout)
+        if data.get('implementation')=='native':return data
+    except ValueError:pass
+    return {'implementation':'unavailable','enabled':False}
+
+def status():
+    helper=module(); guest=helper.state(); native=native_status()
+    mode='multi-cursor' if native.get('enabled') or (guest.get('enabled') and not guest.get('testing')) else 'single-cursor'
+    safe=bool(guest.get('enabled') and guest.get('testing') and not native.get('enabled'))
+    return {'hostMode':mode,'native':native,'desktop':guest,'inputReady':safe,
+            'coordinateSpace':'private screenshot pixels; never host global coordinates'}
+
+def environment():
+    info=status()
+    if not info['inputReady']:raise RuntimeError('Private test desktop is paused/unavailable, or two-person mode is active. No host input sent.')
+    return module().private_env()
+
+def ipc(*args, env=None):
+    env=env or environment()
+    result=run(['swaymsg','-s',env['SWAYSOCK'],*args],env=env)
+    value=json.loads(result.stdout)
+    if isinstance(value,list):
+        for item in value:
+            if isinstance(item,dict) and item.get('success') is False:
+                raise RuntimeError(item.get('error','Private compositor command failed'))
+    return value
+
+def dimensions(env):
+    output=next((o for o in ipc('-t','get_outputs',env=env) if o.get('active')),None)
+    if not output:raise RuntimeError('Private output unavailable')
+    return output['rect']['width'],output['rect']['height'],output['name']
+
+def point(x,y,env):
+    w,h,_=dimensions(env)
+    if not (0<=x<w and 0<=y<h):raise ValueError(f'Coordinates must be inside {w}×{h}')
+    return f'abs {x} {y} {w} {h}'
+
+def input_server():
+    env=environment(); path=RUNTIME/'agent-input.sock'
+    lock=(RUNTIME/'agent-input.lock').open('a')
+    try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+    except BlockingIOError:return
+    path.unlink(missing_ok=True)
+    child=subprocess.Popen([str(INPUT),env['WAYLAND_DISPLAY'],'seat0'],env=env,
+                           stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True,bufsize=1)
+    def read():
+        if not select.select([child.stdout],[],[],5)[0]:raise RuntimeError('Private input timed out')
+        value=child.stdout.readline().strip()
+        if not value:raise RuntimeError('Private input disconnected')
+        return value
+    server=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
+    try:
+        if read()!='ready':raise RuntimeError('Private input was not ready')
+        server.bind(str(path));path.chmod(0o600);server.listen(4);server.settimeout(2)
+        while True:
+            try:connection,_=server.accept()
+            except socket.timeout:
+                environment()
+                if child.poll() is not None:break
+                continue
+            with connection:
+                connection.settimeout(5)
+                request=json.loads(connection.makefile('r').readline())
+                environment()
+                commands=request['commands']
+                try:
+                    for command in commands:
+                        child.stdin.write(command+'\n');child.stdin.flush()
+                        if read()!='ok':raise RuntimeError('Private input failed')
+                    connection.sendall(b'{"ok":true}\n')
+                except Exception as exc:
+                    connection.sendall((json.dumps({'error':str(exc)})+'\n').encode());raise
+    finally:
+        child.terminate()
+        try:child.wait(timeout=3)
+        except subprocess.TimeoutExpired:child.kill()
+        server.close();path.unlink(missing_ok=True)
+
+def input_commands(commands,env):
+    if not INPUT.is_file():raise RuntimeError('Input client is not built; run caelestia-build -- '+str(ROOT/'system/agent-desktop/build.sh'))
+    path=RUNTIME/'agent-input.sock'
+    def connect():
+        client=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);client.settimeout(15)
+        try:client.connect(str(path))
+        except OSError:client.close();raise
+        return client
+    try:client=connect()
+    except OSError:
+        subprocess.Popen([str(Path(__file__).resolve()),'_input-server'],env=dict(os.environ),
+                         stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True)
+        for _ in range(50):
+            time.sleep(.03)
+            try:client=connect();break
+            except OSError:pass
+        else:raise RuntimeError('Private input server did not start')
+        time.sleep(.12) # let existing clients bind newly advertised capabilities
+    with client:
+        client.sendall((json.dumps({'commands':commands+['sync']})+'\n').encode())
+        reply=json.loads(client.makefile('r').readline())
+        if not reply.get('ok'):raise RuntimeError(reply.get('error','Private input failed'))
+
+
+def browser_secret_bus(env):
+    # The copied Chrome profile uses the user's existing libsecret encryption
+    # key. Expose only Secret Service, not host app activation or portals.
+    path=RUNTIME/'browser-secrets.sock'
+    try:
+        with socket.socket(socket.AF_UNIX,socket.SOCK_STREAM) as check:check.connect(str(path))
+    except OSError:
+        path.unlink(missing_ok=True)
+        proxy=subprocess.Popen(['xdg-dbus-proxy',f'unix:path={RUNTIME.parent}/bus',str(path),
+            '--filter','--talk=org.freedesktop.secrets'],stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True)
+        for _ in range(60):
+            if path.is_socket():break
+            if proxy.poll() is not None:raise RuntimeError('Chrome keyring proxy failed to start')
+            time.sleep(.025)
+        else:raise RuntimeError('Chrome keyring proxy did not become ready')
+    result=dict(env,DBUS_SESSION_BUS_ADDRESS='unix:path='+str(path))
+    return result
+
+def prepare_command(command, *, browser=False):
+    if not command:raise ValueError('An app command is required after --')
+    name=Path(command[0]).name
+    chromium=any(part in name.lower() for part in ('chrome','chromium','brave','edge','vivaldi'))
+    electron=name.lower() in ('codex','claude','antigravity','agy','code','electron','chatgpt')
+    if chromium or electron:
+        # An existing host process must never receive this launch through its singleton socket.
+        if any(a=='--user-data-dir' or a.startswith('--user-data-dir=') for a in command[1:]):
+            raise ValueError('The agent CLI manages its own dedicated app profile')
+        profile=HOME/'.local/share/caelestia/agent-desktop/profiles'/name
+        profile_args=[]
+        config_path=HOME/'.config/caelestia/agent-desktop.json'
+        if chromium and config_path.exists():
+            config=json.loads(config_path.read_text())
+            if config.get('chromeProfileRoot') and config.get('chromeProfileDirectory'):
+                selected=Path(config['chromeProfileRoot']).expanduser().resolve()
+                allowed=(HOME/'.local/share/caelestia/agent-desktop').resolve()
+                if not selected.is_relative_to(allowed):raise ValueError('Chrome profile must be inside the private agent profile directory')
+                profile=selected
+                profile_args=['--profile-directory='+config['chromeProfileDirectory'],'--password-store=gnome-libsecret']
+
+        profile.mkdir(parents=True,mode=0o700,exist_ok=True)
+        command=[command[0],f'--user-data-dir={profile}','--ozone-platform=wayland',
+                 '--no-first-run','--no-default-browser-check',*profile_args,*command[1:]]
+    elif 'firefox' in name.lower():
+        profile=HOME/'.local/share/caelestia/agent-desktop/profiles/firefox'
+        profile.mkdir(parents=True,mode=0o700,exist_ok=True)
+        command=[command[0],'--no-remote','--profile',str(profile),*command[1:]]
+    elif browser:raise ValueError('Use Chrome/Chromium/Edge/Brave/Vivaldi or Firefox for an isolated browser')
+    return command
+
+def main():
+    p=argparse.ArgumentParser(description=__doc__)
+    sub=p.add_subparsers(dest='action',required=True)
+    for name in ('status','start','pause','windows'):sub.add_parser(name)
+    ex=sub.add_parser('exec',help='Run a command synchronously with private display/bus; returns its exit status')
+    ex.add_argument('args',nargs=argparse.REMAINDER)
+    launch=sub.add_parser('launch',help='Start an app with private display and a separate profile for supported singleton apps')
+    launch.add_argument('args',nargs=argparse.REMAINDER)
+    browser=sub.add_parser('browser',help='Open isolated Chrome and expose its private DevTools endpoint')
+    browser.add_argument('url',nargs='?',help='Omit to reuse the existing browser without adding a tab')
+    shot=sub.add_parser('screenshot');shot.add_argument('path')
+    click=sub.add_parser('click');click.add_argument('x',type=int);click.add_argument('y',type=int)
+    click.add_argument('--button',choices=BUTTONS,default='left');click.add_argument('--count',type=int,choices=(1,2,3),default=1)
+    move=sub.add_parser('move');move.add_argument('x',type=int);move.add_argument('y',type=int)
+    drag=sub.add_parser('drag')
+    for n in ('x1','y1','x2','y2'):drag.add_argument(n,type=int)
+    drag.add_argument('--duration',type=float,default=.5)
+    scroll=sub.add_parser('scroll');scroll.add_argument('amount',type=int)
+    scroll.add_argument('--horizontal',action='store_true')
+    key=sub.add_parser('key');key.add_argument('chord',help='e.g. ctrl+shift+p, enter, alt+left')
+    key_state=key.add_mutually_exclusive_group()
+    key_state.add_argument('--down',action='store_true',help='Hold the chord until --up or desktop pause')
+    key_state.add_argument('--up',action='store_true',help='Release a previously held chord')
+    text=sub.add_parser('type');text.add_argument('text',nargs='?',help='Omit to read stdin; leaves clipboard unchanged')
+    clip=sub.add_parser('clipboard');clip.add_argument('operation',choices=('get','set','set-image','types'));clip.add_argument('text',nargs='?')
+    focus=sub.add_parser('focus');focus.add_argument('id',type=int)
+    a=p.parse_args()
+    if a.action=='status':print(json.dumps(status(),indent=2));return
+    if a.action=='start':
+        info=status()
+        if info['hostMode']=='multi-cursor':raise RuntimeError('Two-person mode is active; the laptop may contain human work. Leave it untouched.')
+        result=run([HELPER,'test'],env=dict(os.environ,CAELESTIA_MULTISEAT_QUIET='1'),timeout=45)
+        input_commands([],environment())
+        print(json.dumps(status(),indent=2));return
+    if a.action=='pause':
+        info=status()
+        if not info['desktop'].get('testing'):raise RuntimeError('Refusing to pause a human desktop')
+        run([HELPER,'pause']);print(json.dumps(status(),indent=2));return
+    env=environment()
+    run([HELPER,'refresh'])
+    input_commands([],env)
+    if a.action in ('exec','launch','browser'):
+        command=a.args if a.action!='browser' else ['/opt/google/chrome/google-chrome',*([a.url] if a.url else [])]
+        if command[:1]==['--']:command=command[1:]
+        command=prepare_command(command,browser=a.action=='browser')
+        if '--password-store=gnome-libsecret' in command:env=browser_secret_bus(env)
+        if a.action=='exec':os.execvpe(command[0],command,env)
+        endpoint=None
+        profile_root=None
+        if a.action=='browser':
+            profile_root=next(arg.split('=',1)[1] for arg in command if arg.startswith('--user-data-dir='))
+            port=None
+            browser_pid=None
+            metadata=RUNTIME/'browser.json'
+            try:
+                saved=json.loads(metadata.read_text())
+                proc=Path('/proc')/str(saved['pid'])
+                ticks=(proc/'stat').read_text().rsplit(')',1)[1].split()[19]
+                if saved.get('profileRoot')==profile_root and saved.get('supervisorPid')==module().state().get('supervisor_pid') and saved.get('startTicks')==ticks:
+                    port=saved['port'];browser_pid=saved['pid']
+            except (OSError,ValueError,KeyError,IndexError):pass
+            private_pids=set()
+            def collect_pids(node):
+                if node.get('pid'):private_pids.add(node['pid'])
+                for child in node.get('nodes',[])+node.get('floating_nodes',[]):collect_pids(child)
+            collect_pids(ipc('-t','get_tree',env=environment()))
+            for proc in Path('/proc').iterdir():
+                if not proc.name.isdigit() or int(proc.name) not in private_pids:continue
+                try:
+                    if proc.stat().st_uid!=os.getuid():continue
+                    args=(proc/'cmdline').read_bytes().decode(errors='replace')
+                    if not re.search(r'(?:^|[ \x00])--user-data-dir='+re.escape(profile_root)+r'(?:[ \x00]|$)',args):continue
+                except OSError:continue
+                match=re.search(r'(?:^|[ \x00])--remote-debugging-port=(\d+)(?:[ \x00]|$)',args)
+                if match and int(match[1])>0:port=int(match[1]);browser_pid=int(proc.name);break
+            if port is None:
+                with socket.socket() as sock:
+                    sock.bind(('127.0.0.1',0));port=sock.getsockname()[1]
+            command += ['--remote-debugging-address=127.0.0.1',f'--remote-debugging-port={port}']
+            endpoint=f'http://127.0.0.1:{port}'
+        logs=HOME/'.local/state/caelestia/agent-desktop';logs.mkdir(parents=True,exist_ok=True)
+        logfile=logs/'apps.log'
+        if logfile.exists() and logfile.stat().st_size>5*1024*1024:logfile.replace(logs/'apps.previous.log')
+        child=None
+        if a.action!='browser' or browser_pid is None or a.url:
+            with logfile.open('a') as log:
+                child=subprocess.Popen(command,env=env,stdin=subprocess.DEVNULL,stdout=log,stderr=log,start_new_session=True)
+        if endpoint:
+            for _ in range(100):
+                try:
+                    with urllib.request.urlopen(endpoint+'/json/version',timeout=.3) as response:
+                        if json.load(response).get('webSocketDebuggerUrl'):break
+                except (OSError,ValueError):pass
+                time.sleep(.05)
+            else:raise RuntimeError('The private browser did not expose DevTools; inspect '+str(logfile))
+        if endpoint:
+            browser_pid=browser_pid or child.pid
+            try:
+                ticks=(Path('/proc')/str(browser_pid)/'stat').read_text().rsplit(')',1)[1].split()[19]
+                metadata.write_text(json.dumps({'pid':browser_pid,'startTicks':ticks,'port':port,'profileRoot':profile_root,'supervisorPid':module().state().get('supervisor_pid')}))
+            except OSError:pass
+        print(json.dumps({'pid':browser_pid if endpoint else child.pid,'desktop':'laptop-private','log':str(logfile),'cdpEndpoint':endpoint}));return
+    if a.action=='windows':
+        tree=ipc('-t','get_tree',env=env);windows=[]
+        def visit(node):
+            if node.get('app_id') or node.get('window'):
+                windows.append({k:node.get(k) for k in ('id','name','app_id','pid','rect','focused')})
+            for child in node.get('nodes',[])+node.get('floating_nodes',[]):visit(child)
+        visit(tree);print(json.dumps(windows,indent=2));return
+    if a.action=='focus':
+        ipc(f'[con_id={a.id}] focus',env=env);return
+    if a.action=='screenshot':
+        destination=Path(a.path).expanduser().absolute()
+        run(['grim','-o',dimensions(env)[2],destination],env=env)
+        print(str(destination));return
+    if a.action=='clipboard':
+        if a.operation=='get':sys.stdout.write(run(['wl-paste','--seat','seat0','--type','text','--no-newline'],env=env).stdout)
+        elif a.operation=='types':sys.stdout.write(run(['wl-paste','--seat','seat0','--list-types'],env=env).stdout)
+        elif a.operation=='set-image':
+            if not a.text:raise ValueError('An image path is required')
+            path=Path(a.text).expanduser();mime=mimetypes.guess_type(path)[0]
+            if not mime or not mime.startswith('image/') or mime=='image/svg+xml':raise ValueError('Use a raster image for clipboard paste')
+            subprocess.run(['wl-copy','--seat','seat0','--type',mime],input=path.read_bytes(),env=env,
+                           stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=5,check=True)
+        else:
+            subprocess.run(['wl-copy','--seat','seat0'],input=a.text if a.text is not None else sys.stdin.read(),
+                           text=True,env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=5,check=True)
+        return
+    if a.action=='type':
+        # wtype supports arbitrary Unicode. Its virtual keyboard is confined to
+        # this private compositor; no clipboard paste or host clipboard mutation.
+        run(['wtype','-'],input=a.text if a.text is not None else sys.stdin.read(),env=env)
+        return
+    commands=[]
+    if a.action in ('move','click'):
+        commands=[point(a.x,a.y,env)]
+        if a.action=='click':
+            for _ in range(a.count):commands += [f'button {BUTTONS[a.button]} 1','sleep 30',f'button {BUTTONS[a.button]} 0','sleep 70']
+    elif a.action=='drag':
+        if not .05<=a.duration<=10:raise ValueError('Drag duration must be 0.05–10 seconds')
+        commands=[point(a.x1,a.y1,env),'button 272 1'];steps=max(2,int(a.duration*60))
+        for i in range(1,steps+1):commands += [point(round(a.x1+(a.x2-a.x1)*i/steps),round(a.y1+(a.y2-a.y1)*i/steps),env),f'sleep {round(a.duration*1000/steps)}']
+        commands+=['button 272 0']
+    elif a.action=='scroll':
+        if abs(a.amount)>100:raise ValueError('Scroll at most 100 notches per call')
+        commands=[f'scroll {a.amount if a.horizontal else 0} {0 if a.horizontal else a.amount}']
+    elif a.action=='key':
+        parts=a.chord.lower().split('+')
+        codes=[KEYS[k] for k in parts]
+        press=[f'key {k} 1' for k in codes];release=[f'key {k} 0' for k in reversed(codes)]
+        commands=press if a.down else release if a.up else press+['sleep 30']+release
+    input_commands(commands,env)
+    print(json.dumps({'ok':True,'desktop':'laptop-private'}))
+
+if __name__=='__main__':
+    try:
+        if sys.argv[1:]==['_input-server']:input_server()
+        else:main()
+    except (OSError,ValueError,KeyError,RuntimeError,subprocess.SubprocessError) as exc:
+        print(str(exc),file=sys.stderr);sys.exit(1)

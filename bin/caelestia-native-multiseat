@@ -1,0 +1,84 @@
+#!/usr/bin/env python3
+"""Toggle native logical seats without replacing the running compositor."""
+import argparse
+import json
+from pathlib import Path
+import subprocess
+import sys
+
+
+def notify(title, body):
+    subprocess.run(['notify-send','-a','Caelestia',title,body],check=False)
+
+
+def session_update_pending():
+    try:
+        manifest=json.loads(Path('/usr/lib/caelestia-hyprland-native/build-manifest.json').read_text())
+        live=subprocess.run(['hyprctl','version','-j'],capture_output=True,text=True,timeout=3)
+        return manifest.get('commit') and manifest['commit'] != json.loads(live.stdout).get('commit')
+    except (OSError,ValueError,subprocess.TimeoutExpired):
+        return False
+
+
+def pause_agent_desktop():
+    helper=Path.home()/'.local/bin/caelestia-multiseat'
+    result=subprocess.run([str(helper),'status'],capture_output=True,text=True,timeout=3)
+    try:guest=json.loads(result.stdout)
+    except ValueError:return
+    if guest.get('testing') and guest.get('enabled'):
+        subprocess.run([str(helper),'pause'],capture_output=True,text=True,timeout=8,check=True)
+
+
+def main():
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('command',choices=['toggle','status'],default='status',nargs='?')
+    args=parser.parse_args()
+    check=subprocess.run(['hyprctl','multiseat','status'],capture_output=True,text=True,timeout=3)
+    try:
+        status=json.loads(check.stdout)
+    except ValueError:
+        status={}
+    if check.returncode or status.get('implementation')!='native':
+        installed=Path('/usr/lib/caelestia-hyprland-native/bin/Hyprland').is_file()
+        if args.command=='toggle':
+            notify('Start the native desktop session' if installed else 'Native independent input is not installed',
+                   'Save your work, log out, and choose Caelestia (native multiseat) at login. Then Super+M toggles independent input.' if installed else 'Normal desktop input remains active.')
+        print(json.dumps({'implementation':'unavailable','enabled':False,'normalInput':True,
+                          'nativeSessionInstalled':installed,'requiresSessionRestart':installed}))
+        return 1
+    if args.command=='status':
+        status['requiresSessionRestart']=bool(session_update_pending())
+        print(json.dumps(status,indent=2))
+        return 0
+    if not status.get('enabled') and session_update_pending():
+        notify('Log in again to load the desktop fixes',
+               'A newer compositor is installed. Save your work, log out, and choose Caelestia (native multiseat). Normal input remains available.')
+        print(json.dumps({'enabled':False,'requiresSessionRestart':True,'error':'The updated compositor has not been loaded yet'}))
+        return 1
+    if not status.get('enabled'):
+        pause_agent_desktop()
+    try:
+        subprocess.run([str(Path.home()/'.local/bin/caelestia-qs-ipc'), 'desktop', 'prepareSeatChange'],
+                       capture_output=True, timeout=3, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    result=subprocess.run(['hyprctl','multiseat','toggle'],capture_output=True,text=True,timeout=8)
+    try:
+        state=json.loads(result.stdout)
+    except ValueError:
+        state={'error':result.stderr.strip() or result.stdout.strip() or 'The compositor did not reply'}
+    print(json.dumps(state,indent=2))
+    if result.returncode or state.get('error'):
+        notify('Independent input could not change',state.get('error','Compositor request failed'))
+        return 1
+    notify('Independent input on' if state.get('enabled') else 'Normal input restored',
+           'Laptop keyboard and touchpad: laptop screen. External keyboard and mouse: monitor. Super+M returns to normal.' if state.get('enabled') else 'Both displays use the normal shared input.')
+    return 0
+
+
+if __name__=='__main__':
+    try:
+        sys.exit(main())
+    except (subprocess.TimeoutExpired, subprocess.CalledProcessError):
+        print('Native input request timed out',file=sys.stderr)
+        sys.exit(1)

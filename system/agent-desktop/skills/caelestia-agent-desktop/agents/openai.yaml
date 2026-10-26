@@ -1,0 +1,4 @@
+interface:
+  display_name: "Caelestia Agent Desktop"
+  short_description: "Test apps privately on the laptop display"
+  default_prompt: "Use $caelestia-agent-desktop to test this app on the private laptop desktop while I work on my monitor."

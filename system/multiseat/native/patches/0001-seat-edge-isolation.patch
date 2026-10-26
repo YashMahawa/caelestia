@@ -1,0 +1,588 @@
+From 9ff8266b3e6064c6a3527a0cd5e9a1b58523b1c5 Mon Sep 17 00:00:00 2001
+From: YashMahawa <yashmahawar4338@gmail.com>
+Date: Mon, 26 Oct 2026 19:30:41 +0530
+Subject: [PATCH] fix(multiseat): confine hit testing and absolute input to the
+ owning seat
+
+---
+ src/desktop/state/ViewHitTester.cpp   |  11 ++-
+ src/pointer/PointerManager.cpp        |  26 ++++--
+ tests/multiseat/.gitignore            |   2 +
+ tests/multiseat/README.md             |  17 ++++
+ tests/multiseat/input-client/build.sh |   9 ++
+ tests/multiseat/input-client/inject.c | 112 ++++++++++++++++++++++
+ tests/multiseat/native_runtime.py     | 129 ++++++++++++++++++++++++++
+ tests/multiseat/probe.py              |  36 +++++++
+ tests/multiseat/test_edges.py         |  84 +++++++++++++++++
+ 9 files changed, 415 insertions(+), 11 deletions(-)
+ create mode 100644 tests/multiseat/.gitignore
+ create mode 100644 tests/multiseat/README.md
+ create mode 100755 tests/multiseat/input-client/build.sh
+ create mode 100644 tests/multiseat/input-client/inject.c
+ create mode 100644 tests/multiseat/native_runtime.py
+ create mode 100644 tests/multiseat/probe.py
+ create mode 100644 tests/multiseat/test_edges.py
+
+diff --git a/src/desktop/state/ViewHitTester.cpp b/src/desktop/state/ViewHitTester.cpp
+index 1b7ecdc..702cd65 100644
+--- a/src/desktop/state/ViewHitTester.cpp
++++ b/src/desktop/state/ViewHitTester.cpp
+@@ -1,4 +1,5 @@
+ #include "ViewHitTester.hpp"
++#include "../../managers/input/LogicalSeat.hpp"
+ #include "FocusState.hpp"
+ #include "ViewStateTracker.hpp"
+ #include "../view/LayerSurface.hpp"
+@@ -28,7 +29,7 @@ CViewHitTester::CViewHitTester(const IViewStateTracker& tracker) : m_tracker(tra
+ 
+ PHLWINDOW CViewHitTester::windowAt(const Vector2D& pos, uint16_t properties, PHLWINDOW ignoreWindow) const {
+     const auto PMONITOR = State::monitorState()->query().vec(pos).run();
+-    if (!PMONITOR)
++    if (!PMONITOR || !Seat::ownsMonitor(PMONITOR))
+         return nullptr;
+ 
+     static auto PRESIZEONBORDER       = CConfigValue<Config::INTEGER>("general:resize_on_border");
+@@ -51,6 +52,8 @@ PHLWINDOW CViewHitTester::windowAt(const Vector2D& pos, uint16_t properties, PHL
+     // pinned windows on top of floating regardless
+     if (properties & ALLOW_FLOATING) {
+         for (auto const& w : WINDOWS | std::views::reverse) {
++            if (!Seat::ownsMonitor(w->m_monitor.lock()))
++                continue;
+             if (ONLY_PRIORITY && !w->priorityFocus())
+                 continue;
+ 
+@@ -74,6 +77,8 @@ PHLWINDOW CViewHitTester::windowAt(const Vector2D& pos, uint16_t properties, PHL
+     auto windowForWorkspace = [&](bool special) -> PHLWINDOW {
+         auto floating = [&](bool aboveFullscreen) -> PHLWINDOW {
+             for (auto const& w : WINDOWS | std::views::reverse) {
++                if (!Seat::ownsMonitor(w->m_monitor.lock()))
++                    continue;
+                 if (special && !w->onSpecialWorkspace()) // because special floating may creep up into regular
+                     continue;
+ 
+@@ -155,6 +160,8 @@ PHLWINDOW CViewHitTester::windowAt(const Vector2D& pos, uint16_t properties, PHL
+ 
+         // for windows, we need to check their extensions too, first.
+         for (auto const& w : WINDOWS) {
++            if (!Seat::ownsMonitor(w->m_monitor.lock()))
++                continue;
+             if (ONLY_PRIORITY && !w->priorityFocus())
+                 continue;
+ 
+@@ -172,6 +179,8 @@ PHLWINDOW CViewHitTester::windowAt(const Vector2D& pos, uint16_t properties, PHL
+         }
+ 
+         for (auto const& w : WINDOWS) {
++            if (!Seat::ownsMonitor(w->m_monitor.lock()))
++                continue;
+             if (ONLY_PRIORITY && !w->priorityFocus())
+                 continue;
+ 
+diff --git a/src/pointer/PointerManager.cpp b/src/pointer/PointerManager.cpp
+index eab1479..610044a 100644
+--- a/src/pointer/PointerManager.cpp
++++ b/src/pointer/PointerManager.cpp
+@@ -93,7 +93,7 @@ void CPointerManager::lockSoftwareForMonitor(PHLMONITOR mon) {
+         return;
+     }
+ 
+-    auto const              state = stateFor(mon);
++    auto const state = stateFor(mon);
+     state->softwareLocks++;
+ 
+     if (state->softwareLocks == 1)
+@@ -108,7 +108,7 @@ void CPointerManager::unlockSoftwareForMonitor(PHLMONITOR mon) {
+         return;
+     }
+ 
+-    auto const              state = stateFor(mon);
++    auto const state = stateFor(mon);
+     state->softwareLocks--;
+     if (state->softwareLocks < 0) {
+         state->softwareLocks = 0;
+@@ -126,7 +126,7 @@ bool CPointerManager::softwareLockedFor(PHLMONITOR mon) {
+         return Pointer::mgr()->softwareLockedFor(mon);
+     }
+ 
+-    auto const              state = stateFor(mon);
++    auto const state = stateFor(mon);
+     return state->softwareLocks > 0 || (state->hardwareFailed && hasCursor() && g_pHyprRenderer->shouldRenderCursor());
+ }
+ 
+@@ -137,7 +137,7 @@ bool CPointerManager::hasVisibleHWCursor(PHLMONITOR pMonitor) {
+         return Pointer::mgr()->hasVisibleHWCursor(pMonitor);
+     }
+ 
+-    auto const              state = stateFor(pMonitor);
++    auto const state = stateFor(pMonitor);
+     return state->softwareLocks == 0 && !state->hardwareFailed && hasCursor() && g_pHyprRenderer->shouldRenderCursor();
+ }
+ 
+@@ -924,11 +924,16 @@ void CPointerManager::warpAbsolute(Vector2D abs, SP<IHID> dev) {
+         abs.y = std::clamp(abs.y, 0.0, 1.0);
+ 
+     // find x and y size of the entire space
+-    const auto& MONITORS = State::monitorState()->monitors();
+-    Vector2D    topLeft = MONITORS.at(0)->m_position, bottomRight = MONITORS.at(0)->m_position + MONITORS.at(0)->m_size;
++    // Normalize absolute devices against this seat's outputs. Mapping against
++    // the shared layout first makes half of a laptop tablet/touch surface clamp
++    // to its display edge instead of covering the laptop display uniformly.
++    const auto& MONITORS = m_currentMonitorLayout.monitorBoxes;
++    if (MONITORS.empty())
++        return;
++    Vector2D topLeft = MONITORS.at(0).pos(), bottomRight = MONITORS.at(0).extent();
+     for (size_t i = 1; i < MONITORS.size(); ++i) {
+-        const auto EXTENT = MONITORS[i]->logicalBox().extent();
+-        const auto POS    = MONITORS[i]->logicalBox().pos();
++        const auto EXTENT = MONITORS[i].extent();
++        const auto POS    = MONITORS[i].pos();
+         if (EXTENT.x > bottomRight.x)
+             bottomRight.x = EXTENT.x;
+         if (EXTENT.y > bottomRight.y)
+@@ -942,9 +947,10 @@ void CPointerManager::warpAbsolute(Vector2D abs, SP<IHID> dev) {
+ 
+     auto outputMappedArea = [&mappedArea](const std::string& output) {
+         if (output == "current") {
+-            if (const auto PLASTMONITOR = Desktop::focusState()->monitor(); PLASTMONITOR)
++            if (const auto PLASTMONITOR = Desktop::focusState()->monitor(); PLASTMONITOR && Seat::ownsMonitor(PLASTMONITOR))
+                 return PLASTMONITOR->logicalBox();
+-        } else if (const auto PMONITOR = State::monitorState()->query().relativeTo(Desktop::focusState()->monitor()).configString(output).run(); PMONITOR)
++        } else if (const auto PMONITOR = State::monitorState()->query().relativeTo(Desktop::focusState()->monitor()).configString(output).run();
++                   PMONITOR && Seat::ownsMonitor(PMONITOR))
+             return PMONITOR->logicalBox();
+         return mappedArea;
+     };
+diff --git a/tests/multiseat/.gitignore b/tests/multiseat/.gitignore
+new file mode 100644
+index 0000000..877cc87
+--- /dev/null
++++ b/tests/multiseat/.gitignore
+@@ -0,0 +1,2 @@
++__pycache__/
++input-client/build/
+diff --git a/tests/multiseat/README.md b/tests/multiseat/README.md
+new file mode 100644
+index 0000000..bcff7e9
+--- /dev/null
++++ b/tests/multiseat/README.md
+@@ -0,0 +1,17 @@
++# Logical-seat edge integration regression
++
++Runs a private nested compositor in a hidden workspace, with a second headless
++output and synthetic Wayland devices. It never injects into the parent desktop
++or takes physical input devices. Requires Python/PyGObject GTK3, Wayland client
++and xkbcommon development files, and an already-built optimized native fork.
++
++```sh
++caelestia-build -- tests/multiseat/input-client/build.sh
++MULTISEAT_REPORT=/tmp/edge-results.json python tests/multiseat/test_edges.py
++```
++
++Override `NATIVE_TEST_BINARY` to check another build. The regression pushes both
++cursors against all edges, checks the midpoint of absolute secondary-seat input,
++and puts a primary-seat floating window across the display boundary. Motion from
++the laptop must never enter that foreign window. Normal mode retains the shared
++layout; ownership filters are active only when logical seats are enabled.
+diff --git a/tests/multiseat/input-client/build.sh b/tests/multiseat/input-client/build.sh
+new file mode 100755
+index 0000000..397508b
+--- /dev/null
++++ b/tests/multiseat/input-client/build.sh
+@@ -0,0 +1,9 @@
++#!/usr/bin/env bash
++set -euo pipefail
++cd -- "$(dirname -- "$0")"
++mkdir -p build
++wayland-scanner client-header ../../../protocols/virtual-keyboard-unstable-v1.xml build/virtual-keyboard-client.h
++wayland-scanner private-code ../../../protocols/virtual-keyboard-unstable-v1.xml build/virtual-keyboard-protocol.c
++wayland-scanner client-header ../../../protocols/wlr-virtual-pointer-unstable-v1.xml build/virtual-pointer-client.h
++wayland-scanner private-code ../../../protocols/wlr-virtual-pointer-unstable-v1.xml build/virtual-pointer-protocol.c
++cc -O2 -Wall -Wextra -Werror -Ibuild inject.c build/*-protocol.c $(pkg-config --cflags --libs wayland-client xkbcommon) -o build/inject
+diff --git a/tests/multiseat/input-client/inject.c b/tests/multiseat/input-client/inject.c
+new file mode 100644
+index 0000000..36f58c4
+--- /dev/null
++++ b/tests/multiseat/input-client/inject.c
+@@ -0,0 +1,112 @@
++#define _GNU_SOURCE
++/* Synthetic Wayland input for private nms-* test runtimes only. No evdev/uinput. */
++#include <wayland-client.h>
++#include <xkbcommon/xkbcommon.h>
++#include <sys/mman.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++#include <time.h>
++#include <limits.h>
++#include "virtual-keyboard-client.h"
++#include "virtual-pointer-client.h"
++
++struct test_seat { struct wl_seat *seat; char name[128]; };
++static struct test_seat seats[16];
++static unsigned seat_count;
++static struct zwp_virtual_keyboard_manager_v1 *keyboards;
++static struct zwlr_virtual_pointer_manager_v1 *pointers;
++static void caps(void *data, struct wl_seat *seat, uint32_t cap) { (void)data; (void)seat; (void)cap; }
++static void name(void *data, struct wl_seat *seat, const char *value) {
++    (void)seat;
++    snprintf(((struct test_seat *)data)->name, 128, "%s", value);
++}
++static const struct wl_seat_listener seat_listener = {caps, name};
++static void global(void *data, struct wl_registry *registry, uint32_t id, const char *interface, uint32_t version) {
++    (void)data;
++    if (!strcmp(interface, "wl_seat") && seat_count < 16) {
++        struct test_seat *seat = &seats[seat_count++];
++        seat->seat = wl_registry_bind(registry, id, &wl_seat_interface, version < 9 ? version : 9);
++        wl_seat_add_listener(seat->seat, &seat_listener, seat);
++    } else if (!strcmp(interface, "zwp_virtual_keyboard_manager_v1"))
++        keyboards = wl_registry_bind(registry, id, &zwp_virtual_keyboard_manager_v1_interface, 1);
++    else if (!strcmp(interface, "zwlr_virtual_pointer_manager_v1"))
++        pointers = wl_registry_bind(registry, id, &zwlr_virtual_pointer_manager_v1_interface, version < 2 ? version : 2);
++}
++static void removed(void *data, struct wl_registry *registry, uint32_t id) { (void)data; (void)registry; (void)id; }
++static const struct wl_registry_listener registry_listener = {global, removed};
++static uint32_t now(void) {
++    struct timespec time;
++    clock_gettime(CLOCK_MONOTONIC, &time);
++    return (uint32_t)((uint64_t)time.tv_sec * 1000 + time.tv_nsec / 1000000);
++}
++
++int main(int argc, char **argv) {
++    char resolved[PATH_MAX];
++    if (argc != 3 || !realpath(argv[1], resolved) || strncmp(resolved, "/tmp/nms-", 9)) {
++        fprintf(stderr, "Refusing input outside a private /tmp/nms-* runtime\n");
++        return 2;
++    }
++    struct wl_display *display = wl_display_connect(resolved);
++    if (!display) return 3;
++    struct wl_registry *registry = wl_display_get_registry(display);
++    wl_registry_add_listener(registry, &registry_listener, NULL);
++    if (wl_display_roundtrip(display) < 0 || wl_display_roundtrip(display) < 0) return 4;
++    struct wl_seat *selected = NULL;
++    for (unsigned i = 0; i < seat_count; ++i)
++        if (!strcmp(seats[i].name, argv[2])) selected = seats[i].seat;
++    if (!selected || !keyboards || !pointers) return 5;
++    struct zwp_virtual_keyboard_v1 *keyboard = zwp_virtual_keyboard_manager_v1_create_virtual_keyboard(keyboards, selected);
++    struct zwlr_virtual_pointer_v1 *pointer = zwlr_virtual_pointer_manager_v1_create_virtual_pointer(pointers, selected);
++    struct xkb_context *context = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
++    const struct xkb_rule_names rules = {.rules="evdev", .model="pc105", .layout="us"};
++    struct xkb_keymap *keymap = xkb_keymap_new_from_names(context, &rules, XKB_KEYMAP_COMPILE_NO_FLAGS);
++    if (!keymap) return 6;
++    struct xkb_state *state = xkb_state_new(keymap);
++    char *text = xkb_keymap_get_as_string(keymap, XKB_KEYMAP_FORMAT_TEXT_V1);
++    size_t size = strlen(text) + 1;
++    int fd = memfd_create("native-seat-test-keymap", MFD_CLOEXEC);
++    if (fd < 0 || ftruncate(fd, size) || pwrite(fd, text, size, 0) != (ssize_t)size) return 7;
++    zwp_virtual_keyboard_v1_keymap(keyboard, WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1, fd, size);
++    close(fd); free(text);
++    if (wl_display_roundtrip(display) < 0) return 8;
++    puts("ready"); fflush(stdout);
++    char line[256], command[32];
++    while (fgets(line, sizeof(line), stdin)) {
++        unsigned code, pressed, x, y, width, height;
++        double dx, dy;
++        command[0] = 0;
++        sscanf(line, "%31s", command);
++        if (!strcmp(command, "quit")) break;
++        if (sscanf(line, "key %u %u", &code, &pressed) == 2) {
++            zwp_virtual_keyboard_v1_key(keyboard, now(), code, pressed);
++            xkb_state_update_key(state, code + 8, pressed ? XKB_KEY_DOWN : XKB_KEY_UP);
++            zwp_virtual_keyboard_v1_modifiers(keyboard,
++                xkb_state_serialize_mods(state, XKB_STATE_MODS_DEPRESSED),
++                xkb_state_serialize_mods(state, XKB_STATE_MODS_LATCHED),
++                xkb_state_serialize_mods(state, XKB_STATE_MODS_LOCKED),
++                xkb_state_serialize_layout(state, XKB_STATE_LAYOUT_EFFECTIVE));
++        } else if (sscanf(line, "move %lf %lf", &dx, &dy) == 2) {
++            zwlr_virtual_pointer_v1_motion(pointer, now(), wl_fixed_from_double(dx), wl_fixed_from_double(dy));
++            zwlr_virtual_pointer_v1_frame(pointer);
++        } else if (sscanf(line, "abs %u %u %u %u", &x, &y, &width, &height) == 4) {
++            zwlr_virtual_pointer_v1_motion_absolute(pointer, now(), x, y, width, height);
++            zwlr_virtual_pointer_v1_frame(pointer);
++        } else if (sscanf(line, "button %u %u", &code, &pressed) == 2) {
++            zwlr_virtual_pointer_v1_button(pointer, now(), code, pressed);
++            zwlr_virtual_pointer_v1_frame(pointer);
++        } else if (strcmp(command, "sync")) {
++            fprintf(stderr, "Unknown test input command\n"); return 9;
++        }
++        if (wl_display_roundtrip(display) < 0) return 10;
++        puts("ok"); fflush(stdout);
++    }
++    zwlr_virtual_pointer_v1_destroy(pointer);
++    zwp_virtual_keyboard_v1_destroy(keyboard);
++    wl_display_roundtrip(display);
++    xkb_state_unref(state); xkb_keymap_unref(keymap); xkb_context_unref(context);
++    wl_display_disconnect(display);
++    return 0;
++}
+diff --git a/tests/multiseat/native_runtime.py b/tests/multiseat/native_runtime.py
+new file mode 100644
+index 0000000..41aa9a0
+--- /dev/null
++++ b/tests/multiseat/native_runtime.py
+@@ -0,0 +1,129 @@
++"""Private development-compositor harness. All injected input uses its socket."""
++import json
++import os
++from pathlib import Path
++import signal
++import subprocess
++import tempfile
++import time
++
++BINARY = Path(os.environ.get('NATIVE_TEST_BINARY', str(Path(__file__).resolve().parents[2]/'build-native/Hyprland')))
++
++class NativeRuntime:
++    def __init__(self):
++        self.parent = dict(os.environ)
++        self.root = Path(tempfile.mkdtemp(prefix='nms-'))
++        self.root.chmod(0o700)
++        self.children = []
++        self.process = None
++        self.pid = None
++        self.rule = '_G.caelestia_native_test_rule'
++        parent_socket = Path(self.parent['WAYLAND_DISPLAY'])
++        if not parent_socket.is_absolute():
++            parent_socket = Path(self.parent['XDG_RUNTIME_DIR']) / parent_socket
++        self.env = dict(self.parent, XDG_RUNTIME_DIR=str(self.root), WAYLAND_DISPLAY=str(parent_socket),
++                        XDG_CONFIG_HOME=str(self.root/'config'), XDG_CACHE_HOME=str(self.root/'cache'),
++                        XDG_DATA_HOME=str(self.root/'data'),
++                        AQ_DRM_DEVICES='/dev/null', LIBSEAT_BACKEND='seatd', SEATD_SOCK='/nonexistent',
++                        GDK_BACKEND='wayland', QT_QPA_PLATFORM='wayland', HYPRLAND_SEAT='primary')
++        for key in ('DISPLAY', 'HYPRLAND_INSTANCE_SIGNATURE', 'WLR_BACKENDS'):
++            self.env.pop(key, None)
++
++    def __enter__(self):
++        subprocess.run(['hyprctl', 'eval', self.rule + '=hl.window_rule({name="caelestia-native-test",match={class="^aquamarine$"},workspace="special:native-test silent",no_initial_focus=true,no_focus=true,no_anim=true})'], env=self.parent, check=True, capture_output=True)
++        config = self.root/'hypr.lua'
++        config.write_text('hl.monitor({output="",mode="preferred",position="auto",scale=1})\n_G.nativebind=hl.bind("SUPER + s",function() hl.dispatch(hl.dsp.window.float()) end)\nhl.config({misc={disable_hyprland_logo=true,disable_splash_rendering=true}})\n')
++        try:
++            with (self.root/'compositor.log').open('w') as log:
++                self.process = subprocess.Popen(['dbus-run-session', '--', str(BINARY), '-c', str(config)], env=self.env, stdout=log, stderr=log)
++            deadline = time.monotonic() + 25
++            while time.monotonic() < deadline:
++                sockets = list((self.root/'hypr').glob('*/.socket.sock'))
++                displays = [p for p in self.root.glob('wayland-*') if not p.name.endswith('.lock')]
++                if sockets and displays and (sockets[0].parent/'hyprland.lock').exists():
++                    self.env['HYPRLAND_INSTANCE_SIGNATURE'] = sockets[0].parent.name
++                    self.env['WAYLAND_DISPLAY'] = str(displays[0])
++                    self.pid = int((sockets[0].parent/'hyprland.lock').read_text().splitlines()[0])
++                    break
++                if self.process.poll() is not None:
++                    raise RuntimeError((self.root/'compositor.log').read_text()[-6000:])
++                time.sleep(.1)
++            else:
++                raise RuntimeError('Private compositor did not start')
++            assert Path(self.env['WAYLAND_DISPLAY']).parent == self.root
++            assert Path(f'/proc/{self.pid}/exe').resolve() == BINARY.resolve()
++            if os.environ.get('NATIVE_TEST_HEADLESS') == '1':
++                self.ctl('output', 'create', 'headless', 'private-test')
++            deadline = time.monotonic() + 12
++            while time.monotonic() < deadline:
++                if self.ctl_json('monitors', '-j'):
++                    # Wait for the parent Wayland configure, not the temporary 1280x720 mode.
++                    time.sleep(.4)
++                    # Pin the private primary output. Leaving it at "auto"
++                    # allows adding a headless output to move it underneath
++                    # already mapped test windows, depending on the parent.
++                    primary = self.ctl_json('monitors', '-j')[0]
++                    self.ctl('eval', 'hl.monitor({output='+json.dumps(primary['name'])+',mode="preferred",position="0x0",scale=1})')
++                    settle = time.monotonic() + 5
++                    while time.monotonic() < settle:
++                        output = self.ctl_json('monitors', '-j')[0]
++                        if output['x'] == 0 and output['y'] == 0:
++                            break
++                        time.sleep(.05)
++                    else:
++                        raise RuntimeError('Private primary output layout did not settle')
++                    return self
++                time.sleep(.1)
++            raise RuntimeError('Private output did not appear')
++        except BaseException:
++            self.close()
++            raise
++
++    def ctl(self, *args):
++        result = subprocess.run(['hyprctl', *args], env=self.env, capture_output=True, text=True, timeout=10, check=True)
++        return result.stdout
++
++    def ctl_json(self, *args):
++        return json.loads(self.ctl(*args))
++
++    def spawn(self, command, *, env=None, pipes=False):
++        assert Path(self.env['WAYLAND_DISPLAY']).parent == self.root
++        child_env = dict(self.env)
++        child_env.update(env or {})
++        if pipes:
++            child = subprocess.Popen(command, env=child_env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=(self.root/f'child-{len(self.children)}.log').open('w'), text=True, bufsize=1)
++        else:
++            with (self.root/f'child-{len(self.children)}.log').open('w') as log:
++                child = subprocess.Popen(command, env=child_env, stdout=log, stderr=log)
++        self.children.append(child)
++        return child
++
++    def close(self):
++        for child in reversed(self.children):
++            if child.poll() is None:
++                child.terminate()
++                try:
++                    child.wait(timeout=4)
++                except subprocess.TimeoutExpired:
++                    child.kill()
++                    child.wait(timeout=4)
++        if not self.pid:
++            locks = list((self.root/'hypr').glob('*/hyprland.lock'))
++            if locks:
++                self.pid = int(locks[0].read_text().splitlines()[0])
++        if self.pid:
++            try:
++                if Path(f'/proc/{self.pid}/exe').resolve() == BINARY.resolve():
++                    os.kill(self.pid, signal.SIGTERM)
++            except (ProcessLookupError, FileNotFoundError):
++                pass
++        if self.process:
++            try:
++                self.process.wait(timeout=12)
++            except subprocess.TimeoutExpired:
++                self.process.terminate()
++                self.process.wait(timeout=5)
++        subprocess.run(['hyprctl', 'eval', f'if {self.rule} then {self.rule}:set_enabled(false) end'], env=self.parent, capture_output=True)
++
++    def __exit__(self, *_):
++        self.close()
+diff --git a/tests/multiseat/probe.py b/tests/multiseat/probe.py
+new file mode 100644
+index 0000000..9fe3b73
+--- /dev/null
++++ b/tests/multiseat/probe.py
+@@ -0,0 +1,36 @@
++import json
++import sys
++from pathlib import Path
++import gi
++gi.require_version('Gtk', '3.0')
++from gi.repository import Gtk, Gdk, GLib
++
++log = Path(sys.argv[1])
++name = sys.argv[2]
++GLib.set_prgname(name)
++log.write_text('')
++window = Gtk.Window(title=name)
++window.set_default_size(800, 600)
++window.add(Gtk.Entry(placeholder_text='Independent input validation'))
++window.add_events(Gdk.EventMask.POINTER_MOTION_MASK | Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.KEY_PRESS_MASK)
++def event(kind, **data):
++    with log.open('a') as stream:
++        stream.write(json.dumps({'kind': kind, **data}) + '\n')
++window.connect('key-press-event', lambda window, e: event('key', key=Gdk.keyval_name(e.keyval)))
++window.connect('motion-notify-event', lambda window, e: event('motion', x=e.x, y=e.y))
++window.connect('button-press-event', lambda window, e: event('button', button=e.button))
++window.connect('destroy', Gtk.main_quit)
++window.show_all()
++if len(sys.argv) > 3:
++    trigger = Path(sys.argv[3])
++    def open_dialog():
++        if not trigger.exists():
++            return True
++        trigger.unlink()
++        dialog = Gtk.Dialog(title=name+' dialog', transient_for=window)
++        dialog.set_default_size(460, 280)
++        dialog.get_content_area().add(Gtk.Entry())
++        dialog.show_all()
++        return False
++    GLib.timeout_add(100, open_dialog)
++Gtk.main()
+diff --git a/tests/multiseat/test_edges.py b/tests/multiseat/test_edges.py
+new file mode 100644
+index 0000000..fb5acc9
+--- /dev/null
++++ b/tests/multiseat/test_edges.py
+@@ -0,0 +1,84 @@
++import sys,os,json,time
++from pathlib import Path
++import selectors,hashlib
++from native_runtime import NativeRuntime,BINARY
++HERE=Path(__file__).resolve().parent
++KEYS={}
++class Input:
++    def __init__(self, runtime, seat):
++        self.process = runtime.spawn([str(HERE/'input-client/build/inject'), runtime.env['WAYLAND_DISPLAY'], seat], pipes=True)
++        assert self.read() == 'ready'
++    def read(self):
++        with selectors.DefaultSelector() as ready:
++            ready.register(self.process.stdout, selectors.EVENT_READ)
++            if not ready.select(8):
++                raise RuntimeError('Private input client timed out')
++        value = self.process.stdout.readline().strip()
++        if not value:
++            raise RuntimeError(f'Private input client exited: {self.process.poll()}')
++        return value
++    def send(self, command):
++        self.process.stdin.write(command+'\n')
++        self.process.stdin.flush()
++        assert self.read() == 'ok'
++    def key(self, char):
++        self.send(f'key {KEYS[char]} 1')
++        self.send(f'key {KEYS[char]} 0')
++
++def records(path):
++    return [json.loads(line) for line in path.read_text().splitlines()]
++def characters(path):
++    return ''.join(record['key'] for record in records(path) if record['kind']=='key' and len(record['key'])==1)
++def wait_for(predicate, message, timeout=5):
++    deadline = time.monotonic()+timeout
++    while time.monotonic()<deadline:
++        if predicate():
++            return
++        time.sleep(.05)
++    raise AssertionError(message)
++
++report={'passed':False,'checks':[]}
++try:
++ with NativeRuntime() as r:
++  report['binarySha256']=hashlib.sha256(BINARY.read_bytes()).hexdigest()
++  report['version']=r.ctl_json('version','-j')
++  first=r.ctl_json('monitors','-j')[0];name=first['name'];w=first['width'];h=first['height']
++  r.ctl('output','create','headless','edge-laptop')
++  r.ctl('eval',f'hl.monitor({{output="edge-laptop",mode="1920x1080@60",position="{w}x0",scale=1}})')
++  wait_for(lambda:len(r.ctl_json('monitors','-j'))==2,'second output')
++  r.ctl('multiseat','enable-test','edge-laptop',name)
++  a=Input(r,'Hyprland');b=Input(r,'laptop');time.sleep(.2)
++  positions=[]
++  for _ in range(5):
++   for dx,dy in [(100000,0),(0,100000),(-100000,0),(0,-100000)]:
++    a.send(f'move {dx} {dy}');b.send(f'move {dx} {dy}')
++    value=r.ctl_json('multiseat','status');positions.append(value)
++  report['relativePositions']=positions
++  report['relativeLeaks']=[v for v in positions if not (0<=v['primaryCursor']['x']<w and 0<=v['primaryCursor']['y']<h and w<=v['secondaryCursor']['x']<w+1920 and 0<=v['secondaryCursor']['y']<1080)]
++  absolutes=[]
++  for x in (0,100,500,900,1000):
++   b.send(f'abs {x} 500 1000 1000');absolutes.append(r.ctl_json('multiseat','status'))
++  report['absolutePositions']=absolutes
++  probe=HERE/'probe.py'
++  leftlog=r.root/'left.jsonl';rightlog=r.root/'right.jsonl'
++  left=r.spawn(['/usr/bin/python3',str(probe),str(leftlog),'edge-primary'])
++  right=r.spawn(['/usr/bin/python3',str(probe),str(rightlog),'edge-secondary'])
++  wait_for(lambda:len(r.ctl_json('clients','-j'))==2,'edge windows did not map')
++  r.ctl('multiseat','seat','primary','eval',f'hl.dispatch(hl.dsp.window.move({{window="class:edge-primary",monitor="{name}",follow=false}}))')
++  r.ctl('multiseat','seat','laptop','eval','hl.dispatch(hl.dsp.window.move({window="class:edge-secondary",monitor="edge-laptop",follow=false}))')
++  r.ctl('multiseat','seat','primary','eval','hl.dispatch(hl.dsp.window.float({window="class:edge-primary",action="set"}))')
++  r.ctl('multiseat','seat','primary','eval',f'hl.dispatch(hl.dsp.window.resize({{window="class:edge-primary",x={w},y=700,relative=false}}))')
++  r.ctl('multiseat','seat','primary','eval','hl.dispatch(hl.dsp.window.move({window="class:edge-primary",x=100,y=100,relative=false}))')
++  time.sleep(.3);leftlog.write_text('');rightlog.write_text('')
++  pos=r.ctl_json('multiseat','status')['secondaryCursor']
++  for dy in range(8):
++   target=(w+10,400+dy)
++   b.send(f"move {target[0]-pos['x']} {target[1]-pos['y']}")
++   pos=r.ctl_json('multiseat','status')['secondaryCursor']
++  time.sleep(.3)
++  report['foreignPointerEvents']=[json.loads(line) for line in leftlog.read_text().splitlines() if json.loads(line).get('kind')=='motion']
++
++  report['checks']=['relative cursor boundaries','absolute pointer maps to owned display','foreign overlapping window receives no pointer events']
++  report['passed']=not report['foreignPointerEvents'] and not report['relativeLeaks'] and abs(absolutes[2]['secondaryCursor']['x']-(w+960))<2
++except Exception as exc:report['error']=repr(exc)
++Path(os.environ.get('MULTISEAT_REPORT','/tmp/caelestia-native-edge-results.json')).write_text(json.dumps(report,indent=2));print(json.dumps({k:v for k,v in report.items() if k not in ('relativePositions','absolutePositions')},indent=2))
+-- 
+2.56.0
+

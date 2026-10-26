@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=Caelestia (native multiseat)
+Comment=Caelestia with native independent laptop and external input; Super+M toggles
+Exec=/usr/bin/start-caelestia-native
+TryExec=/usr/bin/start-caelestia-native
+Type=Application
+DesktopNames=Hyprland
+Keywords=tiling;wayland;compositor;multiseat;

@@ -1,0 +1,409 @@
+#!/usr/bin/env python3
+"""Two independent input desktops inside the existing Hyprland session.
+Super+M pauses/resumes without terminating apps. `test` never grabs hardware.
+"""
+import argparse,fcntl,json,os,select,shlex,shutil,signal,socket,subprocess,sys,time
+from pathlib import Path
+
+HOME=Path.home();RUNTIME=Path(os.environ.get('XDG_RUNTIME_DIR',f'/run/user/{os.getuid()}'))/'caelestia-multiseat'
+SOURCE=HOME/'caelestia-repo-work/caelestia/system/multiseat'
+SELF=HOME/'.local/bin/caelestia-multiseat'
+INPUT_UNIT=f'caelestia-multiseat-input-{os.getuid()}.service'
+USER_UNIT='caelestia-multiseat.service'
+
+def run(args,**kw):
+    result=subprocess.run([str(x) for x in args],capture_output=True,text=True,timeout=kw.pop('timeout',12),**kw)
+    if result.returncode:raise RuntimeError((result.stderr or result.stdout).strip()[-1000:] or f'{args[0]} failed')
+    return result.stdout.strip()
+def hypr(*args):return run(['hyprctl',*args])
+def lua(code):
+    value=hypr('eval',code)
+    if value!='ok':raise RuntimeError(value)
+def tell(title,body):
+    if os.environ.get('CAELESTIA_MULTISEAT_QUIET')=='1':return
+    subprocess.run(['notify-send','-a','Caelestia',title,body],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=3)
+def state():
+    try:
+        data=json.loads((RUNTIME/'state.json').read_text())
+        proc=Path('/proc')/str(data.get('supervisor_pid',0))
+        command=(proc/'cmdline').read_bytes().split(b'\0')
+        if str(SELF).encode() not in command or b'serve' not in command or proc.stat().st_uid!=os.getuid():
+            data.update(running=False,enabled=False)
+        return data
+    except (OSError,ValueError):return {'running':False,'enabled':False}
+def monitors():return json.loads(hypr('monitors','-j'))
+def choose_output(name,testing=False):
+    outputs=[m for m in monitors() if m.get('mirrorOf') in (None,'none','') and not m.get('disabled')]
+    if len(outputs)<2:raise RuntimeError('Two joined displays are required. Mirrored mode is not supported.')
+    if name:return next((m for m in outputs if m['name']==name),None) or fail('Selected display is unavailable')
+    return next((m for m in outputs if m['name'].startswith(('eDP','LVDS'))),None) or fail('Laptop display not found')
+def fail(message):raise RuntimeError(message)
+def output_geometry(output):
+    width,height=output['width'],output['height']
+    if output.get('transform',0)%2:width,height=height,width
+    return [output['x'],output['y']], [round(width/output.get('scale',1)),round(height/output.get('scale',1))]
+def fit_window(address,output,testing=False):
+    """Fill the assigned display and wait for its configure acknowledgement.
+    Testing uses fixed borderless geometry independent of host keyboard focus.
+    The legacy physical-input mode retains native fullscreen.
+    """
+    selector=json.dumps('address:'+address)
+    position,size=output_geometry(output)
+    windows=json.loads(hypr('clients','-j'))
+    window=next((w for w in windows if w['address']==address),None)
+    if window and window.get('at')==position and window.get('size')==size and (testing or window.get('fullscreen')==2):return
+    lua('hl.dispatch(hl.dsp.window.move({window='+selector+',monitor='+json.dumps(output['name'])+',follow=false}))')
+    if testing:
+        # Native fullscreen is tied to the host's keyboard focus. A different
+        # host window gaining focus would undo it and restore the old 720p size.
+        # Use a fixed borderless display-sized surface for the private desktop.
+        lua('hl.dispatch(hl.dsp.window.fullscreen({window='+selector+',action="unset",mode="fullscreen",layout_aware=false}))')
+        lua('hl.dispatch(hl.dsp.window.float({window='+selector+',action="on"}))')
+        lua('hl.dispatch(hl.dsp.window.resize({window='+selector+',x='+str(size[0])+',y='+str(size[1])+',relative=false}))')
+        lua('hl.dispatch(hl.dsp.window.move({window='+selector+',x='+str(position[0])+',y='+str(position[1])+',relative=false}))')
+    else:
+        lua('hl.dispatch(hl.dsp.window.fullscreen({window='+selector+',action="set",mode="fullscreen",layout_aware=false}))')
+    for _ in range(60):
+        window=next((w for w in json.loads(hypr('clients','-j')) if w['address']==address),None)
+        if not window:fail('The secondary desktop window disappeared')
+        if (testing or window.get('fullscreen')==2) and window.get('at')==position and window.get('size')==size:return
+        time.sleep(.025)
+    fail('Secondary desktop did not fill '+output['name']+' (actual '+repr({k:window.get(k) for k in ("at","size","fullscreen")})+'); input routing has been paused')
+def repair_running_layout(value):
+    if not value.get('enabled'):return value
+    output=next((m for m in monitors() if m['name']==value['output']),None)
+    if not output:fail('Secondary display unavailable')
+    candidates=[]
+    for w in json.loads(hypr('clients','-j')):
+        if w.get('class')!='wlroots':continue
+        try:
+            # Match the managed Sway process, not another nested compositor.
+            ppid=int(Path('/proc/'+str(w['pid'])+'/stat').read_text().rsplit(')',1)[1].split()[1])
+        except (OSError,ValueError,IndexError):continue
+        if w['pid']==value.get('pid') or ppid==value.get('pid'):candidates.append(w)
+    if len(candidates)!=1:fail('Could not identify the managed secondary desktop')
+    try:fit_window(candidates[0]['address'],output,value.get('testing',False))
+    except Exception:
+        request('pause');raise
+    return state()
+def request(command,**fields):
+    RUNTIME.mkdir(mode=0o700,parents=True,exist_ok=True)
+    s=socket.socket(socket.AF_UNIX,socket.SOCK_DGRAM);path=RUNTIME/f'request-{os.getpid()}.sock'
+    s.bind(str(path));s.settimeout(25)
+    try:
+        s.sendto(json.dumps({'command':command,**fields}).encode(),str(RUNTIME/'control.sock'))
+        reply=json.loads(s.recv(32768))
+        if reply.get('error'):raise RuntimeError(reply['error'])
+        return reply
+    finally:s.close();path.unlink(missing_ok=True)
+def device_paths():
+    """Only built-in keyboard/touchpad. Never grab the external gaming input."""
+    result=[]
+    for p in sorted(Path('/sys/class/input').glob('event*')):
+        dev=p/'device'
+        try:name=(dev/'name').read_text().strip();bus=int((dev/'id/bustype').read_text(),16)
+        except (OSError,ValueError):continue
+        if (name=='AT Translated Set 2 keyboard' and bus==0x11) or (name.startswith('ASUF1300:00 2808:0203') and bus==0x18):result.append('/dev/input/'+p.name)
+    if not any('Touchpad' in (Path('/sys/class/input')/Path(p).name/'device/name').read_text() for p in result):fail('Built-in touchpad unavailable')
+    if not any((Path('/sys/class/input')/Path(p).name/'device/name').read_text().strip()=='AT Translated Set 2 keyboard' for p in result):fail('Built-in keyboard unavailable')
+    return result
+
+class Desktop:
+    def __init__(self,output,testing):
+        self.output=output;self.testing=testing;self.child=None;self.address=None;self.enabled=False;self.main=None;self.guard=None
+        self.running=True;self.last_layout=0;self.last_activity=0;self.resume_pending=False;self.rule_output=None
+        self.publish()
+    def publish(self):
+        data={'running':bool(self.child and self.child.poll() is None),'enabled':self.enabled,'testing':self.testing,'output':self.output['name'],
+              'wayland_display':str(RUNTIME/'wayland.sock'),'sway_socket':str(RUNTIME/'sway.sock'),'main_output':self.main,
+              'pid':self.child.pid if self.child else None,'supervisor_pid':os.getpid(),
+              'host_wayland_display':str((RUNTIME.parent/os.environ.get('WAYLAND_DISPLAY','wayland-0')).resolve())}
+        tmp=RUNTIME/'state.new';tmp.write_text(json.dumps(data));tmp.replace(RUNTIME/'state.json')
+    def configure_guard(self):
+        current=json.loads(hypr('version','-j'));built=json.loads((SOURCE/'build/hyprland-version.json').read_text())
+        if current['abiHash']!=built['abiHash']:
+            # No stale plugin can enter the compositor after a system update.
+            run([HOME/'.local/bin/caelestia-build','--kind','cmake','--',SOURCE/'build.sh'],timeout=120)
+            built=json.loads((SOURCE/'build/hyprland-version.json').read_text())
+            if current['abiHash']!=built['abiHash']:fail('Hyprland headers do not match the running session. Log out after updating, then retry.')
+        self.guard=str(SOURCE/'build/pointer-guard.so')
+        plugins=hypr('plugin','list')
+        if 'caelestia-multiseat-guard' not in plugins:
+            answer=hypr('plugin','load',self.guard)
+            if answer!='ok':fail(answer)
+    def rule(self):
+        if self.rule_output==self.output['name']:
+            lua('if _G.caelestia_second_seat_rule then _G.caelestia_second_seat_rule:set_enabled(true) end')
+            return
+        lua('if _G.caelestia_second_seat_rule then _G.caelestia_second_seat_rule:set_enabled(false) end; _G.caelestia_second_seat_rule=nil; collectgarbage("collect")')
+        self.rule_output=self.output['name']
+        # wlroots uses this fixed app_id/title for its sole nested output.
+        # Rules are created only while this managed desktop exists.
+        _,size=output_geometry(self.output)
+        fill=',render_unfocused=true,persistent_size=true,size={'+str(size[0])+','+str(size[1])+'},min_size={'+str(size[0])+','+str(size[1])+'},max_size={'+str(size[0])+','+str(size[1])+'}' if self.testing else ',fullscreen=true'
+        lua('_G.caelestia_second_seat_rule = hl.window_rule({name="caelestia-second-seat",match={class="^wlroots$",initial_title="^wlroots - WL-1$"},float=true,no_initial_focus=true,no_focus=true,no_follow_mouse=true,no_anim=true,no_shadow=true,border_size=0,rounding=0,suppress_event="fullscreen maximize",monitor='+json.dumps(self.output['name'])+fill+'})')
+    def create(self):
+        if not self.testing:self.configure_guard()
+        self.rule()
+        (RUNTIME/'sway.conf').write_text('''set $mod Mod4
+font pango:Sans 12
+default_border pixel 0
+default_floating_border pixel 1
+gaps inner 6
+focus_follows_mouse yes
+focus_on_window_activation none
+seat seat0 fallback false
+'''+('' if self.testing else 'seat ignored fallback true\n')+'''output * bg #17191f solid_color
+bindsym $mod+Return exec foot
+bindsym $mod+d exec fuzzel
+bindsym $mod+e exec '''+str(SELF)+''' files
+bindsym $mod+b exec '''+str(SELF)+''' browser
+bindsym $mod+m exec '''+str(SELF)+''' pause
+bindsym $mod+q kill
+bindsym $mod+f fullscreen toggle
+bindsym $mod+Left focus left
+bindsym $mod+Right focus right
+bindsym $mod+Up focus up
+bindsym $mod+Down focus down
+floating_modifier $mod normal
+bar {
+  position top
+  height 34
+  font pango:Sans 12
+  status_command '''+str(SOURCE/'desktop-bar.py')+'''
+  colors {
+    background #201d1b
+    statusline #f9dfce
+    focused_workspace #f1b993 #f1b993 #26180f
+    inactive_workspace #201d1b #201d1b #d6beb0
+  }
+}
+''')
+        env=dict(os.environ,WLR_BACKENDS='wayland',WLR_WL_OUTPUTS='1',WLR_RENDERER='gles2',WLR_NO_HARDWARE_CURSORS='1',SWAYSOCK=str(RUNTIME/'sway.sock'),
+                 XDG_CURRENT_DESKTOP='sway',XDG_SESSION_DESKTOP='sway',XDG_SESSION_TYPE='wayland',QT_QPA_PLATFORM='wayland',GDK_BACKEND='wayland',
+                 MOZ_ENABLE_WAYLAND='1',ELECTRON_OZONE_PLATFORM_HINT='wayland',XCURSOR_SIZE='24')
+        # Keep parent Wayland connection, but do not let guest applications
+        # address the main compositor or update its activation environment.
+        env.pop('HYPRLAND_INSTANCE_SIGNATURE',None)
+        self.child=subprocess.Popen(['dbus-run-session','--','sway','--unsupported-gpu','-c',str(RUNTIME/'sway.conf')],env=env)
+        # sway's IPC path can be set independently. Its Wayland socket is
+        # discovered through IPC and exposed under a stable private symlink.
+        for _ in range(150):
+            if self.child.poll() is not None:fail('Second desktop failed to start; see journalctl --user -u caelestia-multiseat')
+            if (RUNTIME/'sway.sock').exists():break
+            time.sleep(.05)
+        else:fail('Second desktop startup timed out')
+        # Child compositor's own environment is exported for its descendants.
+        # Query the child process rather than guessing a numbered host socket.
+        pids=run(['pgrep','-P',str(self.child.pid)]).splitlines()
+        candidates=[self.child.pid]+[int(p) for p in pids]
+        sway_pid=None
+        for pid in candidates:
+            try:
+                if (Path(f'/proc/{pid}/comm').read_text().strip()=='sway'):sway_pid=pid;break
+            except OSError:pass
+        if not sway_pid:fail('Could not identify managed second compositor')
+        self.sway_pid=sway_pid
+        # sway exposes its WAYLAND_DISPLAY via a child command in this private bus.
+        run(['swaymsg','-s',RUNTIME/'sway.sock','exec',f'/usr/bin/python3 -c '+shlex.quote('import os,pathlib;pathlib.Path('+repr(str(RUNTIME/'guest-environment.json'))+').write_text(__import__("json").dumps({k:os.environ.get(k,"") for k in ["WAYLAND_DISPLAY","DISPLAY","DBUS_SESSION_BUS_ADDRESS","XDG_RUNTIME_DIR"]}))')])
+        for _ in range(80):
+            if (RUNTIME/'guest-environment.json').exists():break
+            time.sleep(.05)
+        guest=json.loads((RUNTIME/'guest-environment.json').read_text())
+        real=Path(guest['WAYLAND_DISPLAY']);real=real if real.is_absolute() else RUNTIME.parent/real
+        link=RUNTIME/'wayland.sock';link.unlink(missing_ok=True);link.symlink_to(real)
+        for _ in range(100):
+            clients=json.loads(hypr('clients','-j'))
+            match=[c for c in clients if c.get('pid')==sway_pid and c.get('class')=='wlroots']
+            if match:self.address=match[0]['address'];break
+            time.sleep(.05)
+        if not self.address:fail('Second desktop window not found (sway pid '+str(sway_pid)+', clients '+repr([(c.get('pid'),c.get('class')) for c in clients])+')')
+        self.publish()
+    def window_move(self,workspace):
+        if self.address:lua('hl.dispatch(hl.dsp.window.move({window='+json.dumps('address:'+self.address)+',workspace='+json.dumps(workspace)+',follow=false}))')
+    def stop_input(self):
+        subprocess.run(['sudo','-n','systemctl','stop',INPUT_UNIT],capture_output=True,timeout=8)
+        (RUNTIME/'input.pid').unlink(missing_ok=True)
+        (RUNTIME/'input.ready').unlink(missing_ok=True)
+    def pause(self):
+        if not self.testing:
+            self.stop_input()
+            try:hypr('caelestiamultiseat','off')
+            except RuntimeError:pass
+        self.enabled=False;self.window_move('special:caelestia-second-seat')
+        lua('if _G.caelestia_second_seat_rule then _G.caelestia_second_seat_rule:set_enabled(false) end')
+        self.publish()
+    def resume(self):
+        outputs=monitors();selected=next((m for m in outputs if m['name']==self.output['name'] and m.get('mirrorOf') in (None,'none','')),None)
+        if not selected or len(outputs)<2:fail('Both joined displays must be connected')
+        others=[m for m in outputs if m['name']!=selected['name'] and m.get('mirrorOf') in (None,'none','')]
+        if not others:fail('Separate main display unavailable')
+        main=next((m for m in others if m.get('focused')),others[0]);self.main=main['name']
+        self.output=selected;self.rule();self.window_move(str(selected['activeWorkspace']['id']))
+        fit_window(self.address,selected,self.testing)
+        if not self.testing:
+            lua('hl.dispatch(hl.dsp.focus({monitor='+json.dumps(self.main)+'}))')
+            hypr('caelestiamultiseat',self.main)
+            paths=device_paths()
+            (RUNTIME/'input.ready').unlink(missing_ok=True)
+            args=['sudo','-n','systemd-run','--quiet','--collect','--unit='+INPUT_UNIT,'--description=Caelestia laptop input routing',
+                  '-p','User='+str(os.getuid()),'-p','SupplementaryGroups=input','-p','DevicePolicy=closed',
+                  '-p','NoNewPrivileges=yes','-p','ProtectSystem=strict','-p','ProtectHome=read-only',
+                  '-p','TimeoutStopSec=2s','-p','KillMode=control-group',
+                  '-p','RestrictAddressFamilies=AF_UNIX','-p','UMask=0077',
+                  '-p','ReadWritePaths='+str(RUNTIME),
+                  '--setenv=XDG_RUNTIME_DIR='+str(RUNTIME.parent),'--setenv=MULTISEAT_READY_FILE='+str(RUNTIME/'input.ready')]
+            for path in paths:args+=['-p','DeviceAllow='+path+' rw']
+            args+=['/usr/local/libexec/caelestia-multiseat-input',str(RUNTIME/'wayland.sock'),str(RUNTIME/'control.sock'),*paths]
+            run(args)
+            for _ in range(120):
+                props=run(['systemctl','show',INPUT_UNIT,'-p','MainPID','-p','ActiveState'])
+                data=dict(line.split('=',1) for line in props.splitlines() if '=' in line)
+                pid=int(data.get('MainPID','0'))
+                if pid and data.get('ActiveState')=='active' and (RUNTIME/'input.ready').exists():
+                    if Path(f'/proc/{pid}').exists():break
+                if data.get('ActiveState')=='failed':fail('Assigned input is busy or unavailable. Normal input was retained.')
+                time.sleep(.05)
+            else:fail('Input handover failed; normal input was retained')
+            (RUNTIME/'input.pid').write_text(str(pid))
+        self.enabled=True;self.publish()
+    def guest_env(self):
+        guest=json.loads((RUNTIME/'guest-environment.json').read_text())
+        env=dict(os.environ,**guest,SWAYSOCK=str(RUNTIME/'sway.sock'),GDK_BACKEND='wayland',QT_QPA_PLATFORM='wayland',
+                 MOZ_ENABLE_WAYLAND='1',ELECTRON_OZONE_PLATFORM_HINT='wayland',XDG_CURRENT_DESKTOP='sway')
+        return private_env()
+    def close(self):
+        try:self.pause()
+        except Exception:pass
+        if self.child:
+            try:run(['swaymsg','-s',RUNTIME/'sway.sock','exit'])
+            except Exception:self.child.terminate()
+        self.enabled=False;self.publish()
+        data=state();data.update(running=False,enabled=False);(RUNTIME/'state.json').write_text(json.dumps(data))
+
+def serve(output,testing):
+    RUNTIME.mkdir(parents=True,mode=0o700,exist_ok=True)
+    lock=(RUNTIME/'server.lock').open('w');fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+    control=socket.socket(socket.AF_UNIX,socket.SOCK_DGRAM);(RUNTIME/'control.sock').unlink(missing_ok=True);control.bind(str(RUNTIME/'control.sock'))
+    for name in ['sway.sock','wayland.sock','guest-environment.json']: (RUNTIME/name).unlink(missing_ok=True)
+    desktop=Desktop(choose_output(output,testing),testing)
+    def stop(*_):desktop.running=False
+    signal.signal(signal.SIGTERM,stop);signal.signal(signal.SIGINT,stop)
+    try:
+        desktop.create();desktop.resume();tell('Independent desktop ready','Super+M pauses it and preserves its open apps.')
+        while desktop.running and desktop.child.poll() is None:
+            readable,_,_=select.select([control],[],[],1)
+            if readable:
+                message,address=control.recvfrom(32768)
+                try:
+                    try:data=json.loads(message);cmd=data['command']
+                    except ValueError:data={};cmd=message.decode()
+                    if cmd=='toggle':desktop.pause() if desktop.enabled else desktop.resume()
+                    elif cmd=='pause':desktop.pause()
+                    elif cmd=='resume':desktop.resume()
+                    elif cmd=='stop':desktop.running=False
+                    elif cmd=='retarget':
+                        if not desktop.testing:fail('A human desktop cannot be retargeted by an agent')
+                        desktop.pause()
+                        desktop.output=choose_output(data.get('output'),True)
+                        desktop.resume()
+                    elif cmd=='refresh':
+                        if desktop.enabled:fit_window(desktop.address,desktop.output,desktop.testing)
+                    elif cmd=='activity':
+                        if desktop.enabled and not desktop.testing and time.monotonic()-desktop.last_activity>=.8:hypr('caelestiamultiseat','activity');desktop.last_activity=time.monotonic()
+                    elif cmd=='exec':
+                        if not desktop.enabled:fail('The independent desktop is paused. Resume it before sending test input.')
+                        if not data.get('args'):fail('An application command is required')
+                        subprocess.Popen(data['args'],env=desktop.guest_env(),start_new_session=True)
+                    if address:control.sendto(json.dumps(state()).encode(),address)
+                except Exception as exc:
+                    print(str(exc),file=sys.stderr,flush=True)
+                    if cmd in ('resume','toggle','retarget'):
+                        try:desktop.pause()
+                        except Exception:pass
+                    if address:control.sendto(json.dumps({'error':str(exc)}).encode(),address)
+            # Monitor unplug/mirror and failed input process are fail-open.
+            if desktop.enabled:
+                outputs=monitors();names={m['name'] for m in outputs if m.get('mirrorOf') in (None,'none','')}
+                failed=not {desktop.output['name'],desktop.main}.issubset(names)
+                if not desktop.testing:
+                    try:pid=int((RUNTIME/'input.pid').read_text());failed=failed or not Path(f'/proc/{pid}').exists()
+                    except (OSError,ValueError):failed=True
+                if failed:desktop.pause();tell('Independent desktop paused','Input returned to normal. Open apps were preserved.')
+    except Exception as exc:tell('Independent desktop unavailable',str(exc));raise
+    finally:
+        desktop.close();control.close();(RUNTIME/'control.sock').unlink(missing_ok=True)
+
+def start(output,testing):
+    if testing:
+        query=subprocess.run(['hyprctl','multiseat','status'],capture_output=True,text=True,timeout=4)
+        try:native=json.loads(query.stdout)
+        except ValueError:native={}
+        if native.get('enabled') and native.get('implementation')=='native':
+            fail('Two-person mode is active; the laptop desktop belongs to its user')
+    if state().get('running'):
+        if state().get('testing')!=testing:fail('Pause the existing desktop before choosing another mode. Its apps are preserved; use stop only after saving them.')
+        target=choose_output(output,testing)['name']
+        if target!=state().get('output'):
+            return request('retarget',output=target)
+        return request('resume')
+    args=['systemd-run','--user','--collect','--quiet','--unit='+USER_UNIT,'--description=Caelestia independent desktop','-p','KillMode=control-group','-p','TimeoutStopSec=8']
+    for key in ['WAYLAND_DISPLAY','HYPRLAND_INSTANCE_SIGNATURE','XDG_RUNTIME_DIR','PATH']:
+        if key in os.environ:args.append('--setenv='+key+'='+os.environ[key])
+    args += [str(SELF),'serve']
+    if testing:args.append('--testing')
+    if output:args+=['--output',output]
+    run(args)
+    for _ in range(250):
+        value=state()
+        if value.get('enabled'):return value
+        if subprocess.run(['systemctl','--user','is-active','--quiet',USER_UNIT]).returncode not in (0,3):break
+        time.sleep(.1)
+    fail('Desktop did not become ready. Check journalctl --user -u '+USER_UNIT)
+
+def private_env():
+    value=state()
+    if not value.get('running') or not value.get('enabled'):
+        fail('The independent desktop is unavailable or paused; refusing host fallback')
+    guest=json.loads((RUNTIME/'guest-environment.json').read_text())
+    wayland=RUNTIME/'wayland.sock';ipc=RUNTIME/'sway.sock'
+    if not wayland.is_socket() or not ipc.is_socket():fail('Private desktop sockets are unavailable')
+    if value.get('host_wayland_display') and wayland.resolve()==Path(value['host_wayland_display']).resolve():
+        fail('Private display unexpectedly matches the host display')
+    env=dict(os.environ)
+    for key in ('HYPRLAND_INSTANCE_SIGNATURE','HYPRLAND_SEAT','SWAYSOCK','WAYLAND_DISPLAY','DISPLAY',
+                'XDG_ACTIVATION_TOKEN','DESKTOP_STARTUP_ID','DBUS_SESSION_BUS_ADDRESS','SESSION_MANAGER'):
+        env.pop(key,None)
+    env.update({k:v for k,v in guest.items() if v})
+    env.update(WAYLAND_DISPLAY=str(wayland),SWAYSOCK=str(ipc),GDK_BACKEND='wayland',QT_QPA_PLATFORM='wayland',
+               MOZ_ENABLE_WAYLAND='1',ELECTRON_OZONE_PLATFORM_HINT='wayland',XDG_CURRENT_DESKTOP='sway',
+               XDG_SESSION_DESKTOP='sway',CAELESTIA_AGENT_DESKTOP='1')
+    if not env.get('DBUS_SESSION_BUS_ADDRESS'):fail('The private session bus is unavailable')
+    return env
+
+def main():
+    if len(sys.argv)>1 and sys.argv[1]=='exec':
+        args=sys.argv[2:];args=args[1:] if args[:1]==['--'] else args
+        if not args:fail('An application command is required')
+        os.execvpe(args[0],args,private_env());return
+    p=argparse.ArgumentParser(description=__doc__);p.add_argument('command',choices=['toggle','start','test','pause','resume','stop','status','refresh','serve','exec','browser','files'])
+    p.add_argument('--output');p.add_argument('--testing',action='store_true');a=p.parse_args()
+    if a.command=='serve':return serve(a.output,a.testing)
+    if a.command=='status':print(json.dumps(state(),indent=2));return
+    if a.command=='browser':
+        profile=HOME/'.local/share/caelestia-multiseat/browser';profile.mkdir(parents=True,exist_ok=True)
+        os.execvpe('firefox',['firefox','--no-remote','--profile',str(profile)],private_env());return
+    if a.command=='files':
+        for app,args in [('nautilus',['--new-window']),('nemo',['--no-desktop']),('dolphin',['--new-window']),('thunar',[])]:
+            if shutil.which(app):os.execvpe(app,[app,*args],private_env());return
+        fail('No supported file manager is installed')
+    if a.command=='toggle':value=request('toggle') if state().get('running') else start(a.output,False)
+    elif a.command in ('start','test'):value=start(a.output,a.command=='test')
+    elif a.command=='refresh' and not state().get('running'):return
+    else:value=request(a.command)
+    if a.command in ('toggle','start','test','resume','refresh'):value=repair_running_layout(value)
+    print(json.dumps(value,indent=2))
+if __name__=='__main__':
+    try:main()
+    except Exception as exc:
+        print(str(exc),file=sys.stderr);sys.exit(1)
